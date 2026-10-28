@@ -95,7 +95,6 @@ pub(crate) enum TransportFrameError {
     Size,
 }
 
-
 pub(crate) fn read_transport_frame(
     reader: &mut impl Read,
     max_frame_bytes: usize,
@@ -232,8 +231,6 @@ pub enum ServiceError {
     ReplayCallerKeyMismatch,
     #[error("caller runtime is not admitted")]
     CallerNotAdmitted,
-    #[error("transport payload exceeds the caller bound")]
-    PayloadTooLarge,
     #[error("unexpected transport envelope")]
     Envelope,
     #[error("transport envelope identity substitution")]
@@ -249,7 +246,6 @@ pub enum ServiceError {
     #[error("completion does not match the active request")]
     ActiveRequestMismatch,
 }
-
 
 #[cfg(test)]
 mod tests {

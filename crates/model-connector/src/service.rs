@@ -65,6 +65,14 @@ impl CallerAdmission {
     pub fn caller_runtime_id(&self) -> &str {
         &self.caller_runtime_id
     }
+
+    pub(crate) fn max_concurrent_requests(&self) -> usize {
+        self.max_concurrent_requests
+    }
+
+    pub(crate) fn max_payload_bytes(&self) -> usize {
+        self.max_payload_bytes
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -195,12 +203,12 @@ impl TransportService {
             .callers
             .get(&envelope.caller_runtime_id)
             .ok_or(ServiceError::CallerNotAdmitted)?;
-        if envelope.ciphertext.len() > caller.max_payload_bytes {
-            return Err(ServiceError::PayloadTooLarge);
-        }
         let security = caller.security.clone();
         let max_concurrent_requests = caller.max_concurrent_requests;
         let invocation = decrypt_invocation(envelope, &security)?;
+        if envelope.ciphertext.len() > caller.max_payload_bytes {
+            return self.reply_refusal(&invocation, Refusal::Policy, &security);
+        }
         if let Err(error) = invocation.validate(now_unix_ms, self.max_expiry_skew_ms) {
             return self.reply_refusal(&invocation, contract_refusal(&error), &security);
         }
@@ -228,9 +236,7 @@ impl TransportService {
                 return self.reply_refusal(&invocation, Refusal::ReplayConflict, &security);
             }
             return match record.state {
-                ReplayState::Completed { response } => {
-                    Ok(TransportAdmission::Reply(response))
-                }
+                ReplayState::Completed { response } => Ok(TransportAdmission::Reply(response)),
                 ReplayState::Active => {
                     let refusal = if self.live.contains(&identity) {
                         Refusal::InFlight
@@ -262,12 +268,10 @@ impl TransportService {
             .put(replay_key(&identity), &replay_record)
             .map_err(replay_store_error)?;
         self.live.insert(identity);
-        Ok(TransportAdmission::Execute(Box::new(
-            ExecutionClaim {
-                invocation,
-                invocation_sha256,
-            },
-        )))
+        Ok(TransportAdmission::Execute(Box::new(ExecutionClaim {
+            invocation,
+            invocation_sha256,
+        })))
     }
 
     pub fn complete(
@@ -362,7 +366,6 @@ fn contract_refusal(error: &ContractError) -> Refusal {
         _ => Refusal::Malformed,
     }
 }
-
 
 #[cfg(all(test, feature = "daemon"))]
 mod tests {
@@ -490,10 +493,7 @@ mod tests {
             TransportAdmission::Execute(_)
         ));
 
-        for (invocation, expected) in [
-            (&first, Refusal::InFlight),
-            (&second, Refusal::Capacity),
-        ] {
+        for (invocation, expected) in [(&first, Refusal::InFlight), (&second, Refusal::Capacity)] {
             let response = match service
                 .begin(&encrypt_invocation(invocation, &security).unwrap(), 1_000)
                 .unwrap()
@@ -661,7 +661,8 @@ mod tests {
                 .begin(&envelope, 1_000)
         };
         assert!(matches!(admit(size), Ok(TransportAdmission::Execute(_))));
-        assert_eq!(admit(size - 1).unwrap_err(), ServiceError::PayloadTooLarge);
+        let refused = admit(size - 1).unwrap();
+        assert_eq!(refusal_of(refused, &invocation), Refusal::Policy);
     }
 
     #[test]

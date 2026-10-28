@@ -1,5 +1,5 @@
 use std::fs;
-use std::net::{IpAddr, TcpListener, TcpStream};
+use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -10,7 +10,10 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use zeroize::Zeroizing;
 
-use crate::contract::{TransportInvocation, TransportResult};
+use crate::contract::{
+    RECEIPT_SCHEMA_ID, TransportDisposition, TransportInvocation, TransportOutcome,
+    TransportReceipt, TransportResult,
+};
 use crate::envelope::{
     ServiceError, TransportEnvelope, TransportFrameError, read_transport_frame,
     write_transport_frame,
@@ -39,9 +42,17 @@ pub struct ServeLimits {
     pub max_expiry_skew_ms: u64,
 }
 
+/// What a frame carries besides the caller's payload: the envelope fields and
+/// the headroom a result needs. The base daemon's budget, unchanged.
+const FRAME_OVERHEAD_BUDGET: usize = 4096;
+
 impl ServeLimits {
-    fn validate(&self) -> Result<(), ServeError> {
-        if self.max_frame_bytes == 0
+    /// The bounds serve refuses before it opens anything: each limit nonzero,
+    /// a frame that can carry a minimum payload plus its overhead, enough
+    /// connections for every caller's request slots, and every caller's payload
+    /// bound between the minimum and what a frame can carry.
+    fn validate(&self, admissions: &[CallerAdmission]) -> Result<(), ServeError> {
+        if self.max_frame_bytes < FRAME_OVERHEAD_BUDGET * 2
             || self.max_frame_bytes > u32::MAX as usize
             || self.max_connections == 0
             || self.socket_timeout_ms == 0
@@ -49,7 +60,30 @@ impl ServeLimits {
         {
             return Err(ServeError::InvalidConfig("serve limits"));
         }
+        if admissions.is_empty() {
+            return Err(ServeError::InvalidConfig("callers"));
+        }
+        let slots = admissions
+            .iter()
+            .try_fold(0_usize, |total, caller| {
+                total.checked_add(caller.max_concurrent_requests())
+            })
+            .ok_or(ServeError::InvalidConfig("connection capacity"))?;
+        if self.max_connections < slots.max(8) {
+            return Err(ServeError::InvalidConfig("connection capacity"));
+        }
+        if admissions.iter().any(|caller| {
+            caller.max_payload_bytes() < FRAME_OVERHEAD_BUDGET
+                || caller.max_payload_bytes() > self.max_frame_bytes - FRAME_OVERHEAD_BUDGET
+        }) {
+            return Err(ServeError::InvalidConfig("caller admission"));
+        }
         Ok(())
+    }
+
+    /// The largest encoded result a frame can carry once its envelope is added.
+    fn max_result_bytes(&self) -> usize {
+        self.max_frame_bytes - FRAME_OVERHEAD_BUDGET
     }
 }
 
@@ -62,19 +96,6 @@ pub struct CallerConfig {
     pub max_concurrent_requests: usize,
     pub max_payload_bytes: usize,
     pub max_output_tokens: u32,
-}
-
-pub fn required_connection_capacity(callers: &[CallerConfig]) -> Result<usize, ServeError> {
-    Ok(caller_request_capacity(callers)?.max(8))
-}
-
-pub fn caller_request_capacity(callers: &[CallerConfig]) -> Result<usize, ServeError> {
-    callers
-        .iter()
-        .try_fold(0_usize, |total, caller| {
-            total.checked_add(caller.max_concurrent_requests)
-        })
-        .ok_or(ServeError::InvalidConfig("connection capacity"))
 }
 
 pub fn load_admissions(callers: &[CallerConfig]) -> Result<Vec<CallerAdmission>, ServeError> {
@@ -112,10 +133,7 @@ pub fn serve(
     replay_store: &Path,
     backend: Arc<dyn ProviderBackend>,
 ) -> Result<(), ServeError> {
-    limits.validate()?;
-    if admissions.is_empty() {
-        return Err(ServeError::InvalidConfig("callers"));
-    }
+    limits.validate(&admissions)?;
     if !listener
         .local_addr()
         .map_err(ServeError::Listen)?
@@ -132,11 +150,22 @@ pub fn serve(
         admissions,
         limits.max_expiry_skew_ms,
     )?));
+    accept_loop(|| listener.accept(), limits, service, backend)
+}
+
+/// The accept loop over any source of connections, so a test can present a
+/// peer address that a loopback listener never reports.
+fn accept_loop(
+    accept: impl Fn() -> std::io::Result<(TcpStream, SocketAddr)>,
+    limits: ServeLimits,
+    service: Arc<Mutex<TransportService>>,
+    backend: Arc<dyn ProviderBackend>,
+) -> Result<(), ServeError> {
     let active_connections = Arc::new(AtomicUsize::new(0));
     let timeout = Duration::from_millis(limits.socket_timeout_ms);
 
     loop {
-        let (stream, peer) = listener.accept().map_err(ServeError::Listen)?;
+        let (stream, peer) = accept().map_err(ServeError::Listen)?;
         if !peer_admitted(peer.ip()) {
             continue;
         }
@@ -147,18 +176,11 @@ pub fn serve(
         };
         let service = service.clone();
         let backend = backend.clone();
-        let max_frame_bytes = limits.max_frame_bytes;
         thread::Builder::new()
             .name("model-connector-request".to_string())
             .spawn(move || {
                 let _permit = permit;
-                let _ = serve_connection(
-                    stream,
-                    &service,
-                    backend.as_ref(),
-                    max_frame_bytes,
-                    timeout,
-                );
+                let _ = serve_connection(stream, &service, backend.as_ref(), &limits, timeout);
             })
             .map_err(ServeError::Thread)?;
     }
@@ -172,22 +194,23 @@ fn serve_connection(
     mut stream: TcpStream,
     service: &Mutex<TransportService>,
     backend: &dyn ProviderBackend,
-    max_frame_bytes: usize,
+    limits: &ServeLimits,
     timeout: Duration,
 ) -> Result<(), ServeError> {
     stream
         .set_read_timeout(Some(timeout))
         .and_then(|()| stream.set_write_timeout(Some(timeout)))
         .map_err(ServeError::Connection)?;
-    let request = read_transport_frame(&mut stream, max_frame_bytes).map_err(frame_error)?;
-    let response = execute_inference_frame(&request, service, backend)?;
-    write_transport_frame(&mut stream, &response, max_frame_bytes).map_err(frame_error)
+    let request = read_transport_frame(&mut stream, limits.max_frame_bytes).map_err(frame_error)?;
+    let response = execute_inference_frame(&request, service, backend, limits)?;
+    write_transport_frame(&mut stream, &response, limits.max_frame_bytes).map_err(frame_error)
 }
 
 fn execute_inference_frame(
     request: &[u8],
     service: &Mutex<TransportService>,
     backend: &dyn ProviderBackend,
+    limits: &ServeLimits,
 ) -> Result<Vec<u8>, ServeError> {
     let envelope: TransportEnvelope =
         rmp_serde::from_slice(request).map_err(|_| ServeError::FrameEncoding)?;
@@ -198,7 +221,11 @@ fn execute_inference_frame(
     let response = match admission {
         TransportAdmission::Reply(response) => response,
         TransportAdmission::Execute(claim) => {
-            let result = backend.execute(claim.invocation());
+            let result = bound_result(
+                claim.invocation(),
+                backend.execute(claim.invocation()),
+                limits.max_result_bytes(),
+            );
             service
                 .lock()
                 .map_err(|_| ServeError::ServicePoisoned)?
@@ -206,6 +233,40 @@ fn execute_inference_frame(
         }
     };
     rmp_serde::to_vec(&response).map_err(|_| ServeError::FrameEncoding)
+}
+
+/// A result the frame cannot carry is never recorded: it becomes a failed
+/// receipt in the same shape, so the caller is told and a retry replays bytes
+/// that can be delivered.
+fn bound_result(
+    invocation: &TransportInvocation,
+    result: TransportResult,
+    max_result_bytes: usize,
+) -> TransportResult {
+    if rmp_serde::to_vec(&result).is_ok_and(|bytes| bytes.len() <= max_result_bytes) {
+        return result;
+    }
+    let transport = match &result.disposition {
+        TransportDisposition::Transported { receipt, .. } => receipt.transport.clone(),
+        TransportDisposition::Refused(_) => "model-connector".to_string(),
+    };
+    TransportResult::transported(
+        invocation,
+        Vec::new(),
+        TransportReceipt {
+            schema_id: RECEIPT_SCHEMA_ID.to_string(),
+            request_id: invocation.request_id().to_string(),
+            caller_runtime_id: invocation.caller_runtime_id.clone(),
+            native_request_sha256: invocation.native_request_sha256,
+            provider_request_sha256: invocation.provider_request_sha256,
+            model: invocation.request.model.clone(),
+            transport,
+            outcome: TransportOutcome::Failed {
+                failure_kind: "result_size".to_string(),
+                message: "provider result exceeded its byte bound".to_string(),
+            },
+        },
+    )
 }
 
 fn frame_error(error: TransportFrameError) -> ServeError {
@@ -287,12 +348,14 @@ mod tests {
     use super::*;
     use crate::client::ConnectorClient;
     use crate::contract::{
-        Refusal, TransportDisposition, TransportEvent, TransportEventPayload, TransportResult,
+        Refusal, TransportDisposition, TransportEvent, TransportEventPayload, TransportOutcome,
+        TransportResult,
     };
     use crate::fixtures::{TestStore, caller, invocation_for, receipt, request};
 
     const CALLER: &str = "epiphany-yggdrasil";
     const KEY: &str = "epiphany-distinct-test-key";
+    const FRAME: usize = 128 * 1024;
 
     struct CountingBackend {
         ready: bool,
@@ -333,7 +396,7 @@ mod tests {
 
     fn limits() -> ServeLimits {
         ServeLimits {
-            max_frame_bytes: 64 * 1024,
+            max_frame_bytes: FRAME,
             max_connections: 8,
             socket_timeout_ms: 5_000,
             max_expiry_skew_ms: 300_000,
@@ -374,20 +437,20 @@ mod tests {
         backend: Arc<CountingBackend>,
         store: &TestStore,
     ) -> (ConnectorClient, std::net::SocketAddr) {
+        start_with(backend, store, vec![caller(CALLER, KEY, 4)])
+    }
+
+    fn start_with(
+        backend: Arc<dyn ProviderBackend>,
+        store: &TestStore,
+        admissions: Vec<CallerAdmission>,
+    ) -> (ConnectorClient, std::net::SocketAddr) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let endpoint = listener.local_addr().unwrap();
         let path = store.path.clone();
-        thread::spawn(move || {
-            serve(
-                listener,
-                limits(),
-                vec![caller(CALLER, KEY, 4)],
-                &path,
-                backend,
-            )
-        });
+        thread::spawn(move || serve(listener, limits(), admissions, &path, backend));
         let client =
-            ConnectorClient::new(endpoint, KEY, 64 * 1024, Some(Duration::from_secs(5))).unwrap();
+            ConnectorClient::new(endpoint, KEY, FRAME, Some(Duration::from_secs(5))).unwrap();
         (client, endpoint)
     }
 
@@ -456,8 +519,8 @@ mod tests {
         let mut replies = Vec::new();
         for _ in 0..2 {
             let mut stream = TcpStream::connect(endpoint).unwrap();
-            write_transport_frame(&mut stream, &request, 64 * 1024).unwrap();
-            replies.push(read_transport_frame(&mut stream, 64 * 1024).unwrap());
+            write_transport_frame(&mut stream, &request, FRAME).unwrap();
+            replies.push(read_transport_frame(&mut stream, FRAME).unwrap());
         }
         assert_eq!(replies[0], replies[1]);
         assert_eq!(backend.executions.load(Ordering::SeqCst), 1);
@@ -514,8 +577,9 @@ mod tests {
     #[test]
     fn serve_refuses_unbounded_limits_and_admits_the_widest_frame() {
         let store = TestStore::new();
-        let mutations: [fn(&mut ServeLimits); 5] = [
+        let mutations: [fn(&mut ServeLimits); 6] = [
             |limits| limits.max_frame_bytes = 0,
+            |limits| limits.max_frame_bytes = 8191,
             |limits| limits.max_frame_bytes = u32::MAX as usize + 1,
             |limits| limits.max_connections = 0,
             |limits| limits.socket_timeout_ms = 0,
@@ -547,7 +611,10 @@ mod tests {
             &store.path,
             CountingBackend::new(true),
         );
-        assert!(result.is_none(), "the widest frame the wire can carry must serve");
+        assert!(
+            result.is_none(),
+            "the widest frame the wire can carry must serve"
+        );
     }
 
     #[test]
@@ -587,23 +654,180 @@ mod tests {
         assert_eq!(active.load(Ordering::SeqCst), 0);
     }
 
-    #[test]
-    fn caller_admission_reserves_every_independently_admitted_request_slot() {
-        let both = callers(&[8, 8]);
-        assert_eq!(caller_request_capacity(&both).unwrap(), 16);
-        assert_eq!(required_connection_capacity(&both).unwrap(), 16);
-        assert_eq!(required_connection_capacity(&callers(&[3])).unwrap(), 8);
-        assert!(matches!(
-            caller_request_capacity(&callers(&[usize::MAX, 1])),
-            Err(ServeError::InvalidConfig("connection capacity"))
-        ));
+    fn admission(id: &str, key: &str, slots: usize, payload: usize) -> CallerAdmission {
+        CallerAdmission::new(id, key, 1, ["gpt-5.4".to_string()], slots, payload, 32_768).unwrap()
+    }
+
+    /// `Some(field)` when serve refused the configuration, `None` while it serves.
+    fn refusal(limits: ServeLimits, admissions: Vec<CallerAdmission>) -> Option<&'static str> {
+        let store = TestStore::new();
+        match outcome(
+            TcpListener::bind("127.0.0.1:0").unwrap(),
+            limits,
+            admissions,
+            &store.path,
+            CountingBackend::new(true),
+        ) {
+            None => None,
+            Some(Err(ServeError::InvalidConfig(field))) => Some(field),
+            Some(other) => panic!("unexpected serve outcome {other:?}"),
+        }
     }
 
     #[test]
-    fn provider_capacity_is_caller_execution_capacity_not_listener_capacity() {
-        let callers = callers(&[4]);
-        assert_eq!(caller_request_capacity(&callers).unwrap(), 4);
-        assert_eq!(required_connection_capacity(&callers).unwrap(), 8);
+    fn serve_refuses_fewer_connections_than_the_callers_request_slots() {
+        let two = || {
+            vec![
+                admission("a", "key-a-distinct", 8, 8192),
+                admission("b", "key-b-distinct", 8, 8192),
+            ]
+        };
+        let at = |connections| ServeLimits {
+            max_connections: connections,
+            ..limits()
+        };
+        assert_eq!(refusal(at(15), two()), Some("connection capacity"));
+        assert_eq!(refusal(at(16), two()), None);
+        let small = || vec![admission("a", "key-a-distinct", 3, 8192)];
+        assert_eq!(refusal(at(7), small()), Some("connection capacity"));
+        assert_eq!(refusal(at(8), small()), None);
+        let overflowing = vec![
+            admission("a", "key-a-distinct", usize::MAX, 8192),
+            admission("b", "key-b-distinct", 1, 8192),
+        ];
+        assert_eq!(
+            refusal(at(usize::MAX), overflowing),
+            Some("connection capacity")
+        );
+    }
+
+    #[test]
+    fn serve_refuses_a_frame_or_payload_bound_the_other_cannot_carry() {
+        let frame = |bytes| ServeLimits {
+            max_frame_bytes: bytes,
+            ..limits()
+        };
+        let payload = |bytes| vec![admission("a", "key-a-distinct", 4, bytes)];
+        assert_eq!(refusal(frame(8191), payload(4096)), Some("serve limits"));
+        // The tightest legal pair: a 4096-byte payload in an 8192-byte frame.
+        assert_eq!(refusal(frame(8192), payload(4096)), None);
+        assert_eq!(
+            refusal(frame(8192), payload(4097)),
+            Some("caller admission")
+        );
+        assert_eq!(refusal(frame(12288), payload(8192)), None);
+        assert_eq!(
+            refusal(frame(12288), payload(8193)),
+            Some("caller admission")
+        );
+        assert_eq!(
+            refusal(frame(FRAME), payload(4095)),
+            Some("caller admission")
+        );
+        let mixed = vec![
+            admission("a", "key-a-distinct", 4, 8192),
+            admission("b", "key-b-distinct", 4, FRAME),
+        ];
+        assert_eq!(refusal(frame(FRAME), mixed), Some("caller admission"));
+    }
+
+    #[test]
+    fn a_payload_over_the_caller_bound_is_refused_on_the_wire() {
+        let store = TestStore::new();
+        let backend = CountingBackend::new(true);
+        let (client, _) = start_with(
+            backend.clone(),
+            &store,
+            vec![admission(CALLER, KEY, 4, 8192)],
+        );
+        let mut invocation = fresh("request-big");
+        invocation.request.instructions = "x".repeat(10_000);
+        invocation.provider_request_sha256 =
+            crate::contract::provider_request_sha256(&invocation.request).unwrap();
+        let reply = client.execute(&invocation).unwrap();
+        assert_eq!(
+            reply.disposition,
+            TransportDisposition::Refused(Refusal::Policy)
+        );
+        assert_eq!(backend.executions.load(Ordering::SeqCst), 0);
+    }
+
+    struct OversizeBackend {
+        executions: AtomicUsize,
+    }
+
+    impl ProviderBackend for OversizeBackend {
+        fn ready(&self) -> bool {
+            true
+        }
+
+        fn execute(&self, invocation: &TransportInvocation) -> TransportResult {
+            self.executions.fetch_add(1, Ordering::SeqCst);
+            TransportResult::transported(
+                invocation,
+                vec![TransportEvent {
+                    sequence: 0,
+                    payload: TransportEventPayload::TextDelta {
+                        text: "y".repeat(FRAME),
+                    },
+                }],
+                receipt(invocation),
+            )
+        }
+    }
+
+    #[test]
+    fn a_result_larger_than_the_frame_fails_typed_and_is_never_replayed_as_completed() {
+        let store = TestStore::new();
+        let backend = Arc::new(OversizeBackend {
+            executions: AtomicUsize::new(0),
+        });
+        let (client, _) = start_with(backend.clone(), &store, vec![caller(CALLER, KEY, 4)]);
+        let invocation = fresh("request-oversize");
+        let first = client.execute(&invocation).unwrap();
+        let second = client.execute(&invocation).unwrap();
+        let TransportDisposition::Transported { events, receipt } = &first.disposition else {
+            panic!("expected a transported failure");
+        };
+        assert!(events.is_empty());
+        assert_eq!(
+            receipt.outcome,
+            TransportOutcome::Failed {
+                failure_kind: "result_size".to_string(),
+                message: "provider result exceeded its byte bound".to_string(),
+            }
+        );
+        assert_eq!(receipt.transport, "fixture-sse");
+        assert_eq!(first, second, "the retry replays the deliverable failure");
+        assert_eq!(backend.executions.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn the_accept_loop_drops_a_peer_that_is_not_loopback() {
+        let run = |reported: SocketAddr| {
+            let store = TestStore::new();
+            let backend = CountingBackend::new(true);
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let endpoint = listener.local_addr().unwrap();
+            let service = Arc::new(Mutex::new(
+                TransportService::open(&store.path, vec![caller(CALLER, KEY, 4)], 300_000).unwrap(),
+            ));
+            let served = backend.clone();
+            thread::spawn(move || {
+                accept_loop(
+                    || listener.accept().map(|(stream, _)| (stream, reported)),
+                    limits(),
+                    service,
+                    served,
+                )
+            });
+            let client =
+                ConnectorClient::new(endpoint, KEY, FRAME, Some(Duration::from_secs(5))).unwrap();
+            let reply = client.execute(&fresh("request-peer"));
+            (reply.is_ok(), backend.executions.load(Ordering::SeqCst))
+        };
+        assert_eq!(run("127.0.0.1:50000".parse().unwrap()), (true, 1));
+        assert_eq!(run("192.168.1.7:50000".parse().unwrap()), (false, 0));
     }
 
     #[test]
@@ -642,7 +866,7 @@ mod tests {
         let served = backend.clone();
         thread::spawn(move || serve(listener, limits(), admissions, &path, served));
         let client =
-            ConnectorClient::new(endpoint, KEY, 64 * 1024, Some(Duration::from_secs(5))).unwrap();
+            ConnectorClient::new(endpoint, KEY, FRAME, Some(Duration::from_secs(5))).unwrap();
         client.execute(&fresh("request-key")).unwrap();
         assert_eq!(backend.executions.load(Ordering::SeqCst), 1);
     }
