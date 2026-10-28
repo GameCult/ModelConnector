@@ -485,6 +485,18 @@ mod tests {
             TransportDisposition::Transported { .. }
         ));
         assert_eq!(first, second);
+        let TransportDisposition::Transported { events, receipt } = &first.disposition else {
+            unreachable!("matched above");
+        };
+        assert_eq!(
+            events.len(),
+            1,
+            "a result within the bound is delivered as the provider made it"
+        );
+        assert!(matches!(
+            receipt.outcome,
+            TransportOutcome::Completed { .. }
+        ));
         assert_eq!(backend.executions.load(Ordering::SeqCst), 1);
 
         let mut conflicting_request = request();
@@ -800,6 +812,43 @@ mod tests {
         assert_eq!(receipt.transport, "fixture-sse");
         assert_eq!(first, second, "the retry replays the deliverable failure");
         assert_eq!(backend.executions.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_result_is_bounded_by_the_frame_less_its_overhead_inclusively() {
+        let invocation = fresh("request-bound");
+        let result_with = |text_len: usize| {
+            TransportResult::transported(
+                &invocation,
+                vec![TransportEvent {
+                    sequence: 0,
+                    payload: TransportEventPayload::TextDelta {
+                        text: "z".repeat(text_len),
+                    },
+                }],
+                receipt(&invocation),
+            )
+        };
+        let bounded = ServeLimits {
+            max_frame_bytes: 20_000,
+            ..limits()
+        };
+        let max = bounded.max_result_bytes();
+        assert_eq!(max, 20_000 - 4096);
+        // MessagePack headers are the same width across this range, so one probe fixes the size.
+        let probe = rmp_serde::to_vec(&result_with(10_000)).unwrap().len();
+        let exact = 10_000 + max - probe;
+        assert_eq!(rmp_serde::to_vec(&result_with(exact)).unwrap().len(), max);
+        assert_eq!(
+            bound_result(&invocation, result_with(exact), max),
+            result_with(exact)
+        );
+        let over = bound_result(&invocation, result_with(exact + 1), max);
+        let TransportDisposition::Transported { receipt, .. } = &over.disposition else {
+            panic!("expected a transported failure");
+        };
+        assert!(matches!(receipt.outcome, TransportOutcome::Failed { .. }));
+        over.validate_against(&invocation).unwrap();
     }
 
     #[test]
