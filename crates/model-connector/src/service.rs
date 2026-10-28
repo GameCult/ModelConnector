@@ -1027,12 +1027,12 @@ mod tests {
             &security(KEY),
         )
         .unwrap();
-        // The sealed size varies with the random nonce and ciphertext bytes
-        // (a byte of 128 or more takes two), so bracket it: the ciphertext
-        // plus the id is a floor, twice the ciphertext plus the id and the
-        // envelope's other fields is a ceiling.
+        // The frame carries the id twice (the message id and the envelope's
+        // request id) and the base64 of the envelope, so bracket it: the
+        // ciphertext plus the id is a floor, twice the ciphertext and both
+        // ids plus the envelope's other fields is a ceiling.
         let floor = sealed.ciphertext.len() + id.len();
-        let ceiling = 2 * sealed.ciphertext.len() + id.len() + 512;
+        let ceiling = 2 * (sealed.ciphertext.len() + 2 * id.len()) + 512;
         let store = TestStore::new();
         let mut service = open_service(&store, 1);
         assert!(matches!(
