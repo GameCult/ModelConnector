@@ -3530,7 +3530,12 @@ mod tests {
         );
         assert!(service.live.is_empty());
         assert_eq!(service.window_spend(CALLER, 5), 3 * FIXTURE_USAGE_COST);
-        // Inside the full window the clock is not behind: an honest ceiling.
+        // At the window's first instant, and inside it, the clock is not
+        // behind: an honest ceiling.
+        assert_eq!(
+            refusal_at(&mut service, "at-start", 50_000, MAX_COST),
+            Refusal::SpendCeiling
+        );
         assert_eq!(
             refusal_at(&mut service, "inside", 50_500, MAX_COST),
             Refusal::SpendCeiling
