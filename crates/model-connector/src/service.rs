@@ -531,7 +531,8 @@ mod tests {
                 .begin(
                     &encrypt_invocation(&epiphany, &security("epiphany-distinct-test-key"))
                         .unwrap(),
-                    1_000, FRAME,
+                    1_000,
+                    FRAME,
                 )
                 .unwrap(),
             TransportAdmission::Execute(_)
@@ -541,7 +542,8 @@ mod tests {
                 .begin(
                     &encrypt_invocation(&ghostlight, &security("ghostlight-distinct-test-key"))
                         .unwrap(),
-                    1_000, FRAME,
+                    1_000,
+                    FRAME,
                 )
                 .unwrap(),
             TransportAdmission::Execute(_)
@@ -555,7 +557,11 @@ mod tests {
         let security = security("epiphany-distinct-test-key");
         let mut service = open_service(&store, 1);
         let claim = match service
-            .begin(&encrypt_invocation(&invocation, &security).unwrap(), 1_000, FRAME)
+            .begin(
+                &encrypt_invocation(&invocation, &security).unwrap(),
+                1_000,
+                FRAME,
+            )
             .unwrap()
         {
             TransportAdmission::Execute(claim) => claim,
@@ -583,7 +589,11 @@ mod tests {
         let mut service = open_service(&store, 1);
 
         let replay = match service
-            .begin(&encrypt_invocation(&invocation, &security).unwrap(), 1_000, FRAME)
+            .begin(
+                &encrypt_invocation(&invocation, &security).unwrap(),
+                1_000,
+                FRAME,
+            )
             .unwrap()
         {
             TransportAdmission::Reply(response) => response,
@@ -602,7 +612,11 @@ mod tests {
             TransportInvocation::new("epiphany-yggdrasil", 2_000, [7; 32], changed_request)
                 .unwrap();
         let refusal = match service
-            .begin(&encrypt_invocation(&conflicting, &security).unwrap(), 1_000, FRAME)
+            .begin(
+                &encrypt_invocation(&conflicting, &security).unwrap(),
+                1_000,
+                FRAME,
+            )
             .unwrap()
         {
             TransportAdmission::Reply(response) => response,
@@ -631,7 +645,11 @@ mod tests {
 
         for (invocation, expected) in [(&first, Refusal::InFlight), (&second, Refusal::Capacity)] {
             let response = match service
-                .begin(&encrypt_invocation(invocation, &security).unwrap(), 1_000, FRAME)
+                .begin(
+                    &encrypt_invocation(invocation, &security).unwrap(),
+                    1_000,
+                    FRAME,
+                )
                 .unwrap()
             {
                 TransportAdmission::Reply(response) => response,
@@ -655,7 +673,11 @@ mod tests {
         let mut service = open_service(&store, 1);
         assert!(matches!(
             service
-                .begin(&encrypt_invocation(&first, &security).unwrap(), 1_000, FRAME)
+                .begin(
+                    &encrypt_invocation(&first, &security).unwrap(),
+                    1_000,
+                    FRAME
+                )
                 .unwrap(),
             TransportAdmission::Execute(_)
         ));
@@ -663,7 +685,11 @@ mod tests {
 
         let mut restarted = open_service(&store, 1);
         let ambiguous = match restarted
-            .begin(&encrypt_invocation(&first, &security).unwrap(), 1_000, FRAME)
+            .begin(
+                &encrypt_invocation(&first, &security).unwrap(),
+                1_000,
+                FRAME,
+            )
             .unwrap()
         {
             TransportAdmission::Reply(response) => response,
@@ -677,7 +703,11 @@ mod tests {
         );
         assert!(matches!(
             restarted
-                .begin(&encrypt_invocation(&second, &security).unwrap(), 1_000, FRAME)
+                .begin(
+                    &encrypt_invocation(&second, &security).unwrap(),
+                    1_000,
+                    FRAME
+                )
                 .unwrap(),
             TransportAdmission::Execute(_)
         ));
@@ -808,12 +838,16 @@ mod tests {
 
         let mut expired = invocation_for(CALLER, "expired");
         expired.expires_at_unix_ms = 10;
-        let reply = service.begin(&raw_envelope(&expired), 1_000, FRAME).unwrap();
+        let reply = service
+            .begin(&raw_envelope(&expired), 1_000, FRAME)
+            .unwrap();
         assert_eq!(refusal_of(reply, &expired), Refusal::Expired);
 
         let mut substituted = invocation_for(CALLER, "substituted");
         substituted.provider_request_sha256 = [9; 32];
-        let reply = service.begin(&raw_envelope(&substituted), 1_000, FRAME).unwrap();
+        let reply = service
+            .begin(&raw_envelope(&substituted), 1_000, FRAME)
+            .unwrap();
         assert_eq!(
             refusal_of(reply, &substituted),
             Refusal::ProviderDigestSubstitution
@@ -821,7 +855,9 @@ mod tests {
 
         let mut malformed = invocation_for(CALLER, "malformed");
         malformed.native_request_sha256 = [0; 32];
-        let reply = service.begin(&raw_envelope(&malformed), 1_000, FRAME).unwrap();
+        let reply = service
+            .begin(&raw_envelope(&malformed), 1_000, FRAME)
+            .unwrap();
         assert_eq!(refusal_of(reply, &malformed), Refusal::Malformed);
     }
 
@@ -1003,7 +1039,10 @@ mod tests {
         request_id: &str,
     ) -> (Box<ExecutionClaim>, TransportInvocation) {
         let invocation = invocation_for(CALLER, request_id);
-        match service.begin(&raw_envelope(&invocation), 1_000, FRAME).unwrap() {
+        match service
+            .begin(&raw_envelope(&invocation), 1_000, FRAME)
+            .unwrap()
+        {
             TransportAdmission::Execute(claim) => (claim, invocation),
             TransportAdmission::Reply(_) => panic!("expected an execution claim"),
         }
@@ -1053,8 +1092,9 @@ mod tests {
         assert_eq!(receipt.transport, "model-connector");
 
         // The recorded replay is the stand-in's exact bytes.
-        let TransportAdmission::Reply(replay) =
-            service.begin(&raw_envelope(&invocation), 1_000, FRAME).unwrap()
+        let TransportAdmission::Reply(replay) = service
+            .begin(&raw_envelope(&invocation), 1_000, FRAME)
+            .unwrap()
         else {
             panic!("expected a replay");
         };
@@ -1174,8 +1214,9 @@ mod tests {
         );
         // Still active, never completed, and no longer live: the retry is told the
         // outcome is indeterminate.
-        let TransportAdmission::Reply(reply) =
-            service.begin(&raw_envelope(&invocation), 1_000, FRAME).unwrap()
+        let TransportAdmission::Reply(reply) = service
+            .begin(&raw_envelope(&invocation), 1_000, FRAME)
+            .unwrap()
         else {
             panic!("expected a refusal");
         };

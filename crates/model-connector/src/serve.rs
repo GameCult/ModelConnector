@@ -12,8 +12,8 @@ use zeroize::Zeroizing;
 
 use crate::contract::{TransportInvocation, TransportResult};
 use crate::envelope::{
-    ServiceError, TransportEnvelope, TransportFrameError, read_transport_frame, frame_bytes_for_payload,
-    write_transport_frame,
+    ServiceError, TransportEnvelope, TransportFrameError, frame_bytes_for_payload,
+    read_transport_frame, write_transport_frame,
 };
 use crate::service::{CallerAdmission, TransportAdmission, TransportService};
 
@@ -766,20 +766,14 @@ mod tests {
         );
         // The tightest legal pair: the smallest payload in the smallest frame.
         assert_eq!(refusal(frame(tightest), payload(4096)), None);
-        assert_eq!(
-            refusal(frame(tightest), payload(4097)),
-            Some("frame bound")
-        );
+        assert_eq!(refusal(frame(tightest), payload(4097)), Some("frame bound"));
         assert_eq!(
             refusal(frame(tightest), payload(4095)),
             Some("caller admission")
         );
         // The bound is the sealed frame at its worst encoding, not the payload:
         // a payload that is the whole frame cannot be carried.
-        assert_eq!(
-            refusal(frame(FRAME), payload(FRAME)),
-            Some("frame bound")
-        );
+        assert_eq!(refusal(frame(FRAME), payload(FRAME)), Some("frame bound"));
         for bytes in [8192, 65_535, 65_536, 100_000] {
             let widest = frame_bytes_for_payload(bytes);
             assert_eq!(refusal(frame(widest), payload(bytes)), None, "{bytes}");

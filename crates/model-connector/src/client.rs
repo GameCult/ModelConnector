@@ -70,7 +70,6 @@ impl ConnectorClient {
     }
 }
 
-
 #[cfg(test)]
 mod client_endpoint_tests {
     use super::*;
@@ -109,7 +108,6 @@ mod client_endpoint_tests {
         }
     }
 }
-
 
 #[derive(Debug, Error)]
 pub enum ConnectorClientError {

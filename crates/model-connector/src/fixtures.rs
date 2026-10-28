@@ -126,4 +126,3 @@ pub(crate) fn invocation_for(caller_runtime_id: &str, request_id: &str) -> Trans
     request.request_id = request_id.to_string();
     TransportInvocation::new(caller_runtime_id, 2_000, [7; 32], request).unwrap()
 }
-

@@ -289,10 +289,7 @@ impl TransportResult {
         }
     }
 
-    pub fn validate_against(
-        &self,
-        invocation: &TransportInvocation,
-    ) -> Result<(), ContractError> {
+    pub fn validate_against(&self, invocation: &TransportInvocation) -> Result<(), ContractError> {
         if self.schema_id != RESULT_SCHEMA_ID {
             return Err(ContractError::Schema);
         }
@@ -363,10 +360,7 @@ pub struct TransportReceipt {
 }
 
 impl TransportReceipt {
-    pub fn validate_against(
-        &self,
-        invocation: &TransportInvocation,
-    ) -> Result<(), ContractError> {
+    pub fn validate_against(&self, invocation: &TransportInvocation) -> Result<(), ContractError> {
         if self.schema_id != RECEIPT_SCHEMA_ID {
             return Err(ContractError::Schema);
         }
@@ -518,7 +512,6 @@ pub enum ContractError {
     Encoding,
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -618,8 +611,7 @@ mod tests {
         assert_eq!(result.validate_against(&invocation), Ok(()));
 
         let mut reordered = result;
-        let TransportDisposition::Transported { events, .. } = &mut reordered.disposition
-        else {
+        let TransportDisposition::Transported { events, .. } = &mut reordered.disposition else {
             unreachable!()
         };
         events[0].sequence = 1;

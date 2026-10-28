@@ -497,12 +497,18 @@ mod tests {
 
     #[test]
     fn the_payload_bound_a_frame_allows_inverts_the_frame_a_payload_needs() {
-        assert_eq!(payload_bytes_for_frame(frame_bytes_for_payload(0) - 1), None);
+        assert_eq!(
+            payload_bytes_for_frame(frame_bytes_for_payload(0) - 1),
+            None
+        );
         assert_eq!(payload_bytes_for_frame(frame_bytes_for_payload(0)), Some(0));
         for bytes in [1, 15, 16, 4096, 65_535, 65_536, 100_000, 2_000_000] {
             let frame = frame_bytes_for_payload(bytes);
             assert_eq!(payload_bytes_for_frame(frame), Some(bytes), "{bytes}");
-            assert!(payload_bytes_for_frame(frame - 1).unwrap() < bytes, "{bytes}");
+            assert!(
+                payload_bytes_for_frame(frame - 1).unwrap() < bytes,
+                "{bytes}"
+            );
         }
     }
 }
