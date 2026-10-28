@@ -462,6 +462,8 @@ pub enum ServiceError {
     SharedCallerKey,
     #[error("connector replay store failed: {0}")]
     ReplayStore(String),
+    #[error("an allowed model has no price: {0}")]
+    UnpricedModel(String),
     #[error("connector replay record is malformed")]
     InvalidReplayRecord,
     #[error("caller key changed while durable replay records still exist")]

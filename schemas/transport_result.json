@@ -46,12 +46,15 @@
         "ModelNotAllowed",
         "OutputBound",
         "PayloadBound",
+        "CostBound",
+        "SpendCeiling",
         "Capacity",
         "InFlight",
         "Indeterminate",
         "ReplayConflict",
         "Malformed",
-        "ForeignReasoningState"
+        "ForeignReasoningState",
+        "ClockBehindAdmissionWindow"
       ]
     },
     "StopReason": {
@@ -250,6 +253,17 @@
                 },
                 "message": {
                   "type": "string"
+                },
+                "usage": {
+                  "description": "What the provider billed for the failed request: `Some` when it\nreported usage (`Some` of zeros when it billed nothing), `None`\nwhen unknown.",
+                  "anyOf": [
+                    {
+                      "$ref": "#/$defs/Usage"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
                 }
               },
               "additionalProperties": false,
@@ -271,6 +285,12 @@
       "properties": {
         "caller_runtime_id": {
           "type": "string"
+        },
+        "cost_micro_usd": {
+          "description": "What the request cost, in micro-USD. The service derives it from the\noutcome's usage and its price table; a backend never writes it.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
         },
         "foreign_reasoning_dropped": {
           "description": "How many foreign `ReasoningState` items the service removed from the\nrequest before the backend saw it.",
@@ -294,6 +314,12 @@
         },
         "outcome": {
           "$ref": "#/$defs/TransportOutcome"
+        },
+        "overrun_micro_usd": {
+          "description": "How far `cost_micro_usd` exceeds what the service reserved for the\nrequest: zero unless the backend reported usage above the worst case\nthe request allowed, which is a breach of the backend's contract. The\ncost is still the true one and the caller's window is charged all of\nit. The service derives this; a backend never writes it.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
         },
         "provider": {
           "type": "string"
@@ -326,11 +352,13 @@
         "model",
         "provider",
         "foreign_reasoning_dropped",
+        "cost_micro_usd",
+        "overrun_micro_usd",
         "outcome"
       ]
     },
     "Usage": {
-      "description": "Token accounting for one completed request. Cache reads and writes are\ncounted apart from plain input; `reasoning_tokens` is absent when the\nprovider does not report it.",
+      "description": "Token accounting for one request, as the backend reports it; the service\nprices it. Cache reads and writes are counted apart from plain input.\n`output_tokens` includes reasoning tokens: `reasoning_tokens` is a detail\n(absent when the provider does not report it) and is never priced apart.",
       "type": "object",
       "properties": {
         "cache_read_tokens": {

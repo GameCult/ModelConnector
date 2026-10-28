@@ -81,7 +81,7 @@ fn request() -> ProviderRequest {
 }
 
 fn invocation() -> TransportInvocation {
-    TransportInvocation::new(CALLER, 1_800_000_000_000, [7; 32], request()).unwrap()
+    TransportInvocation::new(CALLER, 1_800_000_000_000, [7; 32], 5_000_000, request()).unwrap()
 }
 
 fn receipt(outcome: TransportOutcome) -> TransportReceipt {
@@ -95,6 +95,8 @@ fn receipt(outcome: TransportOutcome) -> TransportReceipt {
         model: invocation.request.model.clone(),
         provider: "anthropic-messages".to_string(),
         foreign_reasoning_dropped: 2,
+        cost_micro_usd: 1_234_567,
+        overrun_micro_usd: 89,
         outcome,
     }
 }
@@ -168,6 +170,13 @@ fn wire_golden_v3() {
     let failed = receipt(TransportOutcome::Failed {
         kind: FailureKind::RateLimited,
         message: "provider asked to slow down".to_string(),
+        usage: Some(Usage {
+            input_tokens: 120,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            output_tokens: 0,
+            reasoning_tokens: None,
+        }),
     });
     assert_eq!(failed.validate_against(&invocation), Ok(()));
     assert_wire("transport_receipt_failed.mp", &failed);

@@ -190,9 +190,10 @@ pub enum FailureKind {
     Provider,
 }
 
-/// Token accounting for one completed request. Cache reads and writes are
-/// counted apart from plain input; `reasoning_tokens` is absent when the
-/// provider does not report it.
+/// Token accounting for one request, as the backend reports it; the service
+/// prices it. Cache reads and writes are counted apart from plain input.
+/// `output_tokens` includes reasoning tokens: `reasoning_tokens` is a detail
+/// (absent when the provider does not report it) and is never priced apart.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Usage {
@@ -251,6 +252,10 @@ pub struct TransportInvocation {
     pub expires_at_unix_ms: u64,
     pub native_request_sha256: [u8; 32],
     pub provider_request_sha256: [u8; 32],
+    /// The most this request may cost, in micro-USD: the caller's own bound
+    /// on it. Required nonzero. It is part of the invocation's identity, so a
+    /// changed budget under a recorded request id is a `ReplayConflict`.
+    pub max_cost_micro_usd: u64,
     pub request: ProviderRequest,
 }
 
@@ -259,6 +264,7 @@ impl TransportInvocation {
         caller_runtime_id: impl Into<String>,
         expires_at_unix_ms: u64,
         native_request_sha256: [u8; 32],
+        max_cost_micro_usd: u64,
         request: ProviderRequest,
     ) -> Result<Self, ContractError> {
         let provider_request_sha256 = provider_request_sha256(&request)?;
@@ -268,6 +274,7 @@ impl TransportInvocation {
             expires_at_unix_ms,
             native_request_sha256,
             provider_request_sha256,
+            max_cost_micro_usd,
             request,
         })
     }
@@ -279,6 +286,9 @@ impl TransportInvocation {
         require_id(&self.caller_runtime_id, "caller_runtime_id")?;
         if self.native_request_sha256 == [0; 32] {
             return Err(ContractError::Invalid("native_request_sha256"));
+        }
+        if self.max_cost_micro_usd == 0 {
+            return Err(ContractError::Invalid("max_cost_micro_usd"));
         }
         self.request.validate()?;
         if self.provider_request_sha256 != provider_request_sha256(&self.request)? {
@@ -475,6 +485,15 @@ pub struct TransportReceipt {
     /// How many foreign `ReasoningState` items the service removed from the
     /// request before the backend saw it.
     pub foreign_reasoning_dropped: u32,
+    /// What the request cost, in micro-USD. The service derives it from the
+    /// outcome's usage and its price table; a backend never writes it.
+    pub cost_micro_usd: u64,
+    /// How far `cost_micro_usd` exceeds what the service reserved for the
+    /// request: zero unless the backend reported usage above the worst case
+    /// the request allowed, which is a breach of the backend's contract. The
+    /// cost is still the true one and the caller's window is charged all of
+    /// it. The service derives this; a backend never writes it.
+    pub overrun_micro_usd: u64,
     pub outcome: TransportOutcome,
 }
 
@@ -524,6 +543,10 @@ pub enum TransportOutcome {
     Failed {
         kind: FailureKind,
         message: String,
+        /// What the provider billed for the failed request: `Some` when it
+        /// reported usage (`Some` of zeros when it billed nothing), `None`
+        /// when unknown.
+        usage: Option<Usage>,
     },
 }
 
@@ -535,6 +558,12 @@ pub enum Refusal {
     ModelNotAllowed,
     OutputBound,
     PayloadBound,
+    // The worst case of the request exceeds the invocation's own
+    // `max_cost_micro_usd`. Plain comments: a doc comment would split the
+    // published schema into a union.
+    CostBound,
+    // The caller's spend window cannot hold the request's reservation.
+    SpendCeiling,
     Capacity,
     InFlight,
     Indeterminate,
@@ -544,6 +573,12 @@ pub enum Refusal {
     // exchange, where dropping it would break the provider's own rules. A plain
     // comment: a doc comment would split the published schema into a union.
     ForeignReasoningState,
+    // The caller's newest admission window starts after the clock's reading,
+    // and the request does not fit what that window holds: the host's clock
+    // is behind the window and the caller stays refused until it catches up.
+    // A plain comment: a doc comment would split the published schema into a
+    // union.
+    ClockBehindAdmissionWindow,
 }
 
 /// The one wire codec of every v3 document: named MessagePack (struct fields
@@ -752,6 +787,31 @@ mod tests {
     }
 
     #[test]
+    fn max_cost_zero_is_malformed() {
+        let mut invocation = invocation();
+        invocation.max_cost_micro_usd = 0;
+        assert_eq!(
+            invocation.validate(1_000, 2_000),
+            Err(ContractError::Invalid("max_cost_micro_usd"))
+        );
+        invocation.max_cost_micro_usd = 1;
+        assert_eq!(invocation.validate(1_000, 2_000), Ok(()));
+    }
+
+    #[test]
+    fn max_cost_is_part_of_the_invocations_identity() {
+        let one = invocation();
+        let mut other = one.clone();
+        other.max_cost_micro_usd += 1;
+        assert_ne!(
+            canonical_invocation_bytes(&one).unwrap(),
+            canonical_invocation_bytes(&other).unwrap()
+        );
+        let decoded: TransportInvocation = wire_decode(&wire_encode(&one).unwrap()).unwrap();
+        assert_eq!(decoded.max_cost_micro_usd, one.max_cost_micro_usd);
+    }
+
+    #[test]
     fn typed_tool_round_survives_messagepack() {
         let invocation = invocation();
         let bytes = wire_encode(&invocation).unwrap();
@@ -946,6 +1006,7 @@ mod tests {
             sent.outcome = TransportOutcome::Failed {
                 kind,
                 message: "failed".to_string(),
+                usage: None,
             };
             assert_eq!(sent.validate_against(&invocation), Ok(()));
             let decoded: TransportReceipt = wire_decode(&wire_encode(&sent).unwrap()).unwrap();
@@ -955,6 +1016,7 @@ mod tests {
         blank.outcome = TransportOutcome::Failed {
             kind: FailureKind::Provider,
             message: String::new(),
+            usage: None,
         };
         assert_eq!(
             blank.validate_against(&invocation),
@@ -991,6 +1053,54 @@ mod tests {
                 Err(ContractError::Identity)
             );
         }
+    }
+
+    #[test]
+    fn validate_against_refuses_each_binding_field_of_the_receipt() {
+        let invocation = invocation();
+        let good = receipt(&invocation);
+        assert_eq!(good.validate_against(&invocation), Ok(()));
+
+        let mut schema = good.clone();
+        schema.schema_id = "other".to_string();
+        assert_eq!(
+            schema.validate_against(&invocation),
+            Err(ContractError::Schema)
+        );
+        let mut provider_digest = good.clone();
+        provider_digest.provider_request_sha256 = [9; 32];
+        assert_eq!(
+            provider_digest.validate_against(&invocation),
+            Err(ContractError::ProviderDigest)
+        );
+        let mut native_digest = good.clone();
+        native_digest.native_request_sha256 = [9; 32];
+        assert_eq!(
+            native_digest.validate_against(&invocation),
+            Err(ContractError::NativeDigest)
+        );
+        let mut blank_provider = good.clone();
+        blank_provider.provider = " ".to_string();
+        assert_eq!(
+            blank_provider.validate_against(&invocation),
+            Err(ContractError::Invalid("receipt.provider"))
+        );
+        let mut blank_response = good.clone();
+        blank_response.outcome = TransportOutcome::Completed {
+            provider_response_id: Some(String::new()),
+            stop_reason: StopReason::EndTurn,
+            usage: Usage {
+                input_tokens: 0,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+                output_tokens: 0,
+                reasoning_tokens: None,
+            },
+        };
+        assert_eq!(
+            blank_response.validate_against(&invocation),
+            Err(ContractError::Invalid("receipt.provider_response_id"))
+        );
     }
 
     fn reasoning(state: &[u8]) -> TransportEventPayload {
@@ -1067,6 +1177,7 @@ mod tests {
         failed.outcome = TransportOutcome::Failed {
             kind: FailureKind::RateLimited,
             message: "slow down".to_string(),
+            usage: None,
         };
         let partial = TransportResult::transported(
             vec![event(0, text("half")), event(1, reasoning(&[1, 2, 3]))],
