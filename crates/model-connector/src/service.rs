@@ -3461,4 +3461,28 @@ mod tests {
         assert_eq!(charged_of(&service, "request-1"), reservation());
         assert_eq!(service.window_spend(CALLER, 0), reservation());
     }
+
+    #[test]
+    fn a_stepped_back_clock_admits_into_the_newest_window_not_an_older_live_one() {
+        let window = 10_000;
+        // The premise: a live reservation fills more of a window than the
+        // ceiling leaves, so admitting into the old window would succeed.
+        assert!(reservation() > 2 * FIXTURE_USAGE_COST);
+        let ceiling = reservation() + 2 * FIXTURE_USAGE_COST;
+        let store = TestStore::new();
+        let mut service = open_limited(&store, ceiling, window);
+        // A request stays live in window 2 while window 9 fills.
+        let old = claim_at(&mut service, "old", 20_000);
+        assert_eq!(run_window(&mut service, "fill", 90_000), 3);
+        assert_eq!(service.window_spend(CALLER, 9), 3 * FIXTURE_USAGE_COST);
+        // The clock reads window 2 again. Window 2 has room (only the live
+        // reservation), window 9 does not: the caller's window is the newest.
+        assert_eq!(
+            refusal_at(&mut service, "back", 20_500, MAX_COST),
+            Refusal::SpendCeiling
+        );
+        assert_eq!(service.window_spend(CALLER, 2), reservation());
+        assert_eq!(service.window_spend(CALLER, 9), 3 * FIXTURE_USAGE_COST);
+        drop(old);
+    }
 }
