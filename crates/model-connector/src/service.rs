@@ -256,6 +256,42 @@ fn add_spend(
     *held = held.saturating_sub(release).saturating_add(charge);
 }
 
+/// The clock a request is admitted at: `now`, held monotonic per caller. A
+/// caller's window never moves back, so a clock that steps back (or a boot
+/// with the clock behind a recorded window) cannot reopen spent budget: the
+/// request is admitted into the caller's newest recorded window. The record
+/// stores this value, so the window re-derives from the records at open.
+fn admission_clock(
+    window_spend: &HashMap<String, BTreeMap<u64, u64>>,
+    caller_runtime_id: &str,
+    now_unix_ms: u64,
+    spend_window_ms: u64,
+) -> u64 {
+    let newest = window_spend
+        .get(caller_runtime_id)
+        .and_then(|windows| windows.keys().next_back().copied())
+        .unwrap_or(0);
+    now_unix_ms.max(newest.saturating_mul(spend_window_ms))
+}
+
+/// The clock a request is admitted at: `now`, held monotonic per caller. A
+/// caller's window never moves back, so a clock that steps back (or a boot
+/// with the clock behind a recorded window) cannot reopen spent budget: the
+/// request is admitted into the caller's newest recorded window. The record
+/// stores this value, so the window re-derives from the records at open.
+fn admission_clock(
+    window_spend: &HashMap<String, BTreeMap<u64, u64>>,
+    caller_runtime_id: &str,
+    now_unix_ms: u64,
+    spend_window_ms: u64,
+) -> u64 {
+    let newest = window_spend
+        .get(caller_runtime_id)
+        .and_then(|windows| windows.keys().next_back().copied())
+        .unwrap_or(0);
+    now_unix_ms.max(newest.saturating_mul(spend_window_ms))
+}
+
 /// Drops the windows of `caller_runtime_id` that nothing can still read:
 /// those before `floor` that hold no live request's reservation. Admission
 /// reads the current window alone, and a live request settles into the window
@@ -699,7 +735,9 @@ impl TransportService {
         // A request belongs to the window it is admitted in. The ceiling is
         // checked after the replay lookup, so a recorded answer is replayed
         // whatever the caller has left.
-        let window = now_unix_ms / spend_window_ms;
+        let admitted_at_unix_ms =
+            admission_clock(&self.window_spend, &identity.caller_runtime_id, now_unix_ms, spend_window_ms);
+        let window = admitted_at_unix_ms / spend_window_ms;
         prune_windows(
             &mut self.window_spend,
             &self.live,
@@ -723,7 +761,7 @@ impl TransportService {
             invocation_sha256,
             expires_at_unix_ms: invocation.expires_at_unix_ms,
             state: ReplayState::Active { reserved_micro_usd },
-            admitted_at_unix_ms: now_unix_ms,
+            admitted_at_unix_ms,
         };
         self.replay_store
             .put(replay_key(&identity), &replay_record)
@@ -808,14 +846,19 @@ impl TransportService {
         // is recorded and the slot released, so the caller gets an answer and
         // a retry replays it.
         let admissible = self.admits_result(&result, &claim);
-        // An admissible result charges the cost its receipt carries (the real
-        // cost, even when the answer is replaced by a stand-in that fits the
-        // frame); a result the service refused charges the whole reservation.
+        // The service prices what the backend reported: a transported result
+        // charges the cost its own outcome's usage derives, and its overrun
+        // past the reservation, whatever its receipt says (a receipt that
+        // misstates either is replaced by the stand-in but still charged the
+        // true cost). Anything else charges the whole reservation.
         let charge = match &result.disposition {
-            TransportDisposition::Transported { receipt, .. } if admissible => Charge {
-                cost_micro_usd: receipt.cost_micro_usd,
-                overrun_micro_usd: receipt.overrun_micro_usd,
-            },
+            TransportDisposition::Transported { receipt, .. } => {
+                let cost_micro_usd = claim.call.cost_of(&receipt.outcome);
+                Charge {
+                    cost_micro_usd,
+                    overrun_micro_usd: claim.call.overrun_of(cost_micro_usd),
+                }
+            }
             _ => Charge {
                 cost_micro_usd: reserved_micro_usd,
                 overrun_micro_usd: 0,
@@ -3019,9 +3062,18 @@ mod tests {
             let invocation = invocation_at(&id, 1_000, MAX_COST);
             let response = service.complete(*claim, result, FRAME).unwrap();
             let receipt = receipt_of(&response, &invocation);
+            // The service prices the usage itself: the stand-in and the ledger
+            // carry the true cost and the true overrun, whatever was claimed.
+            let (cost, true_overrun) = if index == 0 {
+                (FIXTURE_USAGE_COST, 0)
+            } else {
+                (OVERRUN_COST, OVERRUN_COST - reserved)
+            };
             assert_eq!(receipt.provider, STAND_IN_PROVIDER, "{index}");
-            assert_eq!(receipt.cost_micro_usd, reserved, "{index}");
-            assert_eq!(receipt.overrun_micro_usd, 0, "{index}");
+            assert_eq!(receipt.cost_micro_usd, cost, "{index}");
+            assert_eq!(receipt.overrun_micro_usd, true_overrun, "{index}");
+            assert_eq!(charged_of(&service, &id), cost, "{index}");
+            assert_eq!(service.window_spend(CALLER, 0), cost, "{index}");
         }
     }
 
@@ -3154,5 +3206,198 @@ mod tests {
             5_000,
         )
         .unwrap()
+    }
+
+    fn run_window(service: &mut TransportService, prefix: &str, now: u64) -> u32 {
+        let mut admitted = 0;
+        for i in 0..20u64 {
+            let (admission, _) = begin_at(service, &format!("{prefix}-{i:02}"), now + i, MAX_COST);
+            let TransportAdmission::Execute(claim) = admission else {
+                break;
+            };
+            admitted += 1;
+            let result = text_result(claim.call(), "done");
+            service.complete(*claim, result, FRAME).unwrap();
+        }
+        admitted
+    }
+
+    #[test]
+    fn a_clock_stepping_back_cannot_reopen_the_callers_budget() {
+        let window = 10_000;
+        // Room for the reservation plus two settled requests: three admitted.
+        let ceiling = reservation() + 2 * FIXTURE_USAGE_COST;
+        let control_store = TestStore::new();
+        let mut control = open_limited(&control_store, ceiling, window);
+        assert_eq!(run_window(&mut control, "back", 20_000), 3);
+
+        let store = TestStore::new();
+        let mut service = open_limited(&store, ceiling, window);
+        let claim = claim_at(&mut service, "ahead", 50_000);
+        let result = text_result(claim.call(), "done");
+        service.complete(*claim, result, FRAME).unwrap();
+        // The clock now reads window 2, behind the recorded window 5: the
+        // request belongs to window 5, which already holds one.
+        assert_eq!(run_window(&mut service, "back", 20_000), 2);
+        assert_eq!(service.window_spend(CALLER, 5), 3 * FIXTURE_USAGE_COST);
+        assert_eq!(service.window_spend(CALLER, 2), 0);
+        drop(service);
+
+        let mut service = open_limited(&store, ceiling, window);
+        assert_eq!(service.window_spend(CALLER, 5), 3 * FIXTURE_USAGE_COST);
+        assert_eq!(run_window(&mut service, "again", 20_100), 0);
+        assert_eq!(
+            refusal_at(&mut service, "last", 20_200, MAX_COST),
+            Refusal::SpendCeiling
+        );
+    }
+
+    #[test]
+    fn a_clock_jumping_forward_opens_a_fresh_window() {
+        let window = 10_000;
+        let ceiling = reservation() + 2 * FIXTURE_USAGE_COST;
+        let store = TestStore::new();
+        let mut service = open_limited(&store, ceiling, window);
+        assert_eq!(run_window(&mut service, "early", 20_000), 3);
+        assert_eq!(run_window(&mut service, "later", 90_000), 3);
+        assert_eq!(service.window_spend(CALLER, 9), 3 * FIXTURE_USAGE_COST);
+        assert_eq!(service.window_spend(CALLER, 2), 0);
+    }
+
+    /// Hand-written rates: the long tier is cheaper on input and dearer on
+    /// output, so neither tier alone bounds both.
+    fn mixed_long_tier(above_prompt_tokens: u64) -> ModelPrice {
+        ModelPrice {
+            rates: Rates {
+                input: 3_000_000,
+                cache_write_short: 3_750_000,
+                cache_write_long: 6_000_000,
+                cache_read: 300_000,
+                output: 15_000_000,
+            },
+            long_context: Some(LongContext {
+                above_prompt_tokens,
+                rates: Rates {
+                    input: 1_000_000,
+                    cache_write_short: 1_250_000,
+                    cache_write_long: 2_000_000,
+                    cache_read: 100_000,
+                    output: 30_000_000,
+                },
+            }),
+            overhead_tokens: 100,
+        }
+    }
+
+    #[test]
+    fn the_reservation_is_the_dearer_of_both_tiers_class_by_class() {
+        let request = request();
+        let bound = wire_encode(&request).unwrap().len() as u64 + 100;
+        // Above the threshold: input at the base tier's dearer rate, output at
+        // the long tier's.
+        let dearest = Rates {
+            input: 3_000_000,
+            cache_write_short: 3_750_000,
+            cache_write_long: 6_000_000,
+            cache_read: 300_000,
+            output: 30_000_000,
+        };
+        assert_eq!(
+            reservation_micro_usd(&mixed_long_tier(bound - 1), &request).unwrap(),
+            Some(expected_reservation(&request, &dearest, 100))
+        );
+        // At the threshold the base tier alone applies.
+        assert_eq!(
+            reservation_micro_usd(&mixed_long_tier(bound), &request).unwrap(),
+            Some(expected_reservation(&request, &fixture_price().rates, 100))
+        );
+    }
+
+    fn xorshift(state: &mut u64) -> u64 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state
+    }
+
+    fn random_rates(state: &mut u64) -> Rates {
+        Rates {
+            input: xorshift(state) % 50_000_000,
+            cache_write_short: xorshift(state) % 50_000_000,
+            cache_write_long: xorshift(state) % 50_000_000,
+            cache_read: xorshift(state) % 50_000_000,
+            output: xorshift(state) % 200_000_000,
+        }
+    }
+
+    /// Any usage within the bound the reservation assumes (prompt tokens no
+    /// more than encoded bytes plus overhead, output no more than the cap)
+    /// costs no more than the reservation, whatever the price shape.
+    #[test]
+    fn no_usage_within_the_bound_prices_above_the_reservation() {
+        let mut s = 0x9E37_79B9_7F4A_7C15u64;
+        for _ in 0..5_000 {
+            let mut request = request();
+            request.max_output_tokens = (xorshift(&mut s) % 100_000) as u32;
+            request.cache_retention = match xorshift(&mut s) % 3 {
+                0 => None,
+                1 => Some(CacheRetention::Short),
+                _ => Some(CacheRetention::Long),
+            };
+            request.instructions = "x".repeat((xorshift(&mut s) % 3000) as usize);
+            let overhead = xorshift(&mut s) % 5_000;
+            let bound = wire_encode(&request).unwrap().len() as u64 + overhead;
+            let long_context = (xorshift(&mut s) % 2 == 0).then(|| LongContext {
+                above_prompt_tokens: xorshift(&mut s) % (2 * bound + 1),
+                rates: random_rates(&mut s),
+            });
+            let price = ModelPrice {
+                rates: random_rates(&mut s),
+                long_context,
+                overhead_tokens: overhead,
+            };
+            let reserved = reservation_micro_usd(&price, &request).unwrap().unwrap();
+            let prompt = if xorshift(&mut s) % 4 == 0 {
+                bound
+            } else {
+                xorshift(&mut s) % (bound + 1)
+            };
+            let a = xorshift(&mut s) % (prompt + 1);
+            let b = xorshift(&mut s) % (prompt - a + 1);
+            let max_output = u64::from(request.max_output_tokens);
+            let output = if xorshift(&mut s) % 4 == 0 {
+                max_output
+            } else {
+                xorshift(&mut s) % (max_output + 1)
+            };
+            let cost = cost_micro_usd(
+                &price,
+                &usage(a, b, prompt - a - b, output),
+                request.cache_retention,
+            );
+            assert!(cost <= reserved, "{price:?} {a} {b} {output}: {cost} > {reserved}");
+        }
+    }
+
+    #[test]
+    fn another_callers_live_request_does_not_keep_this_callers_old_window() {
+        let store = TestStore::new();
+        let mut service = open_service(&store, 4);
+        // Ghostlight holds a request live in window 0 throughout.
+        let other = invocation_for("ghostlight-yggdrasil", "other");
+        let envelope =
+            encrypt_invocation(&other, &security("ghostlight-distinct-test-key")).unwrap();
+        let TransportAdmission::Execute(_held) = service.begin(&envelope, 1_000, FRAME).unwrap()
+        else {
+            panic!("ghostlight should have executed");
+        };
+        for (id, now) in [("first", 1_000), ("second", WINDOW_MS + 1_000)] {
+            let claim = claim_at(&mut service, id, now);
+            let result = text_result(claim.call(), "done");
+            service.complete(*claim, result, FRAME).unwrap();
+        }
+        assert_eq!(service.window_spend(CALLER, 0), 0);
+        assert_eq!(service.window_spend(CALLER, 1), FIXTURE_USAGE_COST);
+        assert_eq!(service.window_spend("ghostlight-yggdrasil", 0), reservation());
     }
 }
