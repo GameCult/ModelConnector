@@ -291,7 +291,7 @@ pub enum ServeError {
     #[error("invalid serve configuration field {0}")]
     InvalidConfig(&'static str),
     #[error(
-        "max_frame_bytes {max_frame_bytes} cannot carry a {payload_bytes}-byte payload bound:          at least {needed_frame_bytes} frame bytes are needed"
+        "max_frame_bytes {max_frame_bytes} cannot carry a {payload_bytes}-byte payload bound: at least {needed_frame_bytes} frame bytes are needed"
     )]
     FrameBound {
         max_frame_bytes: usize,
@@ -595,6 +595,19 @@ mod tests {
         let replayed = client.execute(&invocation).unwrap();
         assert!(failed_result_size(&replayed));
         assert_eq!(backend.executions.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn frame_bound_error_states_the_frame_needed() {
+        assert_eq!(
+            ServeError::FrameBound {
+                max_frame_bytes: 1000,
+                payload_bytes: 2000,
+                needed_frame_bytes: 4000,
+            }
+            .to_string(),
+            "max_frame_bytes 1000 cannot carry a 2000-byte payload bound: at least 4000 frame bytes are needed"
+        );
     }
 
     #[test]
