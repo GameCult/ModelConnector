@@ -159,9 +159,12 @@ impl TransportService {
         replay_store
             .register_entry_type::<ReplayRecord>()
             .map_err(replay_store_error)?;
-        replay_store.add_generic_backing_store(
-            OwnedRedbMessagePackBackingStore::new(replay_store_path).map_err(replay_store_error)?,
-        );
+        replay_store
+            .add_generic_backing_store(
+                OwnedRedbMessagePackBackingStore::new(replay_store_path)
+                    .map_err(replay_store_error)?,
+            )
+            .map_err(replay_store_error)?;
         replay_store
             .pull_all_backing_stores()
             .map_err(replay_store_error)?;
