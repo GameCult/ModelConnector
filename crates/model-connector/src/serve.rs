@@ -566,10 +566,26 @@ mod tests {
         // record, which the narrow write then cannot carry.
         let store = TestStore::new();
         let invocation = fresh("request-narrowed");
-        let wide = SizedBackend::new(80_000);
-        let (client, _) = start_with(wide.clone(), &store, vec![caller(CALLER, KEY, 4)]);
-        let first = client.execute(&invocation).unwrap();
-        assert!(!failed_result_size(&first));
+        // The wide completion goes straight through the service: serve holds
+        // the replay store for as long as it runs, so a second serve cannot
+        // open it while the first lives.
+        let mut service =
+            TransportService::open(&store.path, vec![caller(CALLER, KEY, 4)], 300_000).unwrap();
+        let envelope =
+            crate::envelope::encrypt_invocation(&invocation, &crate::fixtures::security(KEY))
+                .unwrap();
+        let TransportAdmission::Execute(claim) = service.begin(&envelope, now_ms(), FRAME).unwrap()
+        else {
+            panic!("a fresh request must execute");
+        };
+        service
+            .complete(
+                *claim,
+                sized_result(&invocation, 80_000, "fixture-sse"),
+                FRAME,
+            )
+            .unwrap();
+        drop(service);
 
         let narrow = 100_000;
         let narrowed = ServeLimits {
