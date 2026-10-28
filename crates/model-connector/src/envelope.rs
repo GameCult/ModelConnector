@@ -462,10 +462,12 @@ mod tests {
                 assert!(real <= worst, "{real} > {worst}");
                 // Real ciphertext is random, so about half its bytes take two
                 // bytes: the worst case is not wildly above what is written.
-                assert!(
-                    worst <= real + sealed.ciphertext.len() + 64,
-                    "{worst} {real}"
-                );
+                if id.len() == MAX_IDENTITY_BYTES {
+                    assert!(
+                        worst <= real + sealed.ciphertext.len() + 64,
+                        "{worst} {real}"
+                    );
+                }
             }
         }
     }

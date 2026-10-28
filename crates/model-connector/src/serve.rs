@@ -737,7 +737,10 @@ mod tests {
     fn a_payload_at_the_widest_bound_its_frame_admits_is_carried_and_served() {
         let store = TestStore::new();
         let backend = CountingBackend::new(true);
-        let invocation = fresh(&"q".repeat(256));
+        let mut invocation = fresh(&"q".repeat(256));
+        invocation.request.instructions = "x".repeat(5_000);
+        invocation.provider_request_sha256 =
+            crate::contract::provider_request_sha256(&invocation.request).unwrap();
         let key = crate::fixtures::security(KEY);
         let sealed = crate::envelope::encrypt_invocation(&invocation, &key).unwrap();
         let bound = sealed.ciphertext.len();
