@@ -94,6 +94,7 @@ fn receipt(outcome: TransportOutcome) -> TransportReceipt {
         provider_request_sha256: invocation.provider_request_sha256,
         model: invocation.request.model.clone(),
         provider: "anthropic-messages".to_string(),
+        foreign_reasoning_dropped: 2,
         outcome,
     }
 }
@@ -118,26 +119,46 @@ fn wire_golden_v3() {
     assert_wire("provider_request.mp", &invocation.request);
     assert_wire("transport_invocation.mp", &invocation);
 
-    let transported = TransportResult::transported(
-        &invocation,
-        vec![
-            TransportEvent {
-                sequence: 0,
-                payload: TransportEventPayload::TextDelta {
-                    text: "thinking".to_string(),
-                },
-            },
-            TransportEvent {
-                sequence: 1,
-                payload: TransportEventPayload::ToolCall {
-                    call_id: "call-2".to_string(),
-                    name: "read_source".to_string(),
-                    arguments: "{}".to_string(),
-                },
-            },
-        ],
-        receipt(completed()),
+    // The reasoning bytes are all >= 0x80 so a byte-array encoding cannot pass
+    // for MessagePack bin.
+    let reasoning = || (0x80..=0xff_u8).collect::<Vec<u8>>();
+    assert_wire(
+        "input_reasoning_state.mp",
+        &InputItem::ReasoningState {
+            provider: "anthropic-messages".to_string(),
+            model: "claude-opus-4-5".to_string(),
+            state: reasoning(),
+        },
     );
+
+    let transported = TransportResult {
+        schema_id: RESULT_SCHEMA_ID.to_string(),
+        request_id: invocation.request_id().to_string(),
+        caller_runtime_id: CALLER.to_string(),
+        disposition: TransportDisposition::Transported {
+            events: vec![
+                TransportEvent {
+                    sequence: 0,
+                    payload: TransportEventPayload::TextDelta {
+                        text: "thinking".to_string(),
+                    },
+                },
+                TransportEvent {
+                    sequence: 1,
+                    payload: TransportEventPayload::ReasoningState { state: reasoning() },
+                },
+                TransportEvent {
+                    sequence: 2,
+                    payload: TransportEventPayload::ToolCall {
+                        call_id: "call-2".to_string(),
+                        name: "read_source".to_string(),
+                        arguments: "{}".to_string(),
+                    },
+                },
+            ],
+            receipt: Box::new(receipt(completed())),
+        },
+    };
     assert_eq!(transported.validate_against(&invocation), Ok(()));
     assert_wire("transport_result_transported.mp", &transported);
 
@@ -211,4 +232,13 @@ fn the_golden_carriage_frame_decrypts_and_validates_under_the_fixed_key() {
     let decrypted = decrypt_invocation(&envelope, &key).unwrap();
     assert_eq!(decrypted, invocation);
     assert_eq!(decrypted.validate(1_799_999_999_000, 5_000), Ok(()));
+}
+
+/// The reasoning bytes travel as MessagePack `bin` (0xc4 length marker), never
+/// as an array of integers.
+#[test]
+fn reasoning_state_is_messagepack_bin() {
+    let golden = std::fs::read(fixtures().join("input_reasoning_state.mp")).unwrap();
+    let marker = golden.windows(3).any(|window| window == [0xc4, 0x80, 0x80]);
+    assert!(marker, "state must be a bin 8 of 128 bytes starting 0x80");
 }

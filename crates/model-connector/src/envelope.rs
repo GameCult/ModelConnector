@@ -37,12 +37,13 @@ pub struct TransportEnvelope {
     pub ciphertext: Vec<u8>,
 }
 
-/// The ciphertext is MessagePack `bin` on the wire, never an array of integers.
-fn binary_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+/// Raw bytes are MessagePack `bin` on the wire, never an array of integers.
+/// Serves the ciphertext and both reasoning states.
+pub(crate) fn binary_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
     schemars::json_schema!({
         "type": "string",
         "format": "binary",
-        "description": "MessagePack bin: the raw ciphertext bytes, never an array of integers"
+        "description": "MessagePack bin: raw bytes, never an array of integers"
     })
 }
 

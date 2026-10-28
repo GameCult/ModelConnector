@@ -7,7 +7,7 @@
       "type": "string"
     },
     "ciphertext": {
-      "description": "MessagePack bin: the raw ciphertext bytes, never an array of integers",
+      "description": "MessagePack bin: raw bytes, never an array of integers",
       "type": "string",
       "format": "binary"
     },

@@ -7,7 +7,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use zeroize::Zeroize;
 
-use crate::envelope::ServiceError;
+use crate::envelope::{ServiceError, binary_schema};
 
 pub const PROVIDER_REQUEST_SCHEMA_ID: &str = "gamecult.model.provider_request.v3";
 pub const INVOCATION_SCHEMA_ID: &str = "gamecult.model.transport_invocation.v3";
@@ -124,6 +124,17 @@ impl ProviderRequest {
                     require_provider_call_id(call_id, "input.call_id")?;
                     require_content(output, "input.output")?;
                 }
+                InputItem::ReasoningState {
+                    provider,
+                    model,
+                    state,
+                } => {
+                    require_id(provider, "input.provider")?;
+                    require_id(model, "input.model")?;
+                    if state.is_empty() {
+                        return Err(ContractError::Invalid("input.state"));
+                    }
+                }
             }
         }
         Ok(())
@@ -209,6 +220,18 @@ pub enum InputItem {
     ToolResult {
         call_id: String,
         output: String,
+    },
+    /// One provider reasoning block, opaque to every caller: `state` is the
+    /// connector's own encoding of the whole block. Callers replay it
+    /// verbatim in transcript order and never inspect or branch on it; only
+    /// the connector of `provider` reads it, and the service drops or refuses
+    /// the state of any other provider before a backend sees the request.
+    ReasoningState {
+        provider: String,
+        model: String,
+        #[serde(with = "serde_bytes")]
+        #[schemars(schema_with = "binary_schema")]
+        state: Vec<u8>,
     },
 }
 
@@ -303,7 +326,9 @@ impl TransportResult {
         }
     }
 
-    pub fn transported(
+    /// Built by `ProviderCall` in the daemon and by in-crate tests only.
+    #[cfg(any(test, feature = "daemon"))]
+    pub(crate) fn transported(
         invocation: &TransportInvocation,
         events: Vec<TransportEvent>,
         receipt: TransportReceipt,
@@ -317,6 +342,53 @@ impl TransportResult {
                 receipt: Box::new(receipt),
             },
         }
+    }
+
+    /// The transcript items a completed result adds, ready to append to the
+    /// next request verbatim: consecutive text deltas become one assistant
+    /// text, a tool call stays a tool call and reasoning state is stamped with
+    /// the receipt's provider and model. A refused or failed result yields
+    /// none, because a partial reasoning block must never be replayed.
+    pub fn transcript_items(&self) -> Vec<InputItem> {
+        let TransportDisposition::Transported { events, receipt } = &self.disposition else {
+            return Vec::new();
+        };
+        if !matches!(receipt.outcome, TransportOutcome::Completed { .. }) {
+            return Vec::new();
+        }
+        let mut items: Vec<InputItem> = Vec::new();
+        let mut text = String::new();
+        for event in events {
+            if !matches!(event.payload, TransportEventPayload::TextDelta { .. }) && !text.is_empty()
+            {
+                items.push(InputItem::AssistantText {
+                    text: std::mem::take(&mut text),
+                });
+            }
+            match &event.payload {
+                TransportEventPayload::TextDelta { text: delta } => text.push_str(delta),
+                TransportEventPayload::ToolCall {
+                    call_id,
+                    name,
+                    arguments,
+                } => items.push(InputItem::ToolCall {
+                    call_id: call_id.clone(),
+                    name: name.clone(),
+                    arguments: arguments.clone(),
+                }),
+                TransportEventPayload::ReasoningState { state } => {
+                    items.push(InputItem::ReasoningState {
+                        provider: receipt.provider.clone(),
+                        model: receipt.model.clone(),
+                        state: state.clone(),
+                    })
+                }
+            }
+        }
+        if !text.is_empty() {
+            items.push(InputItem::AssistantText { text });
+        }
+        items
     }
 
     pub fn validate_against(&self, invocation: &TransportInvocation) -> Result<(), ContractError> {
@@ -353,6 +425,14 @@ pub enum TransportEventPayload {
         name: String,
         arguments: String,
     },
+    /// One reasoning block of the provider that answered. It carries no
+    /// provider or model: the receipt names them, so a backend cannot tag its
+    /// own state.
+    ReasoningState {
+        #[serde(with = "serde_bytes")]
+        #[schemars(schema_with = "binary_schema")]
+        state: Vec<u8>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -375,6 +455,12 @@ impl TransportEvent {
                 require_id(name, "event.tool_name")?;
                 require_content(arguments, "event.arguments")
             }
+            TransportEventPayload::ReasoningState { state } => {
+                if state.is_empty() {
+                    return Err(ContractError::Invalid("event.state"));
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -389,6 +475,9 @@ pub struct TransportReceipt {
     pub provider_request_sha256: [u8; 32],
     pub model: String,
     pub provider: String,
+    /// How many foreign `ReasoningState` items the service removed from the
+    /// request before the backend saw it.
+    pub foreign_reasoning_dropped: u32,
     pub outcome: TransportOutcome,
 }
 
@@ -454,6 +543,9 @@ pub enum Refusal {
     Indeterminate,
     ReplayConflict,
     Malformed,
+    /// A `ReasoningState` of another provider sits in the in-flight tool
+    /// exchange, where dropping it would break the provider's own rules.
+    ForeignReasoningState,
 }
 
 /// The one wire codec of every v3 document: named MessagePack (struct fields
@@ -902,5 +994,120 @@ mod tests {
                 Err(ContractError::Identity)
             );
         }
+    }
+
+    fn reasoning(state: &[u8]) -> TransportEventPayload {
+        TransportEventPayload::ReasoningState {
+            state: state.to_vec(),
+        }
+    }
+
+    fn event(sequence: u64, payload: TransportEventPayload) -> TransportEvent {
+        TransportEvent { sequence, payload }
+    }
+
+    fn text(delta: &str) -> TransportEventPayload {
+        TransportEventPayload::TextDelta {
+            text: delta.to_string(),
+        }
+    }
+
+    fn tool_call() -> TransportEventPayload {
+        TransportEventPayload::ToolCall {
+            call_id: "call-9".to_string(),
+            name: "read_source".to_string(),
+            arguments: "{}".to_string(),
+        }
+    }
+
+    #[test]
+    fn transcript_items_follow_event_order() {
+        let invocation = invocation();
+        let events = vec![
+            event(0, text("one ")),
+            event(1, text("two")),
+            event(2, reasoning(&[0x80, 0xff])),
+            event(3, tool_call()),
+            event(4, text("three")),
+            event(5, reasoning(&[7])),
+        ];
+        let result = TransportResult::transported(&invocation, events, receipt(&invocation));
+        assert_eq!(
+            result.transcript_items(),
+            vec![
+                InputItem::AssistantText {
+                    text: "one two".to_string()
+                },
+                InputItem::ReasoningState {
+                    provider: "fixture-sse".to_string(),
+                    model: invocation.request.model.clone(),
+                    state: vec![0x80, 0xff],
+                },
+                InputItem::ToolCall {
+                    call_id: "call-9".to_string(),
+                    name: "read_source".to_string(),
+                    arguments: "{}".to_string(),
+                },
+                InputItem::AssistantText {
+                    text: "three".to_string()
+                },
+                InputItem::ReasoningState {
+                    provider: "fixture-sse".to_string(),
+                    model: invocation.request.model.clone(),
+                    state: vec![7],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn transcript_items_of_refused_or_failed_are_empty() {
+        let invocation = invocation();
+        let refused = TransportResult::refused(&invocation, Refusal::OutputBound);
+        assert_eq!(refused.transcript_items(), Vec::new());
+
+        let mut failed = receipt(&invocation);
+        failed.outcome = TransportOutcome::Failed {
+            kind: FailureKind::RateLimited,
+            message: "slow down".to_string(),
+        };
+        let partial = TransportResult::transported(
+            &invocation,
+            vec![event(0, text("half")), event(1, reasoning(&[1, 2, 3]))],
+            failed,
+        );
+        assert_eq!(partial.transcript_items(), Vec::new());
+    }
+
+    #[test]
+    fn reasoning_state_validation() {
+        let item = |provider: &str, model: &str, state: &[u8]| InputItem::ReasoningState {
+            provider: provider.to_string(),
+            model: model.to_string(),
+            state: state.to_vec(),
+        };
+        let validate = |item: InputItem| {
+            let mut request = request();
+            request.input.push(item);
+            request.validate()
+        };
+        assert_eq!(validate(item("anthropic", "claude", &[1])), Ok(()));
+        assert_eq!(
+            validate(item("", "claude", &[1])),
+            Err(ContractError::Invalid("input.provider"))
+        );
+        assert_eq!(
+            validate(item("anthropic", "", &[1])),
+            Err(ContractError::Invalid("input.model"))
+        );
+        assert_eq!(
+            validate(item("anthropic", "claude", &[])),
+            Err(ContractError::Invalid("input.state"))
+        );
+        assert_eq!(event(0, reasoning(&[1])).validate(), Ok(()));
+        assert_eq!(
+            event(0, reasoning(&[])).validate(),
+            Err(ContractError::Invalid("event.state"))
+        );
     }
 }
