@@ -279,4 +279,120 @@ mod tests {
             Err(ServiceError::Encryption)
         );
     }
+
+    fn sealed_invocation(caller: &str, request_id: &str, kind: EnvelopeKind) -> TransportEnvelope {
+        let invocation = invocation();
+        let plaintext = canonical_invocation_bytes(&invocation).unwrap();
+        encrypt_message(
+            caller,
+            request_id,
+            kind,
+            &plaintext,
+            &security("epiphany-distinct-test-key"),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn the_outer_identity_must_match_the_sealed_invocation_on_each_field() {
+        let key = security("epiphany-distinct-test-key");
+        let invocation = invocation();
+        let caller = invocation.caller_runtime_id.clone();
+        let request_id = invocation.request_id().to_string();
+        let matching = sealed_invocation(&caller, &request_id, EnvelopeKind::Invocation);
+        assert_eq!(decrypt_invocation(&matching, &key).unwrap(), invocation);
+        for envelope in [
+            sealed_invocation("other-caller", &request_id, EnvelopeKind::Invocation),
+            sealed_invocation(&caller, "other-request", EnvelopeKind::Invocation),
+        ] {
+            assert_eq!(
+                decrypt_invocation(&envelope, &key),
+                Err(ServiceError::OuterIdentity)
+            );
+        }
+    }
+
+    #[test]
+    fn the_outer_identity_must_match_the_sealed_result_on_each_field() {
+        let key = security("epiphany-distinct-test-key");
+        let invocation = invocation();
+        let result = TransportResult::transported(&invocation, Vec::new(), receipt(&invocation));
+        let plaintext = rmp_serde::to_vec(&result).unwrap();
+        let seal = |caller: &str, request_id: &str| {
+            encrypt_message(caller, request_id, EnvelopeKind::Result, &plaintext, &key).unwrap()
+        };
+        let caller = result.caller_runtime_id.clone();
+        let request_id = result.request_id.clone();
+        assert_eq!(
+            decrypt_result(&seal(&caller, &request_id), &key, &invocation).unwrap(),
+            result
+        );
+        for envelope in [
+            seal("other-caller", &request_id),
+            seal(&caller, "other-request"),
+        ] {
+            assert_eq!(
+                decrypt_result(&envelope, &key, &invocation),
+                Err(ServiceError::OuterIdentity)
+            );
+        }
+    }
+
+    #[test]
+    fn a_malformed_envelope_is_refused_before_any_decryption() {
+        let key = security("epiphany-distinct-test-key");
+        let invocation = invocation();
+        let good = encrypt_invocation(&invocation, &key).unwrap();
+
+        let mut schema = good.clone();
+        schema.schema_id = "gamecult.codex.transport_envelope.v1".to_string();
+        let wrong_kind = sealed_invocation("epiphany-yggdrasil", "request-1", EnvelopeKind::Result);
+        let mut empty = good.clone();
+        empty.ciphertext.clear();
+        for envelope in [schema, wrong_kind, empty] {
+            assert_eq!(
+                decrypt_invocation(&envelope, &key),
+                Err(ServiceError::Envelope)
+            );
+        }
+        for field in ["caller_runtime_id", "request_id"] {
+            let mut blank = good.clone();
+            if field == "caller_runtime_id" {
+                blank.caller_runtime_id = " ".to_string();
+            } else {
+                blank.request_id = String::new();
+            }
+            assert_eq!(
+                decrypt_invocation(&blank, &key),
+                Err(ServiceError::Contract(ContractError::Invalid(field)))
+            );
+        }
+    }
+
+    #[test]
+    fn a_frame_is_bounded_inclusively_and_never_empty() {
+        use std::io::Cursor;
+        let read = |length: u32, body: usize, max: usize| {
+            let mut frame = length.to_be_bytes().to_vec();
+            frame.extend(vec![1; body]);
+            read_transport_frame(&mut Cursor::new(frame), max)
+        };
+        assert_eq!(read(16, 16, 16).unwrap(), vec![1; 16]);
+        assert!(matches!(read(17, 17, 16), Err(TransportFrameError::Size)));
+        assert!(matches!(read(0, 0, 16), Err(TransportFrameError::Size)));
+        // A bound above the length never turns an empty frame into an empty payload.
+        assert!(matches!(read(0, 0, 1_000), Err(TransportFrameError::Size)));
+
+        let write = |payload: &[u8], max: usize| {
+            let mut out = Vec::new();
+            write_transport_frame(&mut out, payload, max).map(|()| out)
+        };
+        assert_eq!(write(&[1; 16], 16).unwrap().len(), 20);
+        assert!(matches!(
+            write(&[1; 17], 16),
+            Err(TransportFrameError::Size)
+        ));
+        assert!(matches!(write(&[], 16), Err(TransportFrameError::Size)));
+        assert!(matches!(write(&[], 1_000), Err(TransportFrameError::Size)));
+    }
 }
