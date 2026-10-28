@@ -2771,10 +2771,14 @@ mod tests {
             let response = service.complete(*claim, result, FRAME).unwrap();
             let receipt = receipt_of(&response, &invocation);
             assert_eq!(receipt.provider, STAND_IN_PROVIDER, "{index}");
-            // A result the service refused is billed as the worst case.
-            assert_eq!(receipt.cost_micro_usd, reservation(), "{index}");
-            assert_eq!(charged_of(&service, &id), reservation(), "{index}");
-            assert_eq!(service.window_spend(CALLER, 0), reservation(), "{index}");
+            // A result the service refused is still billed what its usage costs.
+            assert_eq!(receipt.cost_micro_usd, FIXTURE_USAGE_COST, "{index}");
+            assert_eq!(charged_of(&service, &id), FIXTURE_USAGE_COST, "{index}");
+            assert_eq!(
+                service.window_spend(CALLER, 0),
+                FIXTURE_USAGE_COST,
+                "{index}"
+            );
         }
     }
 
@@ -3373,7 +3377,7 @@ mod tests {
         let store = TestStore::new();
         let mut service = open_service(&store, 4);
         // Ghostlight holds a request live in window 0 throughout.
-        let other = invocation_for("ghostlight-yggdrasil", "other");
+        let other = invocation_for("ghostlight-yggdrasil", "request-1");
         let envelope =
             encrypt_invocation(&other, &security("ghostlight-distinct-test-key")).unwrap();
         let TransportAdmission::Execute(_held) = service.begin(&envelope, 1_000, FRAME).unwrap()
