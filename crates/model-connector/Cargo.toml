@@ -1,0 +1,23 @@
+[package]
+name = "model-connector"
+description = "Provider-neutral connector contract, envelope, client, replay service and serve loop for GameCult minds"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[features]
+default = []
+daemon = ["dep:cultcache-rs"]
+
+[dependencies]
+aes-gcm = "0.10"
+cultcache-rs = { git = "https://github.com/GameCult/CultLib.git", rev = "e171eca32329baa928f4a1d810401a8b4c857029", package = "cultcache-rs", optional = true }
+rand_core = { version = "0.6", features = ["getrandom"] }
+rmp-serde = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+zeroize = "1"
