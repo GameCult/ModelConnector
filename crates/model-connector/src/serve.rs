@@ -559,6 +559,45 @@ mod tests {
     }
 
     #[test]
+    fn serve_measures_a_replayed_record_against_its_own_max_frame() {
+        // A record completed under a wide frame, replayed by a serve at a
+        // narrower one, must come back as the typed stand-in that fits the
+        // narrower frame; handing `begin` any other frame delivers the wide
+        // record, which the narrow write then cannot carry.
+        let store = TestStore::new();
+        let invocation = fresh("request-narrowed");
+        let wide = SizedBackend::new(80_000);
+        let (client, _) = start_with(wide.clone(), &store, vec![caller(CALLER, KEY, 4)]);
+        let first = client.execute(&invocation).unwrap();
+        assert!(!failed_result_size(&first));
+
+        let narrow = 100_000;
+        let narrowed = ServeLimits {
+            max_frame_bytes: narrow,
+            ..limits()
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = listener.local_addr().unwrap();
+        let path = store.path.clone();
+        let backend = SizedBackend::new(80_000);
+        let served = backend.clone();
+        thread::spawn(move || {
+            serve(
+                listener,
+                narrowed,
+                vec![caller(CALLER, KEY, 4)],
+                &path,
+                served,
+            )
+        });
+        let client =
+            ConnectorClient::new(endpoint, KEY, narrow, Some(Duration::from_secs(5))).unwrap();
+        let replayed = client.execute(&invocation).unwrap();
+        assert!(failed_result_size(&replayed));
+        assert_eq!(backend.executions.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
     fn serve_refuses_to_start_on_an_unready_backend() {
         let store = TestStore::new();
         let backend = CountingBackend::new(false);
