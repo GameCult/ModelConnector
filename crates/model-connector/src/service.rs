@@ -735,7 +735,14 @@ impl TransportService {
             .saturating_add(reserved_micro_usd)
             > spend_ceiling
         {
-            return self.reply_refusal(&invocation, Refusal::SpendCeiling, &security);
+            // A clock reading behind the caller's newest window is named: the
+            // refusal holds until the clock reaches that window's start.
+            let refusal = if now_unix_ms < window.saturating_mul(spend_window_ms) {
+                Refusal::ClockBehindAdmissionWindow
+            } else {
+                Refusal::SpendCeiling
+            };
+            return self.reply_refusal(&invocation, refusal, &security);
         }
 
         // Reserving and claiming the request are one write: a ledger that
@@ -972,6 +979,19 @@ impl TransportService {
             && receipt.foreign_reasoning_dropped == claim.call.receipt.foreign_reasoning_dropped
             && receipt.cost_micro_usd == claim.call.cost_of(&receipt.outcome)
             && receipt.overrun_micro_usd == claim.call.overrun_of(receipt.cost_micro_usd)
+    }
+
+    /// Where `caller_runtime_id`'s newest admission window starts, in unix
+    /// milliseconds, or `None` when the caller has none: the instant the host
+    /// clock must reach before a `ClockBehindAdmissionWindow` refusal can end.
+    pub fn admission_window_start_unix_ms(&self, caller_runtime_id: &str) -> Option<u64> {
+        let spend_window_ms = self.callers.get(caller_runtime_id)?.spend_window_ms;
+        let newest = self
+            .window_spend
+            .get(caller_runtime_id)?
+            .keys()
+            .next_back()?;
+        Some(newest.saturating_mul(spend_window_ms))
     }
 
     fn reply_refusal(
@@ -3242,7 +3262,7 @@ mod tests {
         assert_eq!(run_window(&mut service, "again", 20_100), 0);
         assert_eq!(
             refusal_at(&mut service, "last", 20_200, MAX_COST),
-            Refusal::SpendCeiling
+            Refusal::ClockBehindAdmissionWindow
         );
     }
 
@@ -3479,10 +3499,53 @@ mod tests {
         // reservation), window 9 does not: the caller's window is the newest.
         assert_eq!(
             refusal_at(&mut service, "back", 20_500, MAX_COST),
-            Refusal::SpendCeiling
+            Refusal::ClockBehindAdmissionWindow
         );
         assert_eq!(service.window_spend(CALLER, 2), reservation());
         assert_eq!(service.window_spend(CALLER, 9), 3 * FIXTURE_USAGE_COST);
         drop(old);
+    }
+
+    #[test]
+    fn a_clock_behind_the_callers_window_is_refused_by_name_until_it_catches_up() {
+        let window = 10_000;
+        let ceiling = reservation() + 2 * FIXTURE_USAGE_COST;
+        let store = TestStore::new();
+        let mut service = open_limited(&store, ceiling, window);
+        assert_eq!(service.admission_window_start_unix_ms(CALLER), None);
+        assert_eq!(run_window(&mut service, "fill", 50_000), 3);
+        assert_eq!(
+            service.admission_window_start_unix_ms(CALLER),
+            Some(50_000)
+        );
+        // Behind the full window: the cause is named, no slot is taken and
+        // nothing is reserved.
+        assert_eq!(
+            refusal_at(&mut service, "behind", 20_000, MAX_COST),
+            Refusal::ClockBehindAdmissionWindow
+        );
+        assert!(service.live.is_empty());
+        assert_eq!(service.window_spend(CALLER, 5), 3 * FIXTURE_USAGE_COST);
+        // Inside the full window the clock is not behind: an honest ceiling.
+        assert_eq!(
+            refusal_at(&mut service, "inside", 50_500, MAX_COST),
+            Refusal::SpendCeiling
+        );
+        // Once the clock reaches the next window the caller is admitted.
+        assert_eq!(run_window(&mut service, "later", 60_000), 3);
+    }
+
+    #[test]
+    fn the_clock_behind_refusal_is_no_wider_than_the_widest_other_refusal() {
+        let invocation = invocation_at("request-1", 1_000, MAX_COST);
+        let sized = |refusal| {
+            wire_encode(&TransportResult::refused(&invocation, refusal))
+                .unwrap()
+                .len()
+        };
+        assert!(
+            sized(Refusal::ClockBehindAdmissionWindow)
+                <= sized(Refusal::ProviderDigestSubstitution)
+        );
     }
 }

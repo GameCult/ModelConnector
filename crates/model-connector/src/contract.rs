@@ -573,6 +573,12 @@ pub enum Refusal {
     // exchange, where dropping it would break the provider's own rules. A plain
     // comment: a doc comment would split the published schema into a union.
     ForeignReasoningState,
+    // The caller's newest admission window starts after the clock's reading,
+    // and the request does not fit what that window holds: the host's clock
+    // is behind the window and the caller stays refused until it catches up.
+    // A plain comment: a doc comment would split the published schema into a
+    // union.
+    ClockBehindAdmissionWindow,
 }
 
 /// The one wire codec of every v3 document: named MessagePack (struct fields

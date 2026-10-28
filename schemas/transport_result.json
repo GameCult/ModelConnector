@@ -53,7 +53,8 @@
         "Indeterminate",
         "ReplayConflict",
         "Malformed",
-        "ForeignReasoningState"
+        "ForeignReasoningState",
+        "ClockBehindAdmissionWindow"
       ]
     },
     "StopReason": {
