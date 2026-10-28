@@ -2,83 +2,256 @@ use std::io::{Read, Write};
 
 use aes_gcm::aead::{Aead, Payload};
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
+use cultnet_rs::{
+    CultNetMessage, CultNetWireContract, decode_cultnet_message_from_slice,
+    encode_cultnet_message_to_vec,
+};
 use rand_core::{OsRng, RngCore};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::contract::{
     ContractError, ENVELOPE_SCHEMA_ID, TransportInvocation, TransportKey, TransportResult,
-    canonical_invocation_bytes, require_id,
+    canonical_invocation_bytes, require_id, wire_decode, wire_encode,
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub enum EnvelopeKind {
     Invocation,
     Result,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct TransportEnvelope {
     pub schema_id: String,
     pub caller_runtime_id: String,
     pub request_id: String,
     pub message_kind: EnvelopeKind,
     pub nonce: [u8; 12],
+    #[serde(with = "serde_bytes")]
+    #[schemars(with = "Vec<u8>")]
     pub ciphertext: Vec<u8>,
 }
+
+/// The CultNet service every frame of this connector addresses.
+pub const CONNECTOR_SERVICE_ID: &str = "gamecult.model.connector";
+/// The one operation of that service: run one sealed invocation.
+pub const INVOKE_OPERATION: &str = "invoke";
+
+const PAYLOAD_ENCODING: &str = "messagepack-base64";
+const OK_STATUS: &str = "ok";
 
 /// The longest caller id, request id or model name a service admits. The
 /// frame arithmetic below depends on it. A request whose id is longer is
 /// refused on the wire as malformed.
 pub const MAX_IDENTITY_BYTES: usize = 256;
 
-/// The most bytes a serialized envelope holding `ciphertext_len` ciphertext
-/// bytes can occupy, with ids at their longest: the frame a caller payload
-/// bound (`CallerAdmission`'s `max_payload_bytes`, a bound on ciphertext
-/// length) needs. The v2 wire serializes the ciphertext as a MessagePack array
-/// of integers: a byte of 128 or more takes two bytes, so the worst case is
-/// twice the ciphertext, plus the array header and the envelope's other
-/// fields at their longest. Measured from the real encoding, not assumed.
+fn carriage_bytes(message: &CultNetMessage) -> Result<Vec<u8>, ServiceError> {
+    encode_cultnet_message_to_vec(message, CultNetWireContract::CultNetSchemaV0)
+        .map_err(|_| ServiceError::Carriage)
+}
+
+fn seal_payload(envelope: &TransportEnvelope) -> Result<String, ServiceError> {
+    Ok(STANDARD.encode(wire_encode(envelope)?))
+}
+
+/// The CultNet frame an invocation travels in: a `cultnet.operation_request.v0`
+/// for [`CONNECTOR_SERVICE_ID`] and [`INVOKE_OPERATION`], its `message_id` the
+/// request id and its payload the base64 of the named sealed envelope.
+pub(crate) fn encode_invocation_frame(
+    envelope: &TransportEnvelope,
+) -> Result<Vec<u8>, ServiceError> {
+    carriage_bytes(&CultNetMessage::OperationRequest {
+        message_id: envelope.request_id.clone(),
+        service_id: CONNECTOR_SERVICE_ID.to_string(),
+        operation: INVOKE_OPERATION.to_string(),
+        payload_schema: ENVELOPE_SCHEMA_ID.to_string(),
+        payload_encoding: PAYLOAD_ENCODING.to_string(),
+        payload: seal_payload(envelope)?,
+        source_runtime_id: None,
+        target_runtime_id: None,
+    })
+}
+
+/// The CultNet frame a result travels in: a `cultnet.operation_response.v0`
+/// with status `ok`, otherwise shaped like the invocation's.
+pub(crate) fn encode_result_frame(envelope: &TransportEnvelope) -> Result<Vec<u8>, ServiceError> {
+    carriage_bytes(&CultNetMessage::OperationResponse {
+        message_id: envelope.request_id.clone(),
+        service_id: CONNECTOR_SERVICE_ID.to_string(),
+        operation: INVOKE_OPERATION.to_string(),
+        status: OK_STATUS.to_string(),
+        payload_schema: ENVELOPE_SCHEMA_ID.to_string(),
+        payload_encoding: PAYLOAD_ENCODING.to_string(),
+        payload: seal_payload(envelope)?,
+        diagnostics: Vec::new(),
+        source_runtime_id: None,
+    })
+}
+
+/// Opens the carriage of one frame. Everything the carriage says is checked
+/// here, before any decryption: the service, the operation, the payload schema,
+/// and that the message id is the sealed envelope's request id.
+fn open_carriage(
+    message_id: &str,
+    service_id: &str,
+    operation: &str,
+    payload_schema: &str,
+    payload: &str,
+) -> Result<TransportEnvelope, ServiceError> {
+    if service_id != CONNECTOR_SERVICE_ID
+        || operation != INVOKE_OPERATION
+        || payload_schema != ENVELOPE_SCHEMA_ID
+    {
+        return Err(ServiceError::Carriage);
+    }
+    let bytes = STANDARD
+        .decode(payload)
+        .map_err(|_| ServiceError::Carriage)?;
+    let envelope: TransportEnvelope = wire_decode(&bytes).map_err(|_| ServiceError::Encoding)?;
+    if envelope.request_id != message_id {
+        return Err(ServiceError::OuterIdentity);
+    }
+    Ok(envelope)
+}
+
+fn read_carriage(bytes: &[u8]) -> Result<CultNetMessage, ServiceError> {
+    decode_cultnet_message_from_slice(bytes, CultNetWireContract::CultNetSchemaV0)
+        .map_err(|_| ServiceError::Carriage)
+}
+
+pub(crate) fn decode_invocation_frame(bytes: &[u8]) -> Result<TransportEnvelope, ServiceError> {
+    match read_carriage(bytes)? {
+        CultNetMessage::OperationRequest {
+            message_id,
+            service_id,
+            operation,
+            payload_schema,
+            payload,
+            ..
+        } => open_carriage(
+            &message_id,
+            &service_id,
+            &operation,
+            &payload_schema,
+            &payload,
+        ),
+        _ => Err(ServiceError::Carriage),
+    }
+}
+
+pub(crate) fn decode_result_frame(bytes: &[u8]) -> Result<TransportEnvelope, ServiceError> {
+    match read_carriage(bytes)? {
+        CultNetMessage::OperationResponse {
+            message_id,
+            service_id,
+            operation,
+            status,
+            payload_schema,
+            payload,
+            ..
+        } if status == OK_STATUS => open_carriage(
+            &message_id,
+            &service_id,
+            &operation,
+            &payload_schema,
+            &payload,
+        ),
+        _ => Err(ServiceError::Carriage),
+    }
+}
+
+/// The most bytes one frame holding a sealed envelope of `ciphertext_len`
+/// ciphertext bytes can occupy, with ids at their longest: the frame a caller
+/// payload bound (`CallerAdmission`'s `max_payload_bytes`, a bound on
+/// ciphertext length) needs.
+///
+/// A frame is a CultNet operation message whose payload is the base64 of the
+/// named envelope. The result frame is the larger of the two directions (it
+/// also carries a status), so this bound holds for an invocation as well. The
+/// envelope shell and the message shell are measured from their real
+/// encodings; only the MessagePack length headers and base64 expansion that
+/// grow with `ciphertext_len` are arithmetic.
 pub fn frame_bytes_for_payload(ciphertext_len: usize) -> usize {
-    let shell = rmp_serde::to_vec(&TransportEnvelope {
+    let long = "x".repeat(MAX_IDENTITY_BYTES);
+    let envelope_shell = wire_encode(&TransportEnvelope {
         schema_id: ENVELOPE_SCHEMA_ID.to_string(),
-        caller_runtime_id: "x".repeat(MAX_IDENTITY_BYTES),
-        request_id: "x".repeat(MAX_IDENTITY_BYTES),
+        caller_runtime_id: long.clone(),
+        request_id: long.clone(),
         message_kind: EnvelopeKind::Invocation,
         nonce: [0xff; 12],
         ciphertext: Vec::new(),
     })
     .map_or(usize::MAX, |bytes| bytes.len());
-    // The shell holds an empty array header of one byte.
-    let header = match ciphertext_len {
-        0..=15 => 1,
-        16..=65_535 => 3,
+    let message_shell = encode_cultnet_message_to_vec(
+        &CultNetMessage::OperationResponse {
+            message_id: long,
+            service_id: CONNECTOR_SERVICE_ID.to_string(),
+            operation: INVOKE_OPERATION.to_string(),
+            status: OK_STATUS.to_string(),
+            payload_schema: ENVELOPE_SCHEMA_ID.to_string(),
+            payload_encoding: PAYLOAD_ENCODING.to_string(),
+            payload: "A".to_string(),
+            diagnostics: Vec::new(),
+            source_runtime_id: None,
+        },
+        CultNetWireContract::CultNetSchemaV0,
+    )
+    .map_or(usize::MAX, |bytes| bytes.len());
+    // The shell holds an empty `bin 8`: a marker and a zero length. The shell's
+    // one-character payload takes a one-byte string header and the character.
+    let envelope = envelope_shell
+        .saturating_sub(2)
+        .saturating_add(bin_header_bytes(ciphertext_len))
+        .saturating_add(ciphertext_len);
+    let payload = envelope.div_ceil(3).saturating_mul(4);
+    message_shell
+        .saturating_sub(2)
+        .saturating_add(str_header_bytes(payload))
+        .saturating_add(payload)
+}
+
+/// MessagePack `bin` header width for a byte string of `len` bytes.
+fn bin_header_bytes(len: usize) -> usize {
+    match len {
+        0..=255 => 2,
+        256..=65_535 => 3,
         _ => 5,
-    };
-    shell
-        .saturating_sub(1)
-        .saturating_add(header)
-        .saturating_add(ciphertext_len.saturating_mul(2))
+    }
+}
+
+/// MessagePack `str` header width for a string of `len` bytes.
+fn str_header_bytes(len: usize) -> usize {
+    match len {
+        0..=31 => 1,
+        32..=255 => 2,
+        256..=65_535 => 3,
+        _ => 5,
+    }
 }
 
 /// The largest payload bound whose worst-case frame fits `max_frame_bytes`:
 /// the inverse of [`frame_bytes_for_payload`]. `None` when the frame cannot
 /// carry even an empty envelope.
 pub fn payload_bytes_for_frame(max_frame_bytes: usize) -> Option<usize> {
-    // frame_bytes_for_payload(0) is the shell plus a one-byte array header.
-    let fixed = frame_bytes_for_payload(0) - 1;
-    let room = max_frame_bytes.checked_sub(fixed)?;
-    // Each array header width bounds the payloads it can describe; the
-    // widest payload any width admits is the answer.
-    let by_header = |header: usize, cap: usize| room.checked_sub(header).map(|r| (r / 2).min(cap));
-    [
-        by_header(5, usize::MAX),
-        by_header(3, 65_535),
-        by_header(1, 15),
-    ]
-    .into_iter()
-    .flatten()
-    .max()
+    if frame_bytes_for_payload(0) > max_frame_bytes {
+        return None;
+    }
+    // A frame is longer than its payload, so the answer is below the bound.
+    let (mut fits, mut over) = (0, max_frame_bytes.saturating_add(1));
+    while over - fits > 1 {
+        let middle = fits + (over - fits) / 2;
+        if frame_bytes_for_payload(middle) <= max_frame_bytes {
+            fits = middle;
+        } else {
+            over = middle;
+        }
+    }
+    Some(fits)
 }
 
 pub fn encrypt_invocation(
@@ -102,7 +275,7 @@ pub fn decrypt_invocation(
     validate_envelope(envelope, EnvelopeKind::Invocation)?;
     let plaintext = decrypt_message(envelope, security)?;
     let invocation: TransportInvocation =
-        rmp_serde::from_slice(&plaintext).map_err(|_| ServiceError::Encoding)?;
+        wire_decode(&plaintext).map_err(|_| ServiceError::Encoding)?;
     if invocation.caller_runtime_id != envelope.caller_runtime_id
         || invocation.request_id() != envelope.request_id
     {
@@ -115,7 +288,7 @@ pub fn encrypt_result(
     result: &TransportResult,
     security: &TransportKey,
 ) -> Result<TransportEnvelope, ServiceError> {
-    let plaintext = rmp_serde::to_vec(result).map_err(|_| ServiceError::Encoding)?;
+    let plaintext = wire_encode(result).map_err(|_| ServiceError::Encoding)?;
     encrypt_message(
         &result.caller_runtime_id,
         &result.request_id,
@@ -132,8 +305,7 @@ pub fn decrypt_result(
 ) -> Result<TransportResult, ServiceError> {
     validate_envelope(envelope, EnvelopeKind::Result)?;
     let plaintext = decrypt_message(envelope, security)?;
-    let result: TransportResult =
-        rmp_serde::from_slice(&plaintext).map_err(|_| ServiceError::Encoding)?;
+    let result: TransportResult = wire_decode(&plaintext).map_err(|_| ServiceError::Encoding)?;
     if result.caller_runtime_id != envelope.caller_runtime_id
         || result.request_id != envelope.request_id
     {
@@ -242,13 +414,15 @@ pub(crate) fn decrypt_message(
         .map_err(|_| ServiceError::Encryption)
 }
 
+/// The authenticated data of a sealed message: a positional tuple, a MAC input
+/// and not a wire document (a tuple is positional under the named codec too).
 pub(crate) fn envelope_aad(
     schema_id: &str,
     caller_runtime_id: &str,
     request_id: &str,
     message_kind: EnvelopeKind,
 ) -> Result<Vec<u8>, ServiceError> {
-    rmp_serde::to_vec(&(schema_id, caller_runtime_id, request_id, message_kind))
+    wire_encode(&(schema_id, caller_runtime_id, request_id, message_kind))
         .map_err(|_| ServiceError::Encoding)
 }
 
@@ -291,8 +465,10 @@ pub enum ServiceError {
     OuterIdentity,
     #[error("transport encryption or authentication failed")]
     Encryption,
-    #[error("transport MessagePack encoding failed")]
+    #[error("transport encoding failed")]
     Encoding,
+    #[error("frame is not a connector operation message")]
+    Carriage,
     #[error("completion did not carry a transported provider outcome")]
     InvalidCompletion,
     #[error("completion has no active request")]
@@ -373,7 +549,7 @@ mod tests {
         let key = security("epiphany-distinct-test-key");
         let invocation = invocation();
         let result = TransportResult::transported(&invocation, Vec::new(), receipt(&invocation));
-        let plaintext = rmp_serde::to_vec(&result).unwrap();
+        let plaintext = wire_encode(&result).unwrap();
         let seal = |caller: &str, request_id: &str| {
             encrypt_message(caller, request_id, EnvelopeKind::Result, &plaintext, &key).unwrap()
         };
@@ -401,7 +577,7 @@ mod tests {
         let good = encrypt_invocation(&invocation, &key).unwrap();
 
         let mut schema = good.clone();
-        schema.schema_id = "gamecult.codex.transport_envelope.v1".to_string();
+        schema.schema_id = concat!("gamecult.", "codex.transport_envelope.v2").to_string();
         let wrong_kind = sealed_invocation("epiphany-yggdrasil", "request-1", EnvelopeKind::Result);
         let mut empty = good.clone();
         empty.ciphertext.clear();
@@ -452,20 +628,44 @@ mod tests {
         assert!(matches!(write(&[], 1_000), Err(TransportFrameError::Size)));
     }
 
-    #[test]
-    fn the_worst_frame_is_the_real_encoding_of_an_all_high_ciphertext() {
+    /// The real result frame for an envelope with ids at the longest admitted
+    /// and a ciphertext of `length` bytes.
+    fn real_worst_frame(length: usize) -> Vec<u8> {
         let long = "x".repeat(MAX_IDENTITY_BYTES);
-        for length in [0, 1, 15, 16, 17, 255, 256, 65_535, 65_536, 70_000] {
-            let envelope = TransportEnvelope {
-                schema_id: ENVELOPE_SCHEMA_ID.to_string(),
-                caller_runtime_id: long.clone(),
-                request_id: long.clone(),
-                message_kind: EnvelopeKind::Invocation,
-                nonce: [0xff; 12],
-                ciphertext: vec![0xff; length],
-            };
+        encode_result_frame(&TransportEnvelope {
+            schema_id: ENVELOPE_SCHEMA_ID.to_string(),
+            caller_runtime_id: long.clone(),
+            request_id: long,
+            message_kind: EnvelopeKind::Invocation,
+            nonce: [0xff; 12],
+            ciphertext: vec![0xff; length],
+        })
+        .unwrap()
+    }
+
+    /// Ciphertext sizes either side of every length-header boundary the frame
+    /// crosses: bin 8 to 16 to 32, str 8 to 16 to 32, and each base64 padding.
+    fn boundary_sizes() -> Vec<usize> {
+        let mut sizes: Vec<usize> = (0..=40).collect();
+        for center in [
+            100, 200, 250, 256, 300, 1000, 3000, 65_535, 65_536, 49_000, 49_100, 49_152, 49_200,
+            70_000,
+        ] {
+            for delta in 0..=40 {
+                sizes.push(center + delta);
+                sizes.push(center.saturating_sub(delta));
+            }
+        }
+        sizes.sort_unstable();
+        sizes.dedup();
+        sizes
+    }
+
+    #[test]
+    fn the_frame_bound_is_the_real_carriage_encoding() {
+        for length in boundary_sizes() {
             assert_eq!(
-                rmp_serde::to_vec(&envelope).unwrap().len(),
+                real_worst_frame(length).len(),
                 frame_bytes_for_payload(length),
                 "{length}"
             );
@@ -480,16 +680,18 @@ mod tests {
                 let sealed =
                     encrypt_message(&id, &id, EnvelopeKind::Result, &vec![0x41; plaintext], &key)
                         .unwrap();
-                let real = rmp_serde::to_vec(&sealed).unwrap().len();
                 let worst = frame_bytes_for_payload(sealed.ciphertext.len());
-                assert!(real <= worst, "{real} > {worst}");
-                // Real ciphertext is random, so about half its bytes take two
-                // bytes: the worst case is not wildly above what is written.
+                for real in [
+                    encode_result_frame(&sealed).unwrap().len(),
+                    encode_invocation_frame(&sealed).unwrap().len(),
+                ] {
+                    assert!(real <= worst, "{real} > {worst}");
+                }
+                // The frame is the base64 of the envelope: its worst case is
+                // within the base64 expansion of the real one.
                 if id.len() == MAX_IDENTITY_BYTES {
-                    assert!(
-                        worst <= real + sealed.ciphertext.len() + 64,
-                        "{worst} {real}"
-                    );
+                    let real = encode_result_frame(&sealed).unwrap().len();
+                    assert!(worst <= real + 8, "{worst} {real}");
                 }
             }
         }
@@ -502,7 +704,7 @@ mod tests {
             None
         );
         assert_eq!(payload_bytes_for_frame(frame_bytes_for_payload(0)), Some(0));
-        for bytes in [1, 15, 16, 4096, 65_535, 65_536, 100_000, 2_000_000] {
+        for bytes in boundary_sizes().into_iter().chain([2_000_000]) {
             let frame = frame_bytes_for_payload(bytes);
             assert_eq!(payload_bytes_for_frame(frame), Some(bytes), "{bytes}");
             assert!(
@@ -510,5 +712,200 @@ mod tests {
                 "{bytes}"
             );
         }
+    }
+
+    #[test]
+    fn ciphertext_travels_as_binary() {
+        let key = security("epiphany-distinct-test-key");
+        for plaintext in [10, 300, 70_000] {
+            let sealed = encrypt_message(
+                "caller",
+                "request",
+                EnvelopeKind::Invocation,
+                &vec![0x41; plaintext],
+                &key,
+            )
+            .unwrap();
+            let length = sealed.ciphertext.len();
+            let mut expected = match length {
+                0..=255 => vec![0xc4, length as u8],
+                256..=65_535 => [&[0xc5][..], &(length as u16).to_be_bytes()].concat(),
+                _ => [&[0xc6][..], &(length as u32).to_be_bytes()].concat(),
+            };
+            expected.extend(&sealed.ciphertext);
+            let encoded = wire_encode(&sealed).unwrap();
+            assert!(
+                encoded
+                    .windows(expected.len())
+                    .any(|window| window == expected),
+                "{plaintext}"
+            );
+        }
+    }
+
+    fn sealed_for_carriage() -> TransportEnvelope {
+        encrypt_invocation(&invocation(), &security("epiphany-distinct-test-key")).unwrap()
+    }
+
+    fn request_message(edit: impl FnOnce(&mut CultNetMessage)) -> Vec<u8> {
+        let envelope = sealed_for_carriage();
+        let mut message = decode_cultnet_message_from_slice(
+            &encode_invocation_frame(&envelope).unwrap(),
+            CultNetWireContract::CultNetSchemaV0,
+        )
+        .unwrap();
+        edit(&mut message);
+        carriage_bytes(&message).unwrap()
+    }
+
+    fn response_message(edit: impl FnOnce(&mut CultNetMessage)) -> Vec<u8> {
+        let envelope = sealed_for_carriage();
+        let mut message = decode_cultnet_message_from_slice(
+            &encode_result_frame(&envelope).unwrap(),
+            CultNetWireContract::CultNetSchemaV0,
+        )
+        .unwrap();
+        edit(&mut message);
+        carriage_bytes(&message).unwrap()
+    }
+
+    #[test]
+    fn the_carriage_round_trips_both_directions() {
+        let envelope = sealed_for_carriage();
+        assert_eq!(
+            decode_invocation_frame(&encode_invocation_frame(&envelope).unwrap()).unwrap(),
+            envelope
+        );
+        assert_eq!(
+            decode_result_frame(&encode_result_frame(&envelope).unwrap()).unwrap(),
+            envelope
+        );
+        // A request is not a response, in either direction.
+        assert_eq!(
+            decode_result_frame(&encode_invocation_frame(&envelope).unwrap()),
+            Err(ServiceError::Carriage)
+        );
+        assert_eq!(
+            decode_invocation_frame(&encode_result_frame(&envelope).unwrap()),
+            Err(ServiceError::Carriage)
+        );
+    }
+
+    #[test]
+    fn the_carriage_refuses_another_service_operation_or_schema() {
+        fn edit_request(field: &str, value: &str) -> Vec<u8> {
+            request_message(|message| {
+                if let CultNetMessage::OperationRequest {
+                    service_id,
+                    operation,
+                    payload_schema,
+                    ..
+                } = message
+                {
+                    match field {
+                        "service" => *service_id = value.to_string(),
+                        "operation" => *operation = value.to_string(),
+                        _ => *payload_schema = value.to_string(),
+                    }
+                }
+            })
+        }
+        fn edit_response(field: &str, value: &str) -> Vec<u8> {
+            response_message(|message| {
+                if let CultNetMessage::OperationResponse {
+                    service_id,
+                    operation,
+                    payload_schema,
+                    status,
+                    ..
+                } = message
+                {
+                    match field {
+                        "service" => *service_id = value.to_string(),
+                        "operation" => *operation = value.to_string(),
+                        "status" => *status = value.to_string(),
+                        _ => *payload_schema = value.to_string(),
+                    }
+                }
+            })
+        }
+        for (field, value) in [
+            ("service", "gamecult.model.other"),
+            ("operation", "cancel"),
+            ("schema", "gamecult.model.transport_envelope.v2"),
+        ] {
+            assert_eq!(
+                decode_invocation_frame(&edit_request(field, value)),
+                Err(ServiceError::Carriage),
+                "{field}"
+            );
+            assert_eq!(
+                decode_result_frame(&edit_response(field, value)),
+                Err(ServiceError::Carriage),
+                "{field}"
+            );
+        }
+        assert_eq!(
+            decode_result_frame(&edit_response("status", "rejected")),
+            Err(ServiceError::Carriage)
+        );
+        // The unedited message decodes, so each refusal above is the edit's.
+        assert!(decode_invocation_frame(&edit_request("service", CONNECTOR_SERVICE_ID)).is_ok());
+        assert!(decode_result_frame(&edit_response("status", "ok")).is_ok());
+    }
+
+    #[test]
+    fn the_carriage_refuses_a_message_id_that_is_not_the_envelopes_request_id() {
+        let request = request_message(|message| {
+            if let CultNetMessage::OperationRequest { message_id, .. } = message {
+                *message_id = "another-request".to_string();
+            }
+        });
+        let response = response_message(|message| {
+            if let CultNetMessage::OperationResponse { message_id, .. } = message {
+                *message_id = "another-request".to_string();
+            }
+        });
+        assert_eq!(
+            decode_invocation_frame(&request),
+            Err(ServiceError::OuterIdentity)
+        );
+        assert_eq!(
+            decode_result_frame(&response),
+            Err(ServiceError::OuterIdentity)
+        );
+    }
+
+    #[test]
+    fn the_carriage_refuses_what_is_not_a_connector_message() {
+        let good = encode_invocation_frame(&sealed_for_carriage()).unwrap();
+        // Not MessagePack of any CultNet message, nor a truncated one.
+        assert_eq!(
+            decode_invocation_frame(&[0xc1, 0x00, 0x01]),
+            Err(ServiceError::Carriage)
+        );
+        assert_eq!(
+            decode_invocation_frame(&good[..good.len() / 2]),
+            Err(ServiceError::Carriage)
+        );
+        // A payload that is not base64, and base64 of something else.
+        let not_base64 = request_message(|message| {
+            if let CultNetMessage::OperationRequest { payload, .. } = message {
+                *payload = "!!not base64!!".to_string();
+            }
+        });
+        assert_eq!(
+            decode_invocation_frame(&not_base64),
+            Err(ServiceError::Carriage)
+        );
+        let not_an_envelope = request_message(|message| {
+            if let CultNetMessage::OperationRequest { payload, .. } = message {
+                *payload = STANDARD.encode(b"\x01\x02");
+            }
+        });
+        assert_eq!(
+            decode_invocation_frame(&not_an_envelope),
+            Err(ServiceError::Encoding)
+        );
     }
 }

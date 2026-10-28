@@ -495,6 +495,7 @@ dependencies = [
  "cultnet-rs",
  "rand_core 0.6.4",
  "rmp-serde",
+ "rmpv",
  "schemars",
  "serde",
  "serde_bytes",

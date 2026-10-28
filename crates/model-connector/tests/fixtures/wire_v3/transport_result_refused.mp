@@ -1,0 +1,1 @@
+„©schema_idÙ"gamecult.model.transport_result.v3ªrequest_id®golden-request±caller_runtime_id­golden-caller«disposition§Refused«OutputBound

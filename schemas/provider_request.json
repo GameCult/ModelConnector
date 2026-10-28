@@ -1,0 +1,229 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ProviderRequest",
+  "type": "object",
+  "properties": {
+    "cache_retention": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/CacheRetention"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "conversation_id": {
+      "type": "string"
+    },
+    "input": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/InputItem"
+      }
+    },
+    "instructions": {
+      "type": "string"
+    },
+    "max_output_tokens": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "model": {
+      "type": "string"
+    },
+    "output_schema_json": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "parallel_tool_calls": {
+      "type": "boolean"
+    },
+    "reasoning_effort": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ReasoningEffort"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "request_id": {
+      "type": "string"
+    },
+    "schema_id": {
+      "type": "string"
+    },
+    "tool_choice": {
+      "$ref": "#/$defs/ToolChoice"
+    },
+    "tools": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/ToolDefinition"
+      }
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "schema_id",
+    "request_id",
+    "conversation_id",
+    "model",
+    "instructions",
+    "input",
+    "tools",
+    "tool_choice",
+    "parallel_tool_calls",
+    "max_output_tokens"
+  ],
+  "$defs": {
+    "CacheRetention": {
+      "type": "string",
+      "enum": [
+        "short",
+        "long"
+      ]
+    },
+    "InputItem": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "UserText": {
+              "type": "object",
+              "properties": {
+                "text": {
+                  "type": "string"
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "text"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "UserText"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "AssistantText": {
+              "type": "object",
+              "properties": {
+                "text": {
+                  "type": "string"
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "text"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "AssistantText"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "ToolCall": {
+              "type": "object",
+              "properties": {
+                "arguments": {
+                  "type": "string"
+                },
+                "call_id": {
+                  "type": "string"
+                },
+                "name": {
+                  "type": "string"
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "call_id",
+                "name",
+                "arguments"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "ToolCall"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "ToolResult": {
+              "type": "object",
+              "properties": {
+                "call_id": {
+                  "type": "string"
+                },
+                "output": {
+                  "type": "string"
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "call_id",
+                "output"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "ToolResult"
+          ]
+        }
+      ]
+    },
+    "ReasoningEffort": {
+      "type": "string",
+      "enum": [
+        "low",
+        "medium",
+        "high",
+        "max"
+      ]
+    },
+    "ToolChoice": {
+      "type": "string",
+      "enum": [
+        "auto",
+        "required"
+      ]
+    },
+    "ToolDefinition": {
+      "type": "object",
+      "properties": {
+        "description": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "parameters_json": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "description",
+        "parameters_json"
+      ]
+    }
+  }
+}

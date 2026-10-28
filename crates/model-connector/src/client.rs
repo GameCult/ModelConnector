@@ -6,8 +6,8 @@ use zeroize::Zeroizing;
 
 use crate::contract::{TransportInvocation, TransportKey, TransportResult};
 use crate::envelope::{
-    MAX_IDENTITY_BYTES, ServiceError, TransportFrameError, decrypt_result, encrypt_invocation,
-    read_transport_frame, write_transport_frame,
+    MAX_IDENTITY_BYTES, ServiceError, TransportFrameError, decode_result_frame, decrypt_result,
+    encode_invocation_frame, encrypt_invocation, read_transport_frame, write_transport_frame,
 };
 
 #[derive(Clone)]
@@ -51,8 +51,7 @@ impl ConnectorClient {
         if invocation.request_id().len() > MAX_IDENTITY_BYTES {
             return Err(ConnectorClientError::RequestIdTooLong);
         }
-        let request = rmp_serde::to_vec(&encrypt_invocation(invocation, &self.security)?)
-            .map_err(|_| ConnectorClientError::Encoding)?;
+        let request = encode_invocation_frame(&encrypt_invocation(invocation, &self.security)?)?;
         let connect_timeout = self
             .response_timeout
             .unwrap_or(Duration::from_secs(10))
@@ -67,8 +66,7 @@ impl ConnectorClient {
             .map_err(client_frame_error)?;
         let response =
             read_transport_frame(&mut stream, self.max_frame_bytes).map_err(client_frame_error)?;
-        let envelope =
-            rmp_serde::from_slice(&response).map_err(|_| ConnectorClientError::Encoding)?;
+        let envelope = decode_result_frame(&response)?;
         decrypt_result(&envelope, &self.security, invocation).map_err(Into::into)
     }
 }
@@ -120,8 +118,6 @@ pub enum ConnectorClientError {
     Connection(#[source] std::io::Error),
     #[error("connector frame exceeded its bound")]
     FrameSize,
-    #[error("connector MessagePack encoding failed")]
-    Encoding,
     #[error("request id is longer than the connector identity bound")]
     RequestIdTooLong,
     #[error(transparent)]
@@ -151,7 +147,7 @@ mod fixture_tests {
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let request = read_transport_frame(&mut stream, 64 * 1024).unwrap();
-            let envelope: TransportEnvelope = rmp_serde::from_slice(&request).unwrap();
+            let envelope = decode_invocation_frame(&request).unwrap();
             assert_eq!(decrypt_invocation(&envelope, &security).unwrap(), expected);
             let response = encrypt_result(
                 &TransportResult::refused(&expected, Refusal::ModelNotAllowed),
@@ -160,7 +156,7 @@ mod fixture_tests {
             .unwrap();
             write_transport_frame(
                 &mut stream,
-                &rmp_serde::to_vec(&response).unwrap(),
+                &encode_result_frame(&response).unwrap(),
                 64 * 1024,
             )
             .unwrap();
@@ -193,6 +189,33 @@ mod fixture_tests {
         .unwrap();
         let mut long = invocation();
         long.request.request_id = "r".repeat(MAX_IDENTITY_BYTES + 1);
+        assert!(matches!(
+            client.execute(&long),
+            Err(ConnectorClientError::RequestIdTooLong)
+        ));
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "the client must not even connect"
+        );
+    }
+
+    #[test]
+    fn the_client_measures_a_request_id_in_bytes() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let client = ConnectorClient::new(
+            listener.local_addr().unwrap(),
+            "epiphany-distinct-test-key",
+            64 * 1024,
+            Some(Duration::from_secs(1)),
+        )
+        .unwrap();
+        // 86 characters, 258 bytes: under the bound by characters, over by bytes.
+        let id = "\u{20AC}".repeat(86);
+        assert_eq!((id.chars().count(), id.len()), (86, 258));
+        let mut long = invocation();
+        long.request.request_id = id;
         assert!(matches!(
             client.execute(&long),
             Err(ConnectorClientError::RequestIdTooLong)

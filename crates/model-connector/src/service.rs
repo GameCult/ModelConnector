@@ -13,7 +13,7 @@ use crate::contract::{
 };
 use crate::envelope::{
     EnvelopeKind, MAX_IDENTITY_BYTES, ServiceError, TransportEnvelope, decrypt_invocation,
-    encrypt_result, validate_envelope,
+    encode_result_frame, encrypt_result, validate_envelope,
 };
 
 pub struct CallerAdmission {
@@ -90,7 +90,7 @@ enum ReplayState {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, DatabaseEntry)]
-#[cultcache(type = "gamecult.codex.replay_record.v1")]
+#[cultcache(type = "gamecult.model.replay_record.v1")]
 struct ReplayRecord {
     #[cultcache(key = 0)]
     caller_runtime_id: String,
@@ -313,8 +313,8 @@ impl TransportService {
         })))
     }
 
-    /// Records a result and seals it. `max_frame_bytes` bounds the serialized
-    /// envelope, which is what a frame carries: a result whose sealed envelope
+    /// Records a result and seals it. `max_frame_bytes` bounds the frame the
+    /// sealed envelope travels in (its carriage): a result whose sealed envelope
     /// does not fit is recorded as the typed `result_size` failure instead, so
     /// no completed record is ever undeliverable and a retry replays bytes
     /// that fit.
@@ -424,9 +424,7 @@ impl TransportService {
 }
 
 fn fits_frame(envelope: &TransportEnvelope, max_frame_bytes: usize) -> Result<bool, ServiceError> {
-    rmp_serde::to_vec(envelope)
-        .map(|bytes| bytes.len() <= max_frame_bytes)
-        .map_err(|_| ServiceError::Encoding)
+    encode_result_frame(envelope).map(|bytes| bytes.len() <= max_frame_bytes)
 }
 
 /// The provider named on the stand-in failure, fixed so its size is bounded.
@@ -761,7 +759,7 @@ mod tests {
             &invocation.caller_runtime_id,
             invocation.request_id(),
             EnvelopeKind::Invocation,
-            &rmp_serde::to_vec(invocation).unwrap(),
+            &crate::contract::wire_encode(invocation).unwrap(),
             &security(KEY),
         )
         .unwrap()
@@ -1007,7 +1005,8 @@ mod tests {
             };
             assert_eq!(reply.request_id, id, "{length}");
             let result: TransportResult =
-                rmp_serde::from_slice(&decrypt_message(&reply, &security(KEY)).unwrap()).unwrap();
+                crate::contract::wire_decode(&decrypt_message(&reply, &security(KEY)).unwrap())
+                    .unwrap();
             assert_eq!(
                 result.disposition,
                 TransportDisposition::Refused(Refusal::Malformed)
@@ -1053,7 +1052,7 @@ mod tests {
     fn a_frame_check_is_inclusive_of_the_serialized_envelope() {
         let envelope =
             encrypt_invocation(&invocation_for(CALLER, "sized"), &security(KEY)).unwrap();
-        let size = rmp_serde::to_vec(&envelope).unwrap().len();
+        let size = encode_result_frame(&envelope).unwrap().len();
         assert_eq!(fits_frame(&envelope, size), Ok(true));
         assert_eq!(fits_frame(&envelope, size - 1), Ok(false));
     }
@@ -1098,7 +1097,7 @@ mod tests {
         let (claim, invocation) = claim_for(&mut service, "stand-in");
         let big = text_result(&invocation, &"y".repeat(4000), &"t".repeat(5000));
         let response = service.complete(*claim, big, 2000).unwrap();
-        assert!(rmp_serde::to_vec(&response).unwrap().len() <= 2000);
+        assert!(encode_result_frame(&response).unwrap().len() <= 2000);
         let stand_in = decrypt_result(&response, &security(KEY), &invocation).unwrap();
         assert_eq!(
             stand_in,
@@ -1172,7 +1171,7 @@ mod tests {
         let (claim, invocation) = claim_for(&mut service, "restart");
         let big = text_result(&invocation, &"y".repeat(4000), "fixture-sse");
         let recorded = service.complete(*claim, big, FRAME).unwrap();
-        assert!(rmp_serde::to_vec(&recorded).unwrap().len() > 2000);
+        assert!(encode_result_frame(&recorded).unwrap().len() > 2000);
         drop(service);
 
         let mut service = open_service(&store, 8);
@@ -1192,7 +1191,7 @@ mod tests {
         else {
             panic!("expected a replay");
         };
-        assert!(rmp_serde::to_vec(&smaller).unwrap().len() <= 2000);
+        assert!(encode_result_frame(&smaller).unwrap().len() <= 2000);
         assert_eq!(
             decrypt_result(&smaller, &security(KEY), &invocation).unwrap(),
             result_size_failure(
@@ -1250,5 +1249,26 @@ mod tests {
                 .disposition,
             TransportDisposition::Refused(Refusal::Indeterminate)
         );
+    }
+
+    #[test]
+    fn contract_refusal_maps_each_error() {
+        assert_eq!(contract_refusal(&ContractError::Expiry), Refusal::Expired);
+        assert_eq!(
+            contract_refusal(&ContractError::Identity),
+            Refusal::IdentitySubstitution
+        );
+        assert_eq!(
+            contract_refusal(&ContractError::ProviderDigest),
+            Refusal::ProviderDigestSubstitution
+        );
+        for other in [
+            ContractError::Schema,
+            ContractError::Invalid("model"),
+            ContractError::NativeDigest,
+            ContractError::EventSequence,
+        ] {
+            assert_eq!(contract_refusal(&other), Refusal::Malformed, "{other:?}");
+        }
     }
 }
