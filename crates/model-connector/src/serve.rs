@@ -12,7 +12,7 @@ use zeroize::Zeroizing;
 
 use crate::contract::{TransportInvocation, TransportResult};
 use crate::envelope::{
-    ServiceError, TransportEnvelope, TransportFrameError, read_transport_frame, worst_frame_bytes,
+    ServiceError, TransportEnvelope, TransportFrameError, read_transport_frame, frame_bytes_for_payload,
     write_transport_frame,
 };
 use crate::service::{CallerAdmission, TransportAdmission, TransportService};
@@ -39,8 +39,9 @@ pub struct ServeLimits {
     pub max_expiry_skew_ms: u64,
 }
 
-/// The smallest caller payload bound the base daemon admitted.
-const MIN_PAYLOAD_BYTES: usize = 4096;
+/// The smallest caller payload bound serve admits. The smallest legal frame is
+/// `frame_bytes_for_payload(MIN_PAYLOAD_BYTES)`.
+pub const MIN_PAYLOAD_BYTES: usize = 4096;
 
 impl ServeLimits {
     /// The bounds serve refuses before it opens anything: each limit nonzero,
@@ -51,7 +52,15 @@ impl ServeLimits {
     /// An admitted payload therefore always fits, and `complete` is given the
     /// same frame bound to fit every result in.
     fn validate(&self, admissions: &[CallerAdmission]) -> Result<(), ServeError> {
-        if self.max_frame_bytes < worst_frame_bytes(MIN_PAYLOAD_BYTES)
+        let smallest = frame_bytes_for_payload(MIN_PAYLOAD_BYTES);
+        if self.max_frame_bytes > 0 && self.max_frame_bytes < smallest {
+            return Err(ServeError::FrameBound {
+                max_frame_bytes: self.max_frame_bytes,
+                payload_bytes: MIN_PAYLOAD_BYTES,
+                needed_frame_bytes: smallest,
+            });
+        }
+        if self.max_frame_bytes == 0
             || self.max_frame_bytes > u32::MAX as usize
             || self.max_connections == 0
             || self.socket_timeout_ms == 0
@@ -71,11 +80,18 @@ impl ServeLimits {
         if self.max_connections < slots.max(8) {
             return Err(ServeError::InvalidConfig("connection capacity"));
         }
-        if admissions.iter().any(|caller| {
-            caller.max_payload_bytes() < MIN_PAYLOAD_BYTES
-                || worst_frame_bytes(caller.max_payload_bytes()) > self.max_frame_bytes
-        }) {
-            return Err(ServeError::InvalidConfig("caller admission"));
+        for caller in admissions {
+            if caller.max_payload_bytes() < MIN_PAYLOAD_BYTES {
+                return Err(ServeError::InvalidConfig("caller admission"));
+            }
+            let needed = frame_bytes_for_payload(caller.max_payload_bytes());
+            if needed > self.max_frame_bytes {
+                return Err(ServeError::FrameBound {
+                    max_frame_bytes: self.max_frame_bytes,
+                    payload_bytes: caller.max_payload_bytes(),
+                    needed_frame_bytes: needed,
+                });
+            }
         }
         Ok(())
     }
@@ -211,7 +227,7 @@ fn execute_inference_frame(
     let admission = service
         .lock()
         .map_err(|_| ServeError::ServicePoisoned)?
-        .begin(&envelope, unix_ms()?)?;
+        .begin(&envelope, unix_ms()?, limits.max_frame_bytes)?;
     let response = match admission {
         TransportAdmission::Reply(response) => response,
         TransportAdmission::Execute(claim) => {
@@ -274,6 +290,14 @@ impl Drop for ConnectionPermit {
 pub enum ServeError {
     #[error("invalid serve configuration field {0}")]
     InvalidConfig(&'static str),
+    #[error(
+        "max_frame_bytes {max_frame_bytes} cannot carry a {payload_bytes}-byte payload bound:          at least {needed_frame_bytes} frame bytes are needed"
+    )]
+    FrameBound {
+        max_frame_bytes: usize,
+        payload_bytes: usize,
+        needed_frame_bytes: usize,
+    },
     #[error("connector connection key is unavailable")]
     ConnectionKey(#[source] std::io::Error),
     #[error(transparent)]
@@ -497,6 +521,45 @@ mod tests {
     }
 
     #[test]
+    fn serve_refuses_a_long_request_id_on_the_wire_without_dropping_the_connection() {
+        let store = TestStore::new();
+        let backend = CountingBackend::new(true);
+        let (_client, endpoint) = start(backend.clone(), &store);
+        let security = crate::fixtures::security(KEY);
+        let send = |id: &str| {
+            let request = rmp_serde::to_vec(
+                &crate::envelope::encrypt_invocation(&fresh(id), &security).unwrap(),
+            )
+            .unwrap();
+            let mut stream = TcpStream::connect(endpoint).unwrap();
+            write_transport_frame(&mut stream, &request, FRAME).unwrap();
+            let reply = read_transport_frame(&mut stream, FRAME).unwrap();
+            let envelope: TransportEnvelope = rmp_serde::from_slice(&reply).unwrap();
+            let result: TransportResult = rmp_serde::from_slice(
+                &crate::envelope::decrypt_message(&envelope, &security).unwrap(),
+            )
+            .unwrap();
+            (reply.len(), result)
+        };
+        let (_, served) = send(&"i".repeat(crate::envelope::MAX_IDENTITY_BYTES));
+        assert!(matches!(
+            served.disposition,
+            TransportDisposition::Transported { .. }
+        ));
+        assert_eq!(backend.executions.load(Ordering::SeqCst), 1);
+        for length in [257, 258, 5_000, 60_000] {
+            let (size, result) = send(&"i".repeat(length));
+            assert_eq!(
+                result.disposition,
+                TransportDisposition::Refused(Refusal::Malformed),
+                "{length}"
+            );
+            assert!(size <= smallest_frame(), "{length}: {size}");
+        }
+        assert_eq!(backend.executions.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn serve_refuses_to_start_on_an_unready_backend() {
         let store = TestStore::new();
         let backend = CountingBackend::new(false);
@@ -547,7 +610,7 @@ mod tests {
     /// The smallest frame serve admits: the smallest payload at its worst-case
     /// sealed encoding.
     fn smallest_frame() -> usize {
-        worst_frame_bytes(MIN_PAYLOAD_BYTES)
+        frame_bytes_for_payload(MIN_PAYLOAD_BYTES)
     }
 
     #[test]
@@ -558,16 +621,15 @@ mod tests {
         ))
         .unwrap()
         .len();
-        let worst = worst_frame_bytes(plaintext + GCM_TAG);
+        let worst = frame_bytes_for_payload(plaintext + GCM_TAG);
         assert!(worst <= smallest_frame(), "{worst} > {}", smallest_frame());
     }
 
     #[test]
     fn serve_refuses_unbounded_limits_and_admits_the_widest_frame() {
         let store = TestStore::new();
-        let mutations: [fn(&mut ServeLimits); 6] = [
+        let mutations: [fn(&mut ServeLimits); 5] = [
             |limits| limits.max_frame_bytes = 0,
-            |limits| limits.max_frame_bytes = smallest_frame() - 1,
             |limits| limits.max_frame_bytes = u32::MAX as usize + 1,
             |limits| limits.max_connections = 0,
             |limits| limits.socket_timeout_ms = 0,
@@ -658,6 +720,7 @@ mod tests {
         ) {
             None => None,
             Some(Err(ServeError::InvalidConfig(field))) => Some(field),
+            Some(Err(ServeError::FrameBound { .. })) => Some("frame bound"),
             Some(other) => panic!("unexpected serve outcome {other:?}"),
         }
     }
@@ -699,13 +762,13 @@ mod tests {
         let tightest = smallest_frame();
         assert_eq!(
             refusal(frame(tightest - 1), payload(4096)),
-            Some("serve limits")
+            Some("frame bound")
         );
         // The tightest legal pair: the smallest payload in the smallest frame.
         assert_eq!(refusal(frame(tightest), payload(4096)), None);
         assert_eq!(
             refusal(frame(tightest), payload(4097)),
-            Some("caller admission")
+            Some("frame bound")
         );
         assert_eq!(
             refusal(frame(tightest), payload(4095)),
@@ -715,14 +778,14 @@ mod tests {
         // a payload that is the whole frame cannot be carried.
         assert_eq!(
             refusal(frame(FRAME), payload(FRAME)),
-            Some("caller admission")
+            Some("frame bound")
         );
         for bytes in [8192, 65_535, 65_536, 100_000] {
-            let widest = worst_frame_bytes(bytes);
+            let widest = frame_bytes_for_payload(bytes);
             assert_eq!(refusal(frame(widest), payload(bytes)), None, "{bytes}");
             assert_eq!(
                 refusal(frame(widest - 1), payload(bytes)),
-                Some("caller admission"),
+                Some("frame bound"),
                 "{bytes}"
             );
         }
@@ -730,7 +793,7 @@ mod tests {
             admission("a", "key-a-distinct", 4, 8192),
             admission("b", "key-b-distinct", 4, FRAME),
         ];
-        assert_eq!(refusal(frame(FRAME), mixed), Some("caller admission"));
+        assert_eq!(refusal(frame(FRAME), mixed), Some("frame bound"));
     }
 
     #[test]
@@ -744,7 +807,7 @@ mod tests {
         let key = crate::fixtures::security(KEY);
         let sealed = crate::envelope::encrypt_invocation(&invocation, &key).unwrap();
         let bound = sealed.ciphertext.len();
-        let frame = worst_frame_bytes(bound);
+        let frame = frame_bytes_for_payload(bound);
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let endpoint = listener.local_addr().unwrap();
         let path = store.path.clone();
@@ -920,7 +983,7 @@ mod tests {
     /// The largest result plaintext whose sealed frame fits at the worst encoding.
     fn widest_guaranteed_plaintext(base: usize) -> usize {
         (base..=FRAME)
-            .take_while(|plaintext| worst_frame_bytes(plaintext + GCM_TAG) <= FRAME)
+            .take_while(|plaintext| frame_bytes_for_payload(plaintext + GCM_TAG) <= FRAME)
             .last()
             .unwrap_or(base)
     }

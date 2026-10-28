@@ -24,6 +24,13 @@ Crate `crates/model-connector`:
   `ProviderBackend` trait. A connector binary implements `ProviderBackend` for its
   provider and calls `serve`; the kit names no provider.
 
+Frame arithmetic is public in `src/envelope.rs`: `frame_bytes_for_payload(n)` is the frame a
+caller payload bound of `n` needs, `payload_bytes_for_frame(frame)` is the largest payload bound
+a frame allows, and `MAX_IDENTITY_BYTES` (256) bounds caller ids, request ids and model names.
+`serve` refuses a frame/payload pair that violates them (`ServeError::FrameBound` states the frame
+needed); the smallest legal frame is `frame_bytes_for_payload(MIN_PAYLOAD_BYTES)`. A request id past
+the bound is refused on the wire as `Refusal::Malformed`, the reply naming it by its SHA-256.
+
 The default feature set compiles contract, envelope and client only. Schema ids are
 still `gamecult.codex.*.v2`; renaming them changes the wire and belongs to a later
 contract version.

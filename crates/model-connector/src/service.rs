@@ -195,15 +195,19 @@ impl TransportService {
         })
     }
 
+    /// Admits one request. `max_frame_bytes` is the frame every reply must
+    /// fit, the same bound `complete` is given: a recorded result that no
+    /// longer fits it (the service reopened at a smaller frame) is answered
+    /// with the typed `result_size` failure, which is recorded in its place.
+    /// A request id longer than `MAX_IDENTITY_BYTES` is refused as malformed;
+    /// the refusal names the id by its digest so it fits any legal frame.
     pub fn begin(
         &mut self,
         envelope: &TransportEnvelope,
         now_unix_ms: u64,
+        max_frame_bytes: usize,
     ) -> Result<TransportAdmission, ServiceError> {
         validate_envelope(envelope, EnvelopeKind::Invocation)?;
-        if envelope.request_id.len() > MAX_IDENTITY_BYTES {
-            return Err(ContractError::Invalid("request_id").into());
-        }
         let caller = self
             .callers
             .get(&envelope.caller_runtime_id)
@@ -211,6 +215,12 @@ impl TransportService {
         let security = caller.security.clone();
         let max_concurrent_requests = caller.max_concurrent_requests;
         let invocation = decrypt_invocation(envelope, &security)?;
+        if envelope.request_id.len() > MAX_IDENTITY_BYTES {
+            return Ok(TransportAdmission::Reply(encrypt_result(
+                &unnamed_refusal(&invocation, Refusal::Malformed),
+                &security,
+            )?));
+        }
         if envelope.ciphertext.len() > caller.max_payload_bytes {
             return self.reply_refusal(&invocation, Refusal::Policy, &security);
         }
@@ -240,8 +250,25 @@ impl TransportService {
             if record.invocation_sha256 != invocation_sha256 {
                 return self.reply_refusal(&invocation, Refusal::ReplayConflict, &security);
             }
-            return match record.state {
-                ReplayState::Completed { response } => Ok(TransportAdmission::Reply(response)),
+            return match &record.state {
+                ReplayState::Completed { response } => {
+                    if fits_frame(response, max_frame_bytes)? {
+                        return Ok(TransportAdmission::Reply(response.clone()));
+                    }
+                    let stand_in = self.seal_stand_in(&invocation, &security, max_frame_bytes)?;
+                    self.replay_store
+                        .put(
+                            replay_key(&identity),
+                            &ReplayRecord {
+                                state: ReplayState::Completed {
+                                    response: stand_in.clone(),
+                                },
+                                ..record.clone()
+                            },
+                        )
+                        .map_err(replay_store_error)?;
+                    Ok(TransportAdmission::Reply(stand_in))
+                }
                 ReplayState::Active => {
                     let refusal = if self.live.contains(&identity) {
                         Refusal::InFlight
@@ -318,22 +345,23 @@ impl TransportService {
             .callers
             .get(&identity.caller_runtime_id)
             .ok_or(ServiceError::CallerNotAdmitted)?;
-        let mut response = encrypt_result(&result, &caller.security)?;
+        let security = caller.security.clone();
+        let mut response = encrypt_result(&result, &security)?;
         if !fits_frame(&response, max_frame_bytes)? {
-            response = encrypt_result(
-                &result_size_failure(
-                    &claim.invocation.caller_runtime_id,
-                    claim.invocation.request_id(),
-                    &claim.invocation.request.model,
-                    claim.invocation.native_request_sha256,
-                    claim.invocation.provider_request_sha256,
-                ),
-                &caller.security,
-            )?;
-            if !fits_frame(&response, max_frame_bytes)? {
-                return Err(ServiceError::FrameBound);
-            }
+            response = match self.seal_stand_in(&claim.invocation, &security, max_frame_bytes) {
+                Ok(stand_in) => stand_in,
+                Err(error) => {
+                    // Nothing is recorded, but the caller's slot is not held
+                    // by a request that can no longer finish.
+                    self.live.remove(&identity);
+                    return Err(error);
+                }
+            };
         }
+        let caller = self
+            .callers
+            .get(&identity.caller_runtime_id)
+            .ok_or(ServiceError::CallerNotAdmitted)?;
         let replay_record = ReplayRecord {
             caller_runtime_id: identity.caller_runtime_id.clone(),
             request_id: identity.request_id.clone(),
@@ -349,6 +377,30 @@ impl TransportService {
             .map_err(replay_store_error)?;
         self.live.remove(&identity);
         Ok(response)
+    }
+
+    /// The `result_size` failure sealed for `invocation`, if it fits the frame.
+    fn seal_stand_in(
+        &self,
+        invocation: &TransportInvocation,
+        security: &TransportKey,
+        max_frame_bytes: usize,
+    ) -> Result<TransportEnvelope, ServiceError> {
+        let stand_in = encrypt_result(
+            &result_size_failure(
+                &invocation.caller_runtime_id,
+                invocation.request_id(),
+                &invocation.request.model,
+                invocation.native_request_sha256,
+                invocation.provider_request_sha256,
+            ),
+            security,
+        )?;
+        if fits_frame(&stand_in, max_frame_bytes)? {
+            Ok(stand_in)
+        } else {
+            Err(ServiceError::FrameBound)
+        }
     }
 
     fn reply_refusal(
@@ -412,14 +464,27 @@ fn replay_key(identity: &RequestIdentity) -> String {
     hasher.update(identity.caller_runtime_id.as_bytes());
     hasher.update((identity.request_id.len() as u64).to_be_bytes());
     hasher.update(identity.request_id.as_bytes());
+    hex(hasher.finalize().into())
+}
+
+fn hex(digest: [u8; 32]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
-    let digest = hasher.finalize();
-    let mut key = String::with_capacity(64);
+    let mut text = String::with_capacity(64);
     for byte in digest {
-        key.push(HEX[(byte >> 4) as usize] as char);
-        key.push(HEX[(byte & 0x0f) as usize] as char);
+        text.push(HEX[(byte >> 4) as usize] as char);
+        text.push(HEX[(byte & 0x0f) as usize] as char);
     }
-    key
+    text
+}
+
+/// A refusal for an invocation whose request id is too long to echo: it names
+/// the request by the hex SHA-256 of the id (64 bytes), so the reply fits the
+/// smallest legal frame whatever the id's length.
+fn unnamed_refusal(invocation: &TransportInvocation, reason: Refusal) -> TransportResult {
+    TransportResult {
+        request_id: hex(Sha256::digest(invocation.request_id().as_bytes()).into()),
+        ..TransportResult::refused(invocation, reason)
+    }
 }
 
 fn replay_store_error(error: impl std::fmt::Display) -> ServiceError {
@@ -440,6 +505,8 @@ mod tests {
     use super::*;
     use crate::fixtures::*;
     use crate::{contract::*, envelope::*};
+
+    const FRAME: usize = 1 << 20;
 
     #[test]
     fn service_refuses_shared_keys_and_isolates_caller_request_identities() {
@@ -464,7 +531,7 @@ mod tests {
                 .begin(
                     &encrypt_invocation(&epiphany, &security("epiphany-distinct-test-key"))
                         .unwrap(),
-                    1_000,
+                    1_000, FRAME,
                 )
                 .unwrap(),
             TransportAdmission::Execute(_)
@@ -474,7 +541,7 @@ mod tests {
                 .begin(
                     &encrypt_invocation(&ghostlight, &security("ghostlight-distinct-test-key"))
                         .unwrap(),
-                    1_000,
+                    1_000, FRAME,
                 )
                 .unwrap(),
             TransportAdmission::Execute(_)
@@ -488,7 +555,7 @@ mod tests {
         let security = security("epiphany-distinct-test-key");
         let mut service = open_service(&store, 1);
         let claim = match service
-            .begin(&encrypt_invocation(&invocation, &security).unwrap(), 1_000)
+            .begin(&encrypt_invocation(&invocation, &security).unwrap(), 1_000, FRAME)
             .unwrap()
         {
             TransportAdmission::Execute(claim) => claim,
@@ -516,7 +583,7 @@ mod tests {
         let mut service = open_service(&store, 1);
 
         let replay = match service
-            .begin(&encrypt_invocation(&invocation, &security).unwrap(), 1_000)
+            .begin(&encrypt_invocation(&invocation, &security).unwrap(), 1_000, FRAME)
             .unwrap()
         {
             TransportAdmission::Reply(response) => response,
@@ -535,7 +602,7 @@ mod tests {
             TransportInvocation::new("epiphany-yggdrasil", 2_000, [7; 32], changed_request)
                 .unwrap();
         let refusal = match service
-            .begin(&encrypt_invocation(&conflicting, &security).unwrap(), 1_000)
+            .begin(&encrypt_invocation(&conflicting, &security).unwrap(), 1_000, FRAME)
             .unwrap()
         {
             TransportAdmission::Reply(response) => response,
@@ -558,13 +625,13 @@ mod tests {
         let mut service = open_service(&store, 1);
         let first_envelope = encrypt_invocation(&first, &security).unwrap();
         assert!(matches!(
-            service.begin(&first_envelope, 1_000).unwrap(),
+            service.begin(&first_envelope, 1_000, FRAME).unwrap(),
             TransportAdmission::Execute(_)
         ));
 
         for (invocation, expected) in [(&first, Refusal::InFlight), (&second, Refusal::Capacity)] {
             let response = match service
-                .begin(&encrypt_invocation(invocation, &security).unwrap(), 1_000)
+                .begin(&encrypt_invocation(invocation, &security).unwrap(), 1_000, FRAME)
                 .unwrap()
             {
                 TransportAdmission::Reply(response) => response,
@@ -588,7 +655,7 @@ mod tests {
         let mut service = open_service(&store, 1);
         assert!(matches!(
             service
-                .begin(&encrypt_invocation(&first, &security).unwrap(), 1_000)
+                .begin(&encrypt_invocation(&first, &security).unwrap(), 1_000, FRAME)
                 .unwrap(),
             TransportAdmission::Execute(_)
         ));
@@ -596,7 +663,7 @@ mod tests {
 
         let mut restarted = open_service(&store, 1);
         let ambiguous = match restarted
-            .begin(&encrypt_invocation(&first, &security).unwrap(), 1_000)
+            .begin(&encrypt_invocation(&first, &security).unwrap(), 1_000, FRAME)
             .unwrap()
         {
             TransportAdmission::Reply(response) => response,
@@ -610,7 +677,7 @@ mod tests {
         );
         assert!(matches!(
             restarted
-                .begin(&encrypt_invocation(&second, &security).unwrap(), 1_000)
+                .begin(&encrypt_invocation(&second, &security).unwrap(), 1_000, FRAME)
                 .unwrap(),
             TransportAdmission::Execute(_)
         ));
@@ -646,7 +713,7 @@ mod tests {
         edit(&mut request);
         let invocation = TransportInvocation::new(CALLER, 2_000, [7; 32], request).unwrap();
         let envelope = encrypt_invocation(&invocation, &security(KEY)).unwrap();
-        (service.begin(&envelope, 1_000).unwrap(), invocation)
+        (service.begin(&envelope, 1_000, FRAME).unwrap(), invocation)
     }
 
     fn refusal_of(admission: TransportAdmission, invocation: &TransportInvocation) -> Refusal {
@@ -727,7 +794,7 @@ mod tests {
             .unwrap();
             TransportService::open(&store.path, [admission], 5_000)
                 .unwrap()
-                .begin(&envelope, 1_000)
+                .begin(&envelope, 1_000, FRAME)
         };
         assert!(matches!(admit(size), Ok(TransportAdmission::Execute(_))));
         let refused = admit(size - 1).unwrap();
@@ -741,12 +808,12 @@ mod tests {
 
         let mut expired = invocation_for(CALLER, "expired");
         expired.expires_at_unix_ms = 10;
-        let reply = service.begin(&raw_envelope(&expired), 1_000).unwrap();
+        let reply = service.begin(&raw_envelope(&expired), 1_000, FRAME).unwrap();
         assert_eq!(refusal_of(reply, &expired), Refusal::Expired);
 
         let mut substituted = invocation_for(CALLER, "substituted");
         substituted.provider_request_sha256 = [9; 32];
-        let reply = service.begin(&raw_envelope(&substituted), 1_000).unwrap();
+        let reply = service.begin(&raw_envelope(&substituted), 1_000, FRAME).unwrap();
         assert_eq!(
             refusal_of(reply, &substituted),
             Refusal::ProviderDigestSubstitution
@@ -754,7 +821,7 @@ mod tests {
 
         let mut malformed = invocation_for(CALLER, "malformed");
         malformed.native_request_sha256 = [0; 32];
-        let reply = service.begin(&raw_envelope(&malformed), 1_000).unwrap();
+        let reply = service.begin(&raw_envelope(&malformed), 1_000, FRAME).unwrap();
         assert_eq!(refusal_of(reply, &malformed), Refusal::Malformed);
     }
 
@@ -880,14 +947,46 @@ mod tests {
         let mut service = open_service(&store, 8);
         let ok = invocation_for(CALLER, &at);
         assert!(matches!(
-            service.begin(&raw_envelope(&ok), 1_000).unwrap(),
+            service.begin(&raw_envelope(&ok), 1_000, FRAME).unwrap(),
             TransportAdmission::Execute(_)
         ));
-        let long = invocation_for(CALLER, &over);
-        assert_eq!(
-            service.begin(&raw_envelope(&long), 1_000).err(),
-            Some(ServiceError::Contract(ContractError::Invalid("request_id")))
-        );
+    }
+
+    #[test]
+    fn a_request_id_past_the_bound_is_refused_malformed_in_a_reply_that_fits_the_smallest_frame() {
+        let smallest = frame_bytes_for_payload(4096);
+        for length in [
+            MAX_IDENTITY_BYTES + 1,
+            MAX_IDENTITY_BYTES + 2,
+            5_000,
+            100_000,
+            400_000,
+        ] {
+            let store = TestStore::new();
+            let mut service = open_service(&store, 1);
+            let id = "i".repeat(length);
+            let long = invocation_for(CALLER, &id);
+            let TransportAdmission::Reply(reply) = service
+                .begin(&raw_envelope(&long), 1_000, smallest)
+                .unwrap()
+            else {
+                panic!("an over-long id must be refused, not executed ({length})");
+            };
+            assert!(
+                rmp_serde::to_vec(&reply).unwrap().len() <= smallest,
+                "{length}"
+            );
+            let result: TransportResult =
+                rmp_serde::from_slice(&decrypt_message(&reply, &security(KEY)).unwrap()).unwrap();
+            assert_eq!(
+                result.disposition,
+                TransportDisposition::Refused(Refusal::Malformed)
+            );
+            assert_eq!(result.request_id, reply.request_id);
+            assert_eq!(result.request_id.len(), 64, "the id is named, not echoed");
+            // Nothing was recorded or held: the caller's one slot is free.
+            let (_claim, _) = claim_for(&mut service, "after-the-long-one");
+        }
     }
 
     #[test]
@@ -904,7 +1003,7 @@ mod tests {
         request_id: &str,
     ) -> (Box<ExecutionClaim>, TransportInvocation) {
         let invocation = invocation_for(CALLER, request_id);
-        match service.begin(&raw_envelope(&invocation), 1_000).unwrap() {
+        match service.begin(&raw_envelope(&invocation), 1_000, FRAME).unwrap() {
             TransportAdmission::Execute(claim) => (claim, invocation),
             TransportAdmission::Reply(_) => panic!("expected an execution claim"),
         }
@@ -955,7 +1054,7 @@ mod tests {
 
         // The recorded replay is the stand-in's exact bytes.
         let TransportAdmission::Reply(replay) =
-            service.begin(&raw_envelope(&invocation), 1_000).unwrap()
+            service.begin(&raw_envelope(&invocation), 1_000, FRAME).unwrap()
         else {
             panic!("expected a replay");
         };
@@ -976,6 +1075,94 @@ mod tests {
     }
 
     #[test]
+    fn a_frame_bound_failure_releases_the_callers_slot() {
+        let store = TestStore::new();
+        let mut service = open_service(&store, 1);
+        let (claim, invocation) = claim_for(&mut service, "wedge");
+        let big = text_result(&invocation, "y", "fixture-sse");
+        assert_eq!(
+            service.complete(*claim, big, 10).unwrap_err(),
+            ServiceError::FrameBound
+        );
+        // The caller's only slot is free again, and the dead request is no
+        // longer in flight.
+        let (_next, _) = claim_for(&mut service, "after-wedge");
+        let TransportAdmission::Reply(reply) = service
+            .begin(&raw_envelope(&invocation), 1_000, FRAME)
+            .unwrap()
+        else {
+            panic!("expected a refusal");
+        };
+        assert_eq!(
+            decrypt_result(&reply, &security(KEY), &invocation)
+                .unwrap()
+                .disposition,
+            TransportDisposition::Refused(Refusal::Indeterminate)
+        );
+    }
+
+    #[test]
+    fn a_recorded_result_replayed_after_a_restart_at_a_smaller_frame_is_re_measured() {
+        let store = TestStore::new();
+        let mut service = open_service(&store, 8);
+        let (claim, invocation) = claim_for(&mut service, "restart");
+        let big = text_result(&invocation, &"y".repeat(4000), "fixture-sse");
+        let recorded = service.complete(*claim, big, FRAME).unwrap();
+        assert!(rmp_serde::to_vec(&recorded).unwrap().len() > 2000);
+        drop(service);
+
+        let mut service = open_service(&store, 8);
+        let TransportAdmission::Reply(same) = service
+            .begin(&raw_envelope(&invocation), 1_000, FRAME)
+            .unwrap()
+        else {
+            panic!("expected a replay");
+        };
+        assert_eq!(same, recorded, "a frame that still fits replays the record");
+        drop(service);
+
+        let mut service = open_service(&store, 8);
+        let TransportAdmission::Reply(smaller) = service
+            .begin(&raw_envelope(&invocation), 1_000, 2000)
+            .unwrap()
+        else {
+            panic!("expected a replay");
+        };
+        assert!(rmp_serde::to_vec(&smaller).unwrap().len() <= 2000);
+        assert_eq!(
+            decrypt_result(&smaller, &security(KEY), &invocation).unwrap(),
+            result_size_failure(
+                CALLER,
+                "restart",
+                &invocation.request.model,
+                invocation.native_request_sha256,
+                invocation.provider_request_sha256,
+            )
+        );
+        // The stand-in is what is recorded now, byte for byte, at any frame.
+        let TransportAdmission::Reply(again) = service
+            .begin(&raw_envelope(&invocation), 1_000, FRAME)
+            .unwrap()
+        else {
+            panic!("expected a replay");
+        };
+        assert_eq!(again, smaller);
+    }
+
+    #[test]
+    fn a_replay_whose_stand_in_cannot_fit_either_is_a_frame_bound_failure() {
+        let store = TestStore::new();
+        let mut service = open_service(&store, 8);
+        let (claim, invocation) = claim_for(&mut service, "no-room");
+        let big = text_result(&invocation, "y", "fixture-sse");
+        service.complete(*claim, big, FRAME).unwrap();
+        assert_eq!(
+            service.begin(&raw_envelope(&invocation), 1_000, 10).err(),
+            Some(ServiceError::FrameBound)
+        );
+    }
+
+    #[test]
     fn nothing_is_recorded_when_not_even_the_stand_in_fits() {
         let store = TestStore::new();
         let mut service = open_service(&store, 8);
@@ -985,9 +1172,10 @@ mod tests {
             service.complete(*claim, big, 10).unwrap_err(),
             ServiceError::FrameBound
         );
-        // Still active, never completed: the retry is told it is in flight.
+        // Still active, never completed, and no longer live: the retry is told the
+        // outcome is indeterminate.
         let TransportAdmission::Reply(reply) =
-            service.begin(&raw_envelope(&invocation), 1_000).unwrap()
+            service.begin(&raw_envelope(&invocation), 1_000, FRAME).unwrap()
         else {
             panic!("expected a refusal");
         };
@@ -995,7 +1183,7 @@ mod tests {
             decrypt_result(&reply, &security(KEY), &invocation)
                 .unwrap()
                 .disposition,
-            TransportDisposition::Refused(Refusal::InFlight)
+            TransportDisposition::Refused(Refusal::Indeterminate)
         );
     }
 }

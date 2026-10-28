@@ -28,17 +28,18 @@ pub struct TransportEnvelope {
 }
 
 /// The longest caller id, request id or model name a service admits. The
-/// frame arithmetic below depends on it, so a longer one is refused up front.
-#[cfg(feature = "daemon")]
-pub(crate) const MAX_IDENTITY_BYTES: usize = 256;
+/// frame arithmetic below depends on it. A request whose id is longer is
+/// refused on the wire as malformed.
+pub const MAX_IDENTITY_BYTES: usize = 256;
 
 /// The most bytes a serialized envelope holding `ciphertext_len` ciphertext
-/// bytes can occupy. The v2 wire serializes the ciphertext as a MessagePack
-/// array of integers: a byte of 128 or more takes two bytes, so the worst case
-/// is twice the ciphertext, plus the array header and the envelope's other
+/// bytes can occupy, with ids at their longest: the frame a caller payload
+/// bound (`CallerAdmission`'s `max_payload_bytes`, a bound on ciphertext
+/// length) needs. The v2 wire serializes the ciphertext as a MessagePack array
+/// of integers: a byte of 128 or more takes two bytes, so the worst case is
+/// twice the ciphertext, plus the array header and the envelope's other
 /// fields at their longest. Measured from the real encoding, not assumed.
-#[cfg(feature = "daemon")]
-pub(crate) fn worst_frame_bytes(ciphertext_len: usize) -> usize {
+pub fn frame_bytes_for_payload(ciphertext_len: usize) -> usize {
     let shell = rmp_serde::to_vec(&TransportEnvelope {
         schema_id: ENVELOPE_SCHEMA_ID.to_string(),
         caller_runtime_id: "x".repeat(MAX_IDENTITY_BYTES),
@@ -58,6 +59,26 @@ pub(crate) fn worst_frame_bytes(ciphertext_len: usize) -> usize {
         .saturating_sub(1)
         .saturating_add(header)
         .saturating_add(ciphertext_len.saturating_mul(2))
+}
+
+/// The largest payload bound whose worst-case frame fits `max_frame_bytes`:
+/// the inverse of [`frame_bytes_for_payload`]. `None` when the frame cannot
+/// carry even an empty envelope.
+pub fn payload_bytes_for_frame(max_frame_bytes: usize) -> Option<usize> {
+    if frame_bytes_for_payload(0) > max_frame_bytes {
+        return None;
+    }
+    // frame_bytes_for_payload is increasing; the answer is at most half the frame.
+    let (mut low, mut high) = (0, max_frame_bytes / 2);
+    while low < high {
+        let mid = low + (high - low).div_ceil(2);
+        if frame_bytes_for_payload(mid) <= max_frame_bytes {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+    Some(low)
 }
 
 pub fn encrypt_invocation(
@@ -431,7 +452,6 @@ mod tests {
         assert!(matches!(write(&[], 1_000), Err(TransportFrameError::Size)));
     }
 
-    #[cfg(feature = "daemon")]
     #[test]
     fn the_worst_frame_is_the_real_encoding_of_an_all_high_ciphertext() {
         let long = "x".repeat(MAX_IDENTITY_BYTES);
@@ -446,13 +466,12 @@ mod tests {
             };
             assert_eq!(
                 rmp_serde::to_vec(&envelope).unwrap().len(),
-                worst_frame_bytes(length),
+                frame_bytes_for_payload(length),
                 "{length}"
             );
         }
     }
 
-    #[cfg(feature = "daemon")]
     #[test]
     fn a_sealed_envelope_never_exceeds_the_worst_frame_for_its_ciphertext() {
         let key = security("epiphany-distinct-test-key");
@@ -462,7 +481,7 @@ mod tests {
                     encrypt_message(&id, &id, EnvelopeKind::Result, &vec![0x41; plaintext], &key)
                         .unwrap();
                 let real = rmp_serde::to_vec(&sealed).unwrap().len();
-                let worst = worst_frame_bytes(sealed.ciphertext.len());
+                let worst = frame_bytes_for_payload(sealed.ciphertext.len());
                 assert!(real <= worst, "{real} > {worst}");
                 // Real ciphertext is random, so about half its bytes take two
                 // bytes: the worst case is not wildly above what is written.
@@ -473,6 +492,17 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn the_payload_bound_a_frame_allows_inverts_the_frame_a_payload_needs() {
+        assert_eq!(payload_bytes_for_frame(frame_bytes_for_payload(0) - 1), None);
+        assert_eq!(payload_bytes_for_frame(frame_bytes_for_payload(0)), Some(0));
+        for bytes in [1, 15, 16, 4096, 65_535, 65_536, 100_000, 2_000_000] {
+            let frame = frame_bytes_for_payload(bytes);
+            assert_eq!(payload_bytes_for_frame(frame), Some(bytes), "{bytes}");
+            assert!(payload_bytes_for_frame(frame - 1).unwrap() < bytes, "{bytes}");
         }
     }
 }
