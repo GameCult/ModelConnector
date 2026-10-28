@@ -6,8 +6,8 @@ use zeroize::Zeroizing;
 
 use crate::contract::{TransportInvocation, TransportKey, TransportResult};
 use crate::envelope::{
-    ServiceError, TransportFrameError, decrypt_result, encrypt_invocation, read_transport_frame,
-    write_transport_frame,
+    MAX_IDENTITY_BYTES, ServiceError, TransportFrameError, decrypt_result, encrypt_invocation,
+    read_transport_frame, write_transport_frame,
 };
 
 #[derive(Clone)]
@@ -48,6 +48,9 @@ impl ConnectorClient {
         &self,
         invocation: &TransportInvocation,
     ) -> Result<TransportResult, ConnectorClientError> {
+        if invocation.request_id().len() > MAX_IDENTITY_BYTES {
+            return Err(ConnectorClientError::RequestIdTooLong);
+        }
         let request = rmp_serde::to_vec(&encrypt_invocation(invocation, &self.security)?)
             .map_err(|_| ConnectorClientError::Encoding)?;
         let connect_timeout = self
@@ -119,6 +122,8 @@ pub enum ConnectorClientError {
     FrameSize,
     #[error("connector MessagePack encoding failed")]
     Encoding,
+    #[error("request id is longer than the connector identity bound")]
+    RequestIdTooLong,
     #[error(transparent)]
     Transport(#[from] ServiceError),
 }
@@ -173,5 +178,29 @@ mod fixture_tests {
             TransportDisposition::Refused(Refusal::Policy)
         );
         server.join().unwrap();
+    }
+
+    #[test]
+    fn an_over_long_request_id_is_refused_locally_before_any_byte_is_sent() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let client = ConnectorClient::new(
+            listener.local_addr().unwrap(),
+            "epiphany-distinct-test-key",
+            64 * 1024,
+            Some(Duration::from_secs(1)),
+        )
+        .unwrap();
+        let mut long = invocation();
+        long.request.request_id = "r".repeat(MAX_IDENTITY_BYTES + 1);
+        assert!(matches!(
+            client.execute(&long),
+            Err(ConnectorClientError::RequestIdTooLong)
+        ));
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "the client must not even connect"
+        );
     }
 }

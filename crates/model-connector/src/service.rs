@@ -199,8 +199,9 @@ impl TransportService {
     /// fit, the same bound `complete` is given: a recorded result that no
     /// longer fits it (the service reopened at a smaller frame) is answered
     /// with the typed `result_size` failure, which is recorded in its place.
-    /// A request id longer than `MAX_IDENTITY_BYTES` is refused as malformed;
-    /// the refusal names the id by its digest so it fits any legal frame.
+    /// A request id longer than `MAX_IDENTITY_BYTES` is refused as malformed,
+    /// the refusal echoing the id like every other. The connection is dropped
+    /// (`FrameBound`) only when that sealed refusal does not fit `max_frame_bytes`.
     pub fn begin(
         &mut self,
         envelope: &TransportEnvelope,
@@ -216,10 +217,15 @@ impl TransportService {
         let max_concurrent_requests = caller.max_concurrent_requests;
         let invocation = decrypt_invocation(envelope, &security)?;
         if envelope.request_id.len() > MAX_IDENTITY_BYTES {
-            return Ok(TransportAdmission::Reply(encrypt_result(
-                &unnamed_refusal(&invocation, Refusal::Malformed),
+            let refusal = encrypt_result(
+                &TransportResult::refused(&invocation, Refusal::Malformed),
                 &security,
-            )?));
+            )?;
+            return if fits_frame(&refusal, max_frame_bytes)? {
+                Ok(TransportAdmission::Reply(refusal))
+            } else {
+                Err(ServiceError::FrameBound)
+            };
         }
         if envelope.ciphertext.len() > caller.max_payload_bytes {
             return self.reply_refusal(&invocation, Refusal::Policy, &security);
@@ -475,16 +481,6 @@ fn hex(digest: [u8; 32]) -> String {
         text.push(HEX[(byte & 0x0f) as usize] as char);
     }
     text
-}
-
-/// A refusal for an invocation whose request id is too long to echo: it names
-/// the request by the hex SHA-256 of the id (64 bytes), so the reply fits the
-/// smallest legal frame whatever the id's length.
-fn unnamed_refusal(invocation: &TransportInvocation, reason: Refusal) -> TransportResult {
-    TransportResult {
-        request_id: hex(Sha256::digest(invocation.request_id().as_bytes()).into()),
-        ..TransportResult::refused(invocation, reason)
-    }
 }
 
 fn replay_store_error(error: impl std::fmt::Display) -> ServiceError {
@@ -989,40 +985,64 @@ mod tests {
     }
 
     #[test]
-    fn a_request_id_past_the_bound_is_refused_malformed_in_a_reply_that_fits_the_smallest_frame() {
-        let smallest = frame_bytes_for_payload(4096);
+    fn a_request_id_past_the_bound_is_refused_malformed_echoing_the_id() {
         for length in [
             MAX_IDENTITY_BYTES + 1,
             MAX_IDENTITY_BYTES + 2,
             5_000,
             100_000,
-            400_000,
         ] {
             let store = TestStore::new();
             let mut service = open_service(&store, 1);
             let id = "i".repeat(length);
             let long = invocation_for(CALLER, &id);
-            let TransportAdmission::Reply(reply) = service
-                .begin(&raw_envelope(&long), 1_000, smallest)
-                .unwrap()
+            let TransportAdmission::Reply(reply) =
+                service.begin(&raw_envelope(&long), 1_000, FRAME).unwrap()
             else {
                 panic!("an over-long id must be refused, not executed ({length})");
             };
-            assert!(
-                rmp_serde::to_vec(&reply).unwrap().len() <= smallest,
-                "{length}"
-            );
+            assert_eq!(reply.request_id, id, "{length}");
             let result: TransportResult =
                 rmp_serde::from_slice(&decrypt_message(&reply, &security(KEY)).unwrap()).unwrap();
             assert_eq!(
                 result.disposition,
                 TransportDisposition::Refused(Refusal::Malformed)
             );
-            assert_eq!(result.request_id, reply.request_id);
-            assert_eq!(result.request_id.len(), 64, "the id is named, not echoed");
+            assert_eq!(result.request_id, id);
+            result.validate_against(&long).unwrap();
             // Nothing was recorded or held: the caller's one slot is free.
             let (_claim, _) = claim_for(&mut service, "after-the-long-one");
         }
+    }
+
+    #[test]
+    fn an_over_long_id_drops_the_connection_only_when_its_refusal_cannot_fit() {
+        let id = "i".repeat(5_000);
+        let long = invocation_for(CALLER, &id);
+        let sealed = encrypt_result(
+            &TransportResult::refused(&long, Refusal::Malformed),
+            &security(KEY),
+        )
+        .unwrap();
+        // The sealed size varies with the random nonce and ciphertext bytes
+        // (a byte of 128 or more takes two), so bracket it: the ciphertext
+        // plus the id is a floor, twice the ciphertext plus the id and the
+        // envelope's other fields is a ceiling.
+        let floor = sealed.ciphertext.len() + id.len();
+        let ceiling = 2 * sealed.ciphertext.len() + id.len() + 512;
+        let store = TestStore::new();
+        let mut service = open_service(&store, 1);
+        assert!(matches!(
+            service.begin(&raw_envelope(&long), 1_000, ceiling).unwrap(),
+            TransportAdmission::Reply(_)
+        ));
+        assert_eq!(
+            service
+                .begin(&raw_envelope(&long), 1_000, floor - 1)
+                .unwrap_err(),
+            ServiceError::FrameBound
+        );
+        let (_claim, _) = claim_for(&mut service, "after-the-drop");
     }
 
     #[test]

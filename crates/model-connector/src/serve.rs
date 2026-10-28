@@ -521,40 +521,39 @@ mod tests {
     }
 
     #[test]
-    fn serve_refuses_a_long_request_id_on_the_wire_without_dropping_the_connection() {
+    fn serve_refuses_a_long_request_id_on_the_wire_echoing_the_id_without_dropping_the_connection()
+    {
         let store = TestStore::new();
         let backend = CountingBackend::new(true);
         let (_client, endpoint) = start(backend.clone(), &store);
         let security = crate::fixtures::security(KEY);
+        // Read the way ConnectorClient reads a reply: decrypt_result, which
+        // requires the result to name the request by its own id.
         let send = |id: &str| {
+            let invocation = fresh(id);
             let request = rmp_serde::to_vec(
-                &crate::envelope::encrypt_invocation(&fresh(id), &security).unwrap(),
+                &crate::envelope::encrypt_invocation(&invocation, &security).unwrap(),
             )
             .unwrap();
             let mut stream = TcpStream::connect(endpoint).unwrap();
             write_transport_frame(&mut stream, &request, FRAME).unwrap();
             let reply = read_transport_frame(&mut stream, FRAME).unwrap();
             let envelope: TransportEnvelope = rmp_serde::from_slice(&reply).unwrap();
-            let result: TransportResult = rmp_serde::from_slice(
-                &crate::envelope::decrypt_message(&envelope, &security).unwrap(),
-            )
-            .unwrap();
-            (reply.len(), result)
+            crate::envelope::decrypt_result(&envelope, &security, &invocation).unwrap()
         };
-        let (_, served) = send(&"i".repeat(crate::envelope::MAX_IDENTITY_BYTES));
+        let served = send(&"i".repeat(crate::envelope::MAX_IDENTITY_BYTES));
         assert!(matches!(
             served.disposition,
             TransportDisposition::Transported { .. }
         ));
         assert_eq!(backend.executions.load(Ordering::SeqCst), 1);
         for length in [257, 258, 5_000, 60_000] {
-            let (size, result) = send(&"i".repeat(length));
+            let result = send(&"i".repeat(length));
             assert_eq!(
                 result.disposition,
                 TransportDisposition::Refused(Refusal::Malformed),
                 "{length}"
             );
-            assert!(size <= smallest_frame(), "{length}: {size}");
         }
         assert_eq!(backend.executions.load(Ordering::SeqCst), 1);
     }
