@@ -52,14 +52,6 @@ impl ServeLimits {
     /// An admitted payload therefore always fits, and `complete` is given the
     /// same frame bound to fit every result in.
     fn validate(&self, admissions: &[CallerAdmission]) -> Result<(), ServeError> {
-        let smallest = frame_bytes_for_payload(MIN_PAYLOAD_BYTES);
-        if self.max_frame_bytes > 0 && self.max_frame_bytes < smallest {
-            return Err(ServeError::FrameBound {
-                max_frame_bytes: self.max_frame_bytes,
-                payload_bytes: MIN_PAYLOAD_BYTES,
-                needed_frame_bytes: smallest,
-            });
-        }
         if self.max_frame_bytes == 0
             || self.max_frame_bytes > u32::MAX as usize
             || self.max_connections == 0
@@ -67,6 +59,14 @@ impl ServeLimits {
             || self.max_expiry_skew_ms == 0
         {
             return Err(ServeError::InvalidConfig("serve limits"));
+        }
+        let smallest = frame_bytes_for_payload(MIN_PAYLOAD_BYTES);
+        if self.max_frame_bytes < smallest {
+            return Err(ServeError::FrameBound {
+                max_frame_bytes: self.max_frame_bytes,
+                payload_bytes: MIN_PAYLOAD_BYTES,
+                needed_frame_bytes: smallest,
+            });
         }
         if admissions.is_empty() {
             return Err(ServeError::InvalidConfig("callers"));

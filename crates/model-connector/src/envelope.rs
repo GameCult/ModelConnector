@@ -65,20 +65,20 @@ pub fn frame_bytes_for_payload(ciphertext_len: usize) -> usize {
 /// the inverse of [`frame_bytes_for_payload`]. `None` when the frame cannot
 /// carry even an empty envelope.
 pub fn payload_bytes_for_frame(max_frame_bytes: usize) -> Option<usize> {
-    if frame_bytes_for_payload(0) > max_frame_bytes {
-        return None;
-    }
-    // frame_bytes_for_payload is increasing; the answer is at most half the frame.
-    let (mut low, mut high) = (0, max_frame_bytes / 2);
-    while low < high {
-        let mid = low + (high - low).div_ceil(2);
-        if frame_bytes_for_payload(mid) <= max_frame_bytes {
-            low = mid;
-        } else {
-            high = mid - 1;
-        }
-    }
-    Some(low)
+    // frame_bytes_for_payload(0) is the shell plus a one-byte array header.
+    let fixed = frame_bytes_for_payload(0) - 1;
+    let room = max_frame_bytes.checked_sub(fixed)?;
+    // Each array header width bounds the payloads it can describe; the
+    // widest payload any width admits is the answer.
+    let by_header = |header: usize, cap: usize| room.checked_sub(header).map(|r| (r / 2).min(cap));
+    [
+        by_header(5, usize::MAX),
+        by_header(3, 65_535),
+        by_header(1, 15),
+    ]
+    .into_iter()
+    .flatten()
+    .max()
 }
 
 pub fn encrypt_invocation(
