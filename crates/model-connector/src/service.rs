@@ -988,19 +988,6 @@ impl TransportService {
             && receipt.overrun_micro_usd == claim.call.overrun_of(receipt.cost_micro_usd)
     }
 
-    /// Where `caller_runtime_id`'s newest admission window starts, in unix
-    /// milliseconds, or `None` when the caller has none: the instant the host
-    /// clock must reach before a `ClockBehindAdmissionWindow` refusal can end.
-    pub fn admission_window_start_unix_ms(&self, caller_runtime_id: &str) -> Option<u64> {
-        let spend_window_ms = self.callers.get(caller_runtime_id)?.spend_window_ms;
-        let newest = self
-            .window_spend
-            .get(caller_runtime_id)?
-            .keys()
-            .next_back()?;
-        Some(newest.saturating_mul(spend_window_ms))
-    }
-
     fn reply_refusal(
         &self,
         invocation: &TransportInvocation,
@@ -3593,9 +3580,7 @@ mod tests {
         let ceiling = reservation() + 2 * FIXTURE_USAGE_COST;
         let store = TestStore::new();
         let mut service = open_limited(&store, ceiling, window);
-        assert_eq!(service.admission_window_start_unix_ms(CALLER), None);
         assert_eq!(run_window(&mut service, "fill", 50_000), 3);
-        assert_eq!(service.admission_window_start_unix_ms(CALLER), Some(50_000));
         // Behind the full window: the cause is named, no slot is taken and
         // nothing is reserved.
         assert_eq!(
