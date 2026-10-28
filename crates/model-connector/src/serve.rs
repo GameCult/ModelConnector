@@ -10,12 +10,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use zeroize::Zeroizing;
 
-use crate::contract::{
-    RECEIPT_SCHEMA_ID, TransportDisposition, TransportInvocation, TransportOutcome,
-    TransportReceipt, TransportResult,
-};
+use crate::contract::{TransportInvocation, TransportResult};
 use crate::envelope::{
-    ServiceError, TransportEnvelope, TransportFrameError, read_transport_frame,
+    ServiceError, TransportEnvelope, TransportFrameError, read_transport_frame, worst_frame_bytes,
     write_transport_frame,
 };
 use crate::service::{CallerAdmission, TransportAdmission, TransportService};
@@ -42,17 +39,19 @@ pub struct ServeLimits {
     pub max_expiry_skew_ms: u64,
 }
 
-/// What a frame carries besides the caller's payload: the envelope fields and
-/// the headroom a result needs. The base daemon's budget, unchanged.
-const FRAME_OVERHEAD_BUDGET: usize = 4096;
+/// The smallest caller payload bound the base daemon admitted.
+const MIN_PAYLOAD_BYTES: usize = 4096;
 
 impl ServeLimits {
     /// The bounds serve refuses before it opens anything: each limit nonzero,
-    /// a frame that can carry a minimum payload plus its overhead, enough
-    /// connections for every caller's request slots, and every caller's payload
-    /// bound between the minimum and what a frame can carry.
+    /// a frame that carries the smallest payload (which also carries the failure
+    /// that stands in for an oversize result), enough connections for every caller's request
+    /// slots, and every caller's payload bound between the minimum and the
+    /// largest whose sealed frame, at its worst-case encoding, fits the frame.
+    /// An admitted payload therefore always fits, and `complete` is given the
+    /// same frame bound to fit every result in.
     fn validate(&self, admissions: &[CallerAdmission]) -> Result<(), ServeError> {
-        if self.max_frame_bytes < FRAME_OVERHEAD_BUDGET * 2
+        if self.max_frame_bytes < worst_frame_bytes(MIN_PAYLOAD_BYTES)
             || self.max_frame_bytes > u32::MAX as usize
             || self.max_connections == 0
             || self.socket_timeout_ms == 0
@@ -73,17 +72,12 @@ impl ServeLimits {
             return Err(ServeError::InvalidConfig("connection capacity"));
         }
         if admissions.iter().any(|caller| {
-            caller.max_payload_bytes() < FRAME_OVERHEAD_BUDGET
-                || caller.max_payload_bytes() > self.max_frame_bytes - FRAME_OVERHEAD_BUDGET
+            caller.max_payload_bytes() < MIN_PAYLOAD_BYTES
+                || worst_frame_bytes(caller.max_payload_bytes()) > self.max_frame_bytes
         }) {
             return Err(ServeError::InvalidConfig("caller admission"));
         }
         Ok(())
-    }
-
-    /// The largest encoded result a frame can carry once its envelope is added.
-    fn max_result_bytes(&self) -> usize {
-        self.max_frame_bytes - FRAME_OVERHEAD_BUDGET
     }
 }
 
@@ -221,52 +215,14 @@ fn execute_inference_frame(
     let response = match admission {
         TransportAdmission::Reply(response) => response,
         TransportAdmission::Execute(claim) => {
-            let result = bound_result(
-                claim.invocation(),
-                backend.execute(claim.invocation()),
-                limits.max_result_bytes(),
-            );
+            let result = backend.execute(claim.invocation());
             service
                 .lock()
                 .map_err(|_| ServeError::ServicePoisoned)?
-                .complete(*claim, result)?
+                .complete(*claim, result, limits.max_frame_bytes)?
         }
     };
     rmp_serde::to_vec(&response).map_err(|_| ServeError::FrameEncoding)
-}
-
-/// A result the frame cannot carry is never recorded: it becomes a failed
-/// receipt in the same shape, so the caller is told and a retry replays bytes
-/// that can be delivered.
-fn bound_result(
-    invocation: &TransportInvocation,
-    result: TransportResult,
-    max_result_bytes: usize,
-) -> TransportResult {
-    if rmp_serde::to_vec(&result).is_ok_and(|bytes| bytes.len() <= max_result_bytes) {
-        return result;
-    }
-    let transport = match &result.disposition {
-        TransportDisposition::Transported { receipt, .. } => receipt.transport.clone(),
-        TransportDisposition::Refused(_) => "model-connector".to_string(),
-    };
-    TransportResult::transported(
-        invocation,
-        Vec::new(),
-        TransportReceipt {
-            schema_id: RECEIPT_SCHEMA_ID.to_string(),
-            request_id: invocation.request_id().to_string(),
-            caller_runtime_id: invocation.caller_runtime_id.clone(),
-            native_request_sha256: invocation.native_request_sha256,
-            provider_request_sha256: invocation.provider_request_sha256,
-            model: invocation.request.model.clone(),
-            transport,
-            outcome: TransportOutcome::Failed {
-                failure_kind: "result_size".to_string(),
-                message: "provider result exceeded its byte bound".to_string(),
-            },
-        },
-    )
 }
 
 fn frame_error(error: TransportFrameError) -> ServeError {
@@ -355,7 +311,9 @@ mod tests {
 
     const CALLER: &str = "epiphany-yggdrasil";
     const KEY: &str = "epiphany-distinct-test-key";
-    const FRAME: usize = 128 * 1024;
+    const FRAME: usize = 256 * 1024;
+    /// AES-256-GCM appends a 16-byte tag to the ciphertext.
+    const GCM_TAG: usize = 16;
 
     struct CountingBackend {
         ready: bool,
@@ -586,12 +544,30 @@ mod tests {
         assert_eq!(backend.ready_calls.load(Ordering::SeqCst), 0);
     }
 
+    /// The smallest frame serve admits: the smallest payload at its worst-case
+    /// sealed encoding.
+    fn smallest_frame() -> usize {
+        worst_frame_bytes(MIN_PAYLOAD_BYTES)
+    }
+
+    #[test]
+    fn the_smallest_frame_also_carries_the_failure_that_stands_in_for_a_result() {
+        let long = "x".repeat(crate::envelope::MAX_IDENTITY_BYTES);
+        let plaintext = rmp_serde::to_vec(&crate::service::result_size_failure(
+            &long, &long, &long, [0xff; 32], [0xff; 32],
+        ))
+        .unwrap()
+        .len();
+        let worst = worst_frame_bytes(plaintext + GCM_TAG);
+        assert!(worst <= smallest_frame(), "{worst} > {}", smallest_frame());
+    }
+
     #[test]
     fn serve_refuses_unbounded_limits_and_admits_the_widest_frame() {
         let store = TestStore::new();
         let mutations: [fn(&mut ServeLimits); 6] = [
             |limits| limits.max_frame_bytes = 0,
-            |limits| limits.max_frame_bytes = 8191,
+            |limits| limits.max_frame_bytes = smallest_frame() - 1,
             |limits| limits.max_frame_bytes = u32::MAX as usize + 1,
             |limits| limits.max_connections = 0,
             |limits| limits.socket_timeout_ms = 0,
@@ -720,27 +696,70 @@ mod tests {
             ..limits()
         };
         let payload = |bytes| vec![admission("a", "key-a-distinct", 4, bytes)];
-        assert_eq!(refusal(frame(8191), payload(4096)), Some("serve limits"));
-        // The tightest legal pair: a 4096-byte payload in an 8192-byte frame.
-        assert_eq!(refusal(frame(8192), payload(4096)), None);
+        let tightest = smallest_frame();
         assert_eq!(
-            refusal(frame(8192), payload(4097)),
+            refusal(frame(tightest - 1), payload(4096)),
+            Some("serve limits")
+        );
+        // The tightest legal pair: the smallest payload in the smallest frame.
+        assert_eq!(refusal(frame(tightest), payload(4096)), None);
+        assert_eq!(
+            refusal(frame(tightest), payload(4097)),
             Some("caller admission")
         );
-        assert_eq!(refusal(frame(12288), payload(8192)), None);
         assert_eq!(
-            refusal(frame(12288), payload(8193)),
+            refusal(frame(tightest), payload(4095)),
             Some("caller admission")
         );
+        // The bound is the sealed frame at its worst encoding, not the payload:
+        // a payload that is the whole frame cannot be carried.
         assert_eq!(
-            refusal(frame(FRAME), payload(4095)),
+            refusal(frame(FRAME), payload(FRAME)),
             Some("caller admission")
         );
+        for bytes in [8192, 65_535, 65_536, 100_000] {
+            let widest = worst_frame_bytes(bytes);
+            assert_eq!(refusal(frame(widest), payload(bytes)), None, "{bytes}");
+            assert_eq!(
+                refusal(frame(widest - 1), payload(bytes)),
+                Some("caller admission"),
+                "{bytes}"
+            );
+        }
         let mixed = vec![
             admission("a", "key-a-distinct", 4, 8192),
             admission("b", "key-b-distinct", 4, FRAME),
         ];
         assert_eq!(refusal(frame(FRAME), mixed), Some("caller admission"));
+    }
+
+    #[test]
+    fn a_payload_at_the_widest_bound_its_frame_admits_is_carried_and_served() {
+        let store = TestStore::new();
+        let backend = CountingBackend::new(true);
+        let invocation = fresh(&"q".repeat(256));
+        let key = crate::fixtures::security(KEY);
+        let sealed = crate::envelope::encrypt_invocation(&invocation, &key).unwrap();
+        let bound = sealed.ciphertext.len();
+        let frame = worst_frame_bytes(bound);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = listener.local_addr().unwrap();
+        let path = store.path.clone();
+        let served = backend.clone();
+        let tight = ServeLimits {
+            max_frame_bytes: frame,
+            ..limits()
+        };
+        let admissions = vec![admission(CALLER, KEY, 4, bound)];
+        thread::spawn(move || serve(listener, tight, admissions, &path, served));
+        let client =
+            ConnectorClient::new(endpoint, KEY, frame, Some(Duration::from_secs(5))).unwrap();
+        let reply = client.execute(&invocation).unwrap();
+        assert!(matches!(
+            reply.disposition,
+            TransportDisposition::Transported { .. }
+        ));
+        assert_eq!(backend.executions.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -764,91 +783,177 @@ mod tests {
         assert_eq!(backend.executions.load(Ordering::SeqCst), 0);
     }
 
-    struct OversizeBackend {
+    /// Answers every invocation with one text event of a chosen size.
+    struct SizedBackend {
+        text_len: usize,
+        transport: String,
         executions: AtomicUsize,
     }
 
-    impl ProviderBackend for OversizeBackend {
+    impl SizedBackend {
+        fn new(text_len: usize) -> Arc<Self> {
+            Self::with_transport(text_len, "fixture-sse".to_string())
+        }
+
+        fn with_transport(text_len: usize, transport: String) -> Arc<Self> {
+            Arc::new(Self {
+                text_len,
+                transport,
+                executions: AtomicUsize::new(0),
+            })
+        }
+    }
+
+    impl ProviderBackend for SizedBackend {
         fn ready(&self) -> bool {
             true
         }
 
         fn execute(&self, invocation: &TransportInvocation) -> TransportResult {
             self.executions.fetch_add(1, Ordering::SeqCst);
-            TransportResult::transported(
-                invocation,
-                vec![TransportEvent {
-                    sequence: 0,
-                    payload: TransportEventPayload::TextDelta {
-                        text: "y".repeat(FRAME),
-                    },
-                }],
-                receipt(invocation),
-            )
+            sized_result(invocation, self.text_len, &self.transport)
+        }
+    }
+
+    fn sized_result(
+        invocation: &TransportInvocation,
+        text_len: usize,
+        transport: &str,
+    ) -> TransportResult {
+        let mut receipt = receipt(invocation);
+        receipt.transport = transport.to_string();
+        TransportResult::transported(
+            invocation,
+            vec![TransportEvent {
+                sequence: 0,
+                payload: TransportEventPayload::TextDelta {
+                    text: "y".repeat(text_len),
+                },
+            }],
+            receipt,
+        )
+    }
+
+    fn encoded_len(result: &TransportResult) -> usize {
+        rmp_serde::to_vec(result).unwrap().len()
+    }
+
+    /// Two calls with one request id, through a live serve loop.
+    fn call_twice(
+        backend: Arc<SizedBackend>,
+        request_id: &str,
+    ) -> (TransportResult, TransportResult, usize) {
+        let store = TestStore::new();
+        let (client, _) = start_with(backend.clone(), &store, vec![caller(CALLER, KEY, 4)]);
+        let invocation = fresh(request_id);
+        let first = client.execute(&invocation).expect("first call delivered");
+        let second = client.execute(&invocation).expect("retry delivered");
+        (first, second, backend.executions.load(Ordering::SeqCst))
+    }
+
+    fn failed_result_size(result: &TransportResult) -> bool {
+        matches!(
+            &result.disposition,
+            TransportDisposition::Transported { events, receipt }
+                if events.is_empty()
+                    && receipt.transport == "model-connector"
+                    && receipt.outcome == TransportOutcome::Failed {
+                        failure_kind: "result_size".to_string(),
+                        message: "provider result exceeded its byte bound".to_string(),
+                    }
+        )
+    }
+
+    fn id_cases() -> [String; 2] {
+        ["request-short".to_string(), "r".repeat(256)]
+    }
+
+    /// The encoded size of a result carrying no text, for this request id.
+    fn empty_result_len(request_id: &str) -> usize {
+        encoded_len(&sized_result(&fresh(request_id), 0, "fixture-sse"))
+    }
+
+    #[test]
+    fn a_result_whose_plaintext_fits_but_whose_sealed_frame_does_not_fails_typed_and_replays() {
+        // A plaintext within the frame less its overhead seals to about one and
+        // a half times its size, so it cannot be carried; measuring the
+        // plaintext would record it as completed and every retry would die.
+        for request_id in id_cases() {
+            let base = empty_result_len(&request_id);
+            let room = FRAME - 4096;
+            for plaintext in [room, room - 1, FRAME * 3 / 4] {
+                let backend = SizedBackend::new(plaintext - base);
+                let (first, second, executions) = call_twice(backend, &request_id);
+                assert!(
+                    failed_result_size(&first),
+                    "{} {plaintext}",
+                    request_id.len()
+                );
+                assert_eq!(first, second, "the retry replays the deliverable failure");
+                assert_eq!(executions, 1);
+            }
         }
     }
 
     #[test]
     fn a_result_larger_than_the_frame_fails_typed_and_is_never_replayed_as_completed() {
-        let store = TestStore::new();
-        let backend = Arc::new(OversizeBackend {
-            executions: AtomicUsize::new(0),
-        });
-        let (client, _) = start_with(backend.clone(), &store, vec![caller(CALLER, KEY, 4)]);
-        let invocation = fresh("request-oversize");
-        let first = client.execute(&invocation).unwrap();
-        let second = client.execute(&invocation).unwrap();
-        let TransportDisposition::Transported { events, receipt } = &first.disposition else {
-            panic!("expected a transported failure");
-        };
-        assert!(events.is_empty());
-        assert_eq!(
-            receipt.outcome,
-            TransportOutcome::Failed {
-                failure_kind: "result_size".to_string(),
-                message: "provider result exceeded its byte bound".to_string(),
-            }
-        );
-        assert_eq!(receipt.transport, "fixture-sse");
-        assert_eq!(first, second, "the retry replays the deliverable failure");
-        assert_eq!(backend.executions.load(Ordering::SeqCst), 1);
+        let (first, second, executions) = call_twice(SizedBackend::new(FRAME), "request-oversize");
+        assert!(failed_result_size(&first));
+        assert_eq!(first, second);
+        assert_eq!(executions, 1);
     }
 
     #[test]
-    fn a_result_is_bounded_by_the_frame_less_its_overhead_inclusively() {
-        let invocation = fresh("request-bound");
-        let result_with = |text_len: usize| {
-            TransportResult::transported(
-                &invocation,
-                vec![TransportEvent {
-                    sequence: 0,
-                    payload: TransportEventPayload::TextDelta {
-                        text: "z".repeat(text_len),
-                    },
-                }],
-                receipt(&invocation),
-            )
-        };
-        let bounded = ServeLimits {
-            max_frame_bytes: 20_000,
-            ..limits()
-        };
-        let max = bounded.max_result_bytes();
-        assert_eq!(max, 20_000 - 4096);
-        // MessagePack headers are the same width across this range, so one probe fixes the size.
-        let probe = rmp_serde::to_vec(&result_with(10_000)).unwrap().len();
-        let exact = 10_000 + max - probe;
-        assert_eq!(rmp_serde::to_vec(&result_with(exact)).unwrap().len(), max);
-        assert_eq!(
-            bound_result(&invocation, result_with(exact), max),
-            result_with(exact)
+    fn a_stand_in_failure_never_carries_the_backends_transport() {
+        let (first, second, executions) = call_twice(
+            SizedBackend::with_transport(FRAME, "t".repeat(FRAME)),
+            "request-transport",
         );
-        let over = bound_result(&invocation, result_with(exact + 1), max);
-        let TransportDisposition::Transported { receipt, .. } = &over.disposition else {
-            panic!("expected a transported failure");
-        };
-        assert!(matches!(receipt.outcome, TransportOutcome::Failed { .. }));
-        over.validate_against(&invocation).unwrap();
+        assert!(failed_result_size(&first));
+        assert_eq!(first, second);
+        assert_eq!(executions, 1);
+    }
+
+    #[test]
+    fn a_result_within_what_the_worst_encoding_leaves_is_delivered_intact() {
+        // The largest plaintext whose sealed frame fits at the worst encoding is
+        // always carried, whatever the ciphertext bytes turn out to be.
+        for request_id in id_cases() {
+            let base = empty_result_len(&request_id);
+            let mut plaintext = base;
+            while worst_frame_bytes(plaintext + 1 + GCM_TAG) <= FRAME {
+                plaintext += 1;
+            }
+            let (first, second, _) = call_twice(SizedBackend::new(plaintext - base), &request_id);
+            let TransportDisposition::Transported { events, receipt } = &first.disposition else {
+                panic!("expected a transported result");
+            };
+            assert_eq!(events.len(), 1, "{}", request_id.len());
+            assert!(matches!(
+                receipt.outcome,
+                TransportOutcome::Completed { .. }
+            ));
+            assert_eq!(first, second);
+        }
+    }
+
+    #[test]
+    fn a_result_just_over_the_worst_encoding_is_delivered_whatever_the_nonce_makes_of_it() {
+        // Past the guaranteed size the sealed frame may or may not fit; either
+        // way the caller gets an answer, and the retry gets the same one.
+        for request_id in id_cases() {
+            let base = empty_result_len(&request_id);
+            let mut plaintext = base;
+            while worst_frame_bytes(plaintext + GCM_TAG) <= FRAME {
+                plaintext += 1;
+            }
+            for extra in [0, 1, 2] {
+                let backend = SizedBackend::new(plaintext + extra - base);
+                let (first, second, executions) = call_twice(backend, &request_id);
+                assert_eq!(first, second);
+                assert_eq!(executions, 1);
+            }
+        }
     }
 
     #[test]

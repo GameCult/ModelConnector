@@ -27,6 +27,37 @@ pub struct TransportEnvelope {
     pub ciphertext: Vec<u8>,
 }
 
+/// The longest caller id, request id or model name a service admits. The
+/// frame arithmetic below depends on it, so a longer one is refused up front.
+pub(crate) const MAX_IDENTITY_BYTES: usize = 256;
+
+/// The most bytes a serialized envelope holding `ciphertext_len` ciphertext
+/// bytes can occupy. The v2 wire serializes the ciphertext as a MessagePack
+/// array of integers: a byte of 128 or more takes two bytes, so the worst case
+/// is twice the ciphertext, plus the array header and the envelope's other
+/// fields at their longest. Measured from the real encoding, not assumed.
+pub(crate) fn worst_frame_bytes(ciphertext_len: usize) -> usize {
+    let shell = rmp_serde::to_vec(&TransportEnvelope {
+        schema_id: ENVELOPE_SCHEMA_ID.to_string(),
+        caller_runtime_id: "x".repeat(MAX_IDENTITY_BYTES),
+        request_id: "x".repeat(MAX_IDENTITY_BYTES),
+        message_kind: EnvelopeKind::Invocation,
+        nonce: [0xff; 12],
+        ciphertext: Vec::new(),
+    })
+    .map_or(usize::MAX, |bytes| bytes.len());
+    // The shell holds an empty array header of one byte.
+    let header = match ciphertext_len {
+        0..=15 => 1,
+        16..=65_535 => 3,
+        _ => 5,
+    };
+    shell
+        .saturating_sub(1)
+        .saturating_add(header)
+        .saturating_add(ciphertext_len.saturating_mul(2))
+}
+
 pub fn encrypt_invocation(
     invocation: &TransportInvocation,
     security: &TransportKey,
@@ -245,6 +276,8 @@ pub enum ServiceError {
     NoActiveRequest,
     #[error("completion does not match the active request")]
     ActiveRequestMismatch,
+    #[error("sealed result does not fit the frame bound")]
+    FrameBound,
 }
 
 #[cfg(test)]
@@ -394,5 +427,46 @@ mod tests {
         ));
         assert!(matches!(write(&[], 16), Err(TransportFrameError::Size)));
         assert!(matches!(write(&[], 1_000), Err(TransportFrameError::Size)));
+    }
+
+    #[test]
+    fn the_worst_frame_is_the_real_encoding_of_an_all_high_ciphertext() {
+        let long = "x".repeat(MAX_IDENTITY_BYTES);
+        for length in [0, 1, 15, 16, 17, 255, 256, 65_535, 65_536, 70_000] {
+            let envelope = TransportEnvelope {
+                schema_id: ENVELOPE_SCHEMA_ID.to_string(),
+                caller_runtime_id: long.clone(),
+                request_id: long.clone(),
+                message_kind: EnvelopeKind::Invocation,
+                nonce: [0xff; 12],
+                ciphertext: vec![0xff; length],
+            };
+            assert_eq!(
+                rmp_serde::to_vec(&envelope).unwrap().len(),
+                worst_frame_bytes(length),
+                "{length}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_sealed_envelope_never_exceeds_the_worst_frame_for_its_ciphertext() {
+        let key = security("epiphany-distinct-test-key");
+        for id in ["a".to_string(), "i".repeat(MAX_IDENTITY_BYTES)] {
+            for plaintext in [1, 100, 5_000, 70_000] {
+                let sealed =
+                    encrypt_message(&id, &id, EnvelopeKind::Result, &vec![0x41; plaintext], &key)
+                        .unwrap();
+                let real = rmp_serde::to_vec(&sealed).unwrap().len();
+                let worst = worst_frame_bytes(sealed.ciphertext.len());
+                assert!(real <= worst, "{real} > {worst}");
+                // Real ciphertext is random, so about half its bytes take two
+                // bytes: the worst case is not wildly above what is written.
+                assert!(
+                    worst <= real + sealed.ciphertext.len() + 64,
+                    "{worst} {real}"
+                );
+            }
+        }
     }
 }

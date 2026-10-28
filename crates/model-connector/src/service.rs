@@ -7,12 +7,13 @@ use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 use crate::contract::{
-    ContractError, Refusal, TransportDisposition, TransportInvocation, TransportKey,
-    TransportResult, canonical_invocation_bytes, require_id,
+    ContractError, RECEIPT_SCHEMA_ID, RESULT_SCHEMA_ID, Refusal, TransportDisposition,
+    TransportInvocation, TransportKey, TransportOutcome, TransportReceipt, TransportResult,
+    canonical_invocation_bytes, require_id,
 };
 use crate::envelope::{
-    EnvelopeKind, ServiceError, TransportEnvelope, decrypt_invocation, encrypt_result,
-    validate_envelope,
+    EnvelopeKind, MAX_IDENTITY_BYTES, ServiceError, TransportEnvelope, decrypt_invocation,
+    encrypt_result, validate_envelope,
 };
 
 pub struct CallerAdmission {
@@ -40,9 +41,10 @@ impl CallerAdmission {
         let allowed_models = allowed_models.into_iter().collect::<HashSet<_>>();
         if connection_key_epoch == 0
             || allowed_models.is_empty()
-            || allowed_models
-                .iter()
-                .any(|model| require_id(model, "allowed_model").is_err())
+            || caller_runtime_id.len() > MAX_IDENTITY_BYTES
+            || allowed_models.iter().any(|model| {
+                require_id(model, "allowed_model").is_err() || model.len() > MAX_IDENTITY_BYTES
+            })
             || max_concurrent_requests == 0
             || max_payload_bytes == 0
             || max_output_tokens == 0
@@ -199,6 +201,9 @@ impl TransportService {
         now_unix_ms: u64,
     ) -> Result<TransportAdmission, ServiceError> {
         validate_envelope(envelope, EnvelopeKind::Invocation)?;
+        if envelope.request_id.len() > MAX_IDENTITY_BYTES {
+            return Err(ContractError::Invalid("request_id").into());
+        }
         let caller = self
             .callers
             .get(&envelope.caller_runtime_id)
@@ -274,10 +279,16 @@ impl TransportService {
         })))
     }
 
+    /// Records a result and seals it. `max_frame_bytes` bounds the serialized
+    /// envelope, which is what a frame carries: a result whose sealed envelope
+    /// does not fit is recorded as the typed `result_size` failure instead, so
+    /// no completed record is ever undeliverable and a retry replays bytes
+    /// that fit.
     pub fn complete(
         &mut self,
         claim: ExecutionClaim,
         result: TransportResult,
+        max_frame_bytes: usize,
     ) -> Result<TransportEnvelope, ServiceError> {
         if !matches!(
             &result.disposition,
@@ -307,7 +318,22 @@ impl TransportService {
             .callers
             .get(&identity.caller_runtime_id)
             .ok_or(ServiceError::CallerNotAdmitted)?;
-        let response = encrypt_result(&result, &caller.security)?;
+        let mut response = encrypt_result(&result, &caller.security)?;
+        if !fits_frame(&response, max_frame_bytes)? {
+            response = encrypt_result(
+                &result_size_failure(
+                    &claim.invocation.caller_runtime_id,
+                    claim.invocation.request_id(),
+                    &claim.invocation.request.model,
+                    claim.invocation.native_request_sha256,
+                    claim.invocation.provider_request_sha256,
+                ),
+                &caller.security,
+            )?;
+            if !fits_frame(&response, max_frame_bytes)? {
+                return Err(ServiceError::FrameBound);
+            }
+        }
         let replay_record = ReplayRecord {
             caller_runtime_id: identity.caller_runtime_id.clone(),
             request_id: identity.request_id.clone(),
@@ -335,6 +361,48 @@ impl TransportService {
             &TransportResult::refused(invocation, refusal),
             security,
         )?))
+    }
+}
+
+fn fits_frame(envelope: &TransportEnvelope, max_frame_bytes: usize) -> Result<bool, ServiceError> {
+    rmp_serde::to_vec(envelope)
+        .map(|bytes| bytes.len() <= max_frame_bytes)
+        .map_err(|_| ServiceError::Encoding)
+}
+
+/// The transport named on the stand-in failure, fixed so its size is bounded.
+const STAND_IN_TRANSPORT: &str = "model-connector";
+
+/// The failed result that stands in for one whose sealed frame cannot be
+/// carried: the same shape a provider failure takes, with nothing a provider
+/// controls but the identities the invocation already bound.
+pub(crate) fn result_size_failure(
+    caller_runtime_id: &str,
+    request_id: &str,
+    model: &str,
+    native_request_sha256: [u8; 32],
+    provider_request_sha256: [u8; 32],
+) -> TransportResult {
+    TransportResult {
+        schema_id: RESULT_SCHEMA_ID.to_string(),
+        request_id: request_id.to_string(),
+        caller_runtime_id: caller_runtime_id.to_string(),
+        disposition: TransportDisposition::Transported {
+            events: Vec::new(),
+            receipt: Box::new(TransportReceipt {
+                schema_id: RECEIPT_SCHEMA_ID.to_string(),
+                request_id: request_id.to_string(),
+                caller_runtime_id: caller_runtime_id.to_string(),
+                native_request_sha256,
+                provider_request_sha256,
+                model: model.to_string(),
+                transport: STAND_IN_TRANSPORT.to_string(),
+                outcome: TransportOutcome::Failed {
+                    failure_kind: "result_size".to_string(),
+                    message: "provider result exceeded its byte bound".to_string(),
+                },
+            }),
+        },
     }
 }
 
@@ -441,6 +509,7 @@ mod tests {
                     }],
                     receipt(&invocation),
                 ),
+                1 << 20,
             )
             .unwrap();
         drop(service);
@@ -765,7 +834,9 @@ mod tests {
         let mut forged = (*claim).clone();
         forged.invocation_sha256 = [1; 32];
         assert_eq!(
-            service.complete(forged, result.clone()).unwrap_err(),
+            service
+                .complete(forged, result.clone(), 1 << 20)
+                .unwrap_err(),
             ServiceError::ActiveRequestMismatch
         );
 
@@ -783,8 +854,148 @@ mod tests {
         };
         service.replay_store.put(key, &record).unwrap();
         assert_eq!(
-            service.complete(*claim, result).unwrap_err(),
+            service.complete(*claim, result, 1 << 20).unwrap_err(),
             ServiceError::ActiveRequestMismatch
+        );
+    }
+
+    #[test]
+    fn identities_are_bounded_at_admission_and_on_the_request() {
+        let admit = |caller_id: String, model: String| {
+            CallerAdmission::new(caller_id, KEY, 1, [model], 4, 64 * 1024, 32_768)
+        };
+        let at = "i".repeat(MAX_IDENTITY_BYTES);
+        let over = "i".repeat(MAX_IDENTITY_BYTES + 1);
+        assert!(admit(at.clone(), at.clone()).is_ok());
+        assert!(matches!(
+            admit(over.clone(), at.clone()),
+            Err(ServiceError::InvalidAdmission)
+        ));
+        assert!(matches!(
+            admit(at.clone(), over.clone()),
+            Err(ServiceError::InvalidAdmission)
+        ));
+
+        let store = TestStore::new();
+        let mut service = open_service(&store, 8);
+        let ok = invocation_for(CALLER, &at);
+        assert!(matches!(
+            service.begin(&raw_envelope(&ok), 1_000).unwrap(),
+            TransportAdmission::Execute(_)
+        ));
+        let long = invocation_for(CALLER, &over);
+        assert_eq!(
+            service.begin(&raw_envelope(&long), 1_000).err(),
+            Some(ServiceError::Contract(ContractError::Invalid("request_id")))
+        );
+    }
+
+    #[test]
+    fn a_frame_check_is_inclusive_of_the_serialized_envelope() {
+        let envelope =
+            encrypt_invocation(&invocation_for(CALLER, "sized"), &security(KEY)).unwrap();
+        let size = rmp_serde::to_vec(&envelope).unwrap().len();
+        assert_eq!(fits_frame(&envelope, size), Ok(true));
+        assert_eq!(fits_frame(&envelope, size - 1), Ok(false));
+    }
+
+    fn claim_for(
+        service: &mut TransportService,
+        request_id: &str,
+    ) -> (Box<ExecutionClaim>, TransportInvocation) {
+        let invocation = invocation_for(CALLER, request_id);
+        match service.begin(&raw_envelope(&invocation), 1_000).unwrap() {
+            TransportAdmission::Execute(claim) => (claim, invocation),
+            TransportAdmission::Reply(_) => panic!("expected an execution claim"),
+        }
+    }
+
+    fn text_result(
+        invocation: &TransportInvocation,
+        text: &str,
+        transport: &str,
+    ) -> TransportResult {
+        let mut receipt = receipt(invocation);
+        receipt.transport = transport.to_string();
+        TransportResult::transported(
+            invocation,
+            vec![TransportEvent {
+                sequence: 0,
+                payload: TransportEventPayload::TextDelta {
+                    text: text.to_string(),
+                },
+            }],
+            receipt,
+        )
+    }
+
+    #[test]
+    fn a_result_whose_sealed_envelope_exceeds_the_frame_is_recorded_as_the_stand_in_failure() {
+        let store = TestStore::new();
+        let mut service = open_service(&store, 8);
+        let (claim, invocation) = claim_for(&mut service, "stand-in");
+        let big = text_result(&invocation, &"y".repeat(4000), &"t".repeat(5000));
+        let response = service.complete(*claim, big, 2000).unwrap();
+        assert!(rmp_serde::to_vec(&response).unwrap().len() <= 2000);
+        let stand_in = decrypt_result(&response, &security(KEY), &invocation).unwrap();
+        assert_eq!(
+            stand_in,
+            result_size_failure(
+                CALLER,
+                "stand-in",
+                &invocation.request.model,
+                invocation.native_request_sha256,
+                invocation.provider_request_sha256,
+            )
+        );
+        let TransportDisposition::Transported { receipt, .. } = &stand_in.disposition else {
+            panic!("expected a transported failure");
+        };
+        assert_eq!(receipt.transport, "model-connector");
+
+        // The recorded replay is the stand-in's exact bytes.
+        let TransportAdmission::Reply(replay) =
+            service.begin(&raw_envelope(&invocation), 1_000).unwrap()
+        else {
+            panic!("expected a replay");
+        };
+        assert_eq!(replay, response);
+    }
+
+    #[test]
+    fn a_result_whose_sealed_envelope_fits_is_recorded_as_the_backend_made_it() {
+        let store = TestStore::new();
+        let mut service = open_service(&store, 8);
+        let (claim, invocation) = claim_for(&mut service, "fits");
+        let small = text_result(&invocation, "done", "fixture-sse");
+        let response = service.complete(*claim, small.clone(), 1 << 20).unwrap();
+        assert_eq!(
+            decrypt_result(&response, &security(KEY), &invocation).unwrap(),
+            small
+        );
+    }
+
+    #[test]
+    fn nothing_is_recorded_when_not_even_the_stand_in_fits() {
+        let store = TestStore::new();
+        let mut service = open_service(&store, 8);
+        let (claim, invocation) = claim_for(&mut service, "nothing-fits");
+        let big = text_result(&invocation, "y", "fixture-sse");
+        assert_eq!(
+            service.complete(*claim, big, 10).unwrap_err(),
+            ServiceError::FrameBound
+        );
+        // Still active, never completed: the retry is told it is in flight.
+        let TransportAdmission::Reply(reply) =
+            service.begin(&raw_envelope(&invocation), 1_000).unwrap()
+        else {
+            panic!("expected a refusal");
+        };
+        assert_eq!(
+            decrypt_result(&reply, &security(KEY), &invocation)
+                .unwrap()
+                .disposition,
+            TransportDisposition::Refused(Refusal::InFlight)
         );
     }
 }
