@@ -274,24 +274,6 @@ fn admission_clock(
     now_unix_ms.max(newest.saturating_mul(spend_window_ms))
 }
 
-/// The clock a request is admitted at: `now`, held monotonic per caller. A
-/// caller's window never moves back, so a clock that steps back (or a boot
-/// with the clock behind a recorded window) cannot reopen spent budget: the
-/// request is admitted into the caller's newest recorded window. The record
-/// stores this value, so the window re-derives from the records at open.
-fn admission_clock(
-    window_spend: &HashMap<String, BTreeMap<u64, u64>>,
-    caller_runtime_id: &str,
-    now_unix_ms: u64,
-    spend_window_ms: u64,
-) -> u64 {
-    let newest = window_spend
-        .get(caller_runtime_id)
-        .and_then(|windows| windows.keys().next_back().copied())
-        .unwrap_or(0);
-    now_unix_ms.max(newest.saturating_mul(spend_window_ms))
-}
-
 /// Drops the windows of `caller_runtime_id` that nothing can still read:
 /// those before `floor` that hold no live request's reservation. Admission
 /// reads the current window alone, and a live request settles into the window
