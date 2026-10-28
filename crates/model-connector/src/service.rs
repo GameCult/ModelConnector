@@ -3449,4 +3449,16 @@ mod tests {
         assert_eq!(service.window_spend(CALLER, 0), reservation());
         drop(two);
     }
+
+    #[test]
+    fn a_result_that_is_not_transported_is_charged_the_reservation() {
+        let store = TestStore::new();
+        let mut service = open_service(&store, 4);
+        let claim = claim_at(&mut service, "request-1", 1_000);
+        let invocation = invocation_at("request-1", 1_000, MAX_COST);
+        let refused = TransportResult::refused(&invocation, Refusal::Capacity);
+        service.complete(*claim, refused, FRAME).unwrap();
+        assert_eq!(charged_of(&service, "request-1"), reservation());
+        assert_eq!(service.window_spend(CALLER, 0), reservation());
+    }
 }
