@@ -79,6 +79,7 @@ pub(crate) fn encode_invocation_frame(
 
 /// The CultNet frame a result travels in: a `cultnet.operation_response.v0`
 /// with status `ok`, otherwise shaped like the invocation's.
+#[cfg(any(feature = "daemon", test))]
 pub(crate) fn encode_result_frame(envelope: &TransportEnvelope) -> Result<Vec<u8>, ServiceError> {
     carriage_bytes(&CultNetMessage::OperationResponse {
         message_id: envelope.request_id.clone(),
@@ -124,6 +125,7 @@ fn read_carriage(bytes: &[u8]) -> Result<CultNetMessage, ServiceError> {
         .map_err(|_| ServiceError::Carriage)
 }
 
+#[cfg(any(feature = "daemon", test))]
 pub(crate) fn decode_invocation_frame(bytes: &[u8]) -> Result<TransportEnvelope, ServiceError> {
     match read_carriage(bytes)? {
         CultNetMessage::OperationRequest {
