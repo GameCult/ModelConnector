@@ -154,6 +154,38 @@
           "required": [
             "ToolResult"
           ]
+        },
+        {
+          "description": "One provider reasoning block, opaque to every caller: `state` is the\nconnector's own encoding of the whole block. Callers replay it\nverbatim in transcript order and never inspect or branch on it; only\nthe connector of `provider` reads it, and the service drops or refuses\nthe state of any other provider before a backend sees the request.",
+          "type": "object",
+          "properties": {
+            "ReasoningState": {
+              "type": "object",
+              "properties": {
+                "model": {
+                  "type": "string"
+                },
+                "provider": {
+                  "type": "string"
+                },
+                "state": {
+                  "description": "MessagePack bin: raw bytes, never an array of integers",
+                  "type": "string",
+                  "format": "binary"
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "provider",
+                "model",
+                "state"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "ReasoningState"
+          ]
         }
       ]
     },

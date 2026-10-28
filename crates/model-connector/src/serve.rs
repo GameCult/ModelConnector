@@ -10,12 +10,12 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use zeroize::Zeroizing;
 
-use crate::contract::{TransportInvocation, TransportResult};
+use crate::contract::TransportResult;
 use crate::envelope::{
     ServiceError, TransportFrameError, decode_invocation_frame, encode_result_frame,
     frame_bytes_for_payload, read_transport_frame, write_transport_frame,
 };
-use crate::service::{CallerAdmission, TransportAdmission, TransportService};
+use crate::service::{CallerAdmission, ProviderCall, TransportAdmission, TransportService};
 
 /// The only provider seam of the connector kit. A connector binary implements
 /// it over one model provider; the kit names no provider.
@@ -24,9 +24,14 @@ pub trait ProviderBackend: Send + Sync {
     /// opens the replay store or accepts a connection; the request path does
     /// not consult it.
     fn ready(&self) -> bool;
-    /// Executes one admitted invocation. The service has already bound the
-    /// invocation to its caller and recorded its replay claim.
-    fn execute(&self, invocation: &TransportInvocation) -> TransportResult;
+    /// The tag of the provider this backend fronts. The service owns it from
+    /// `serve` on: it names the provider on every receipt and decides which
+    /// reasoning state is foreign.
+    fn provider(&self) -> &str;
+    /// Executes one admitted call. The service has already bound it to its
+    /// caller and recorded its replay claim. The call cannot show a foreign
+    /// reasoning item and builds the result's receipt itself.
+    fn execute(&self, call: &ProviderCall) -> TransportResult;
 }
 
 /// Bounds of one serve loop. The connector binary's own document owns where
@@ -157,6 +162,7 @@ pub fn serve(
     }
     let service = Arc::new(Mutex::new(TransportService::open(
         replay_store,
+        backend.provider(),
         admissions,
         limits.max_expiry_skew_ms,
     )?));
@@ -230,7 +236,7 @@ fn execute_inference_frame(
     let response = match admission {
         TransportAdmission::Reply(response) => response,
         TransportAdmission::Execute(claim) => {
-            let result = backend.execute(claim.invocation());
+            let result = backend.execute(claim.call());
             service
                 .lock()
                 .map_err(|_| ServeError::ServicePoisoned)?
@@ -328,7 +334,7 @@ mod tests {
     use crate::client::ConnectorClient;
     use crate::contract::{
         FailureKind, Refusal, TransportDisposition, TransportEvent, TransportEventPayload,
-        TransportOutcome, TransportResult,
+        TransportInvocation, TransportOutcome, TransportResult,
     };
     use crate::fixtures::{TestStore, caller, invocation_for, receipt, request};
 
@@ -360,17 +366,20 @@ mod tests {
             self.ready
         }
 
-        fn execute(&self, invocation: &TransportInvocation) -> TransportResult {
+        fn provider(&self) -> &str {
+            "fixture-sse"
+        }
+
+        fn execute(&self, call: &ProviderCall) -> TransportResult {
             self.executions.fetch_add(1, Ordering::SeqCst);
-            TransportResult::transported(
-                invocation,
+            call.transported(
                 vec![TransportEvent {
                     sequence: 0,
                     payload: TransportEventPayload::TextDelta {
                         text: "done".to_string(),
                     },
                 }],
-                receipt(invocation),
+                receipt(&fresh("sizing")).outcome,
             )
         }
     }
@@ -568,8 +577,13 @@ mod tests {
         // The wide completion goes straight through the service: serve holds
         // the replay store for as long as it runs, so a second serve cannot
         // open it while the first lives.
-        let mut service =
-            TransportService::open(&store.path, vec![caller(CALLER, KEY, 4)], 300_000).unwrap();
+        let mut service = TransportService::open(
+            &store.path,
+            "fixture-sse",
+            vec![caller(CALLER, KEY, 4)],
+            300_000,
+        )
+        .unwrap();
         let envelope =
             crate::envelope::encrypt_invocation(&invocation, &crate::fixtures::security(KEY))
                 .unwrap();
@@ -578,13 +592,8 @@ mod tests {
         else {
             panic!("a fresh request must execute");
         };
-        service
-            .complete(
-                *claim,
-                sized_result(&invocation, 150_000, "fixture-sse"),
-                1 << 20,
-            )
-            .unwrap();
+        let wide = sized_result(claim.call(), 150_000);
+        service.complete(*claim, wide, 1 << 20).unwrap();
         drop(service);
 
         let narrow = 140_000;
@@ -684,7 +693,7 @@ mod tests {
     fn the_smallest_frame_also_carries_the_failure_that_stands_in_for_a_result() {
         let long = "x".repeat(crate::envelope::MAX_IDENTITY_BYTES);
         let plaintext = crate::contract::wire_encode(&crate::service::result_size_failure(
-            &long, &long, &long, [0xff; 32], [0xff; 32],
+            &long, &long, &long, [0xff; 32], [0xff; 32], 0,
         ))
         .unwrap()
         .len();
@@ -913,19 +922,13 @@ mod tests {
     /// Answers every invocation with one text event of a chosen size.
     struct SizedBackend {
         text_len: usize,
-        transport: String,
         executions: AtomicUsize,
     }
 
     impl SizedBackend {
         fn new(text_len: usize) -> Arc<Self> {
-            Self::with_transport(text_len, "fixture-sse".to_string())
-        }
-
-        fn with_transport(text_len: usize, transport: String) -> Arc<Self> {
             Arc::new(Self {
                 text_len,
-                transport,
                 executions: AtomicUsize::new(0),
             })
         }
@@ -936,28 +939,25 @@ mod tests {
             true
         }
 
-        fn execute(&self, invocation: &TransportInvocation) -> TransportResult {
+        fn provider(&self) -> &str {
+            "fixture-sse"
+        }
+
+        fn execute(&self, call: &ProviderCall) -> TransportResult {
             self.executions.fetch_add(1, Ordering::SeqCst);
-            sized_result(invocation, self.text_len, &self.transport)
+            sized_result(call, self.text_len)
         }
     }
 
-    fn sized_result(
-        invocation: &TransportInvocation,
-        text_len: usize,
-        transport: &str,
-    ) -> TransportResult {
-        let mut receipt = receipt(invocation);
-        receipt.provider = transport.to_string();
-        TransportResult::transported(
-            invocation,
+    fn sized_result(call: &ProviderCall, text_len: usize) -> TransportResult {
+        call.transported(
             vec![TransportEvent {
                 sequence: 0,
                 payload: TransportEventPayload::TextDelta {
                     text: "y".repeat(text_len),
                 },
             }],
-            receipt,
+            receipt(&fresh("sizing")).outcome,
         )
     }
 
@@ -997,7 +997,25 @@ mod tests {
 
     /// The encoded size of a result carrying no text, for this request id.
     fn empty_result_len(request_id: &str) -> usize {
-        encoded_len(&sized_result(&fresh(request_id), 0, "fixture-sse"))
+        let store = TestStore::new();
+        let mut service = TransportService::open(
+            &store.path,
+            "fixture-sse",
+            vec![caller(CALLER, KEY, 4)],
+            300_000,
+        )
+        .unwrap();
+        let envelope = crate::envelope::encrypt_invocation(
+            &fresh(request_id),
+            &crate::fixtures::security(KEY),
+        )
+        .unwrap();
+        let TransportAdmission::Execute(claim) =
+            service.begin(&envelope, now_ms(), 1 << 20).unwrap()
+        else {
+            panic!("a fresh request must execute");
+        };
+        encoded_len(&sized_result(claim.call(), 0))
     }
 
     #[test]
@@ -1025,17 +1043,6 @@ mod tests {
     #[test]
     fn a_result_larger_than_the_frame_fails_typed_and_is_never_replayed_as_completed() {
         let (first, second, executions) = call_twice(SizedBackend::new(FRAME), "request-oversize");
-        assert!(failed_result_size(&first));
-        assert_eq!(first, second);
-        assert_eq!(executions, 1);
-    }
-
-    #[test]
-    fn a_stand_in_failure_never_carries_the_backends_transport() {
-        let (first, second, executions) = call_twice(
-            SizedBackend::with_transport(FRAME, "t".repeat(FRAME)),
-            "request-transport",
-        );
         assert!(failed_result_size(&first));
         assert_eq!(first, second);
         assert_eq!(executions, 1);
@@ -1093,7 +1100,13 @@ mod tests {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let endpoint = listener.local_addr().unwrap();
             let service = Arc::new(Mutex::new(
-                TransportService::open(&store.path, vec![caller(CALLER, KEY, 4)], 300_000).unwrap(),
+                TransportService::open(
+                    &store.path,
+                    "fixture-sse",
+                    vec![caller(CALLER, KEY, 4)],
+                    300_000,
+                )
+                .unwrap(),
             ));
             let served = backend.clone();
             thread::spawn(move || {

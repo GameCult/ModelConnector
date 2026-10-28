@@ -98,3 +98,18 @@ fn the_published_ciphertext_is_what_the_wire_sends() {
         .unwrap();
     assert!(matches!(wire, rmpv::Value::Binary(bytes) if bytes.len() == 40));
 }
+
+#[test]
+fn the_refusal_schema_is_one_flat_string_enum() {
+    let schema: serde_json::Value = serde_json::from_str(&render::<Refusal>()).unwrap();
+    assert!(schema.get("oneOf").is_none(), "{schema}");
+    assert_eq!(schema["type"], "string");
+    let variants: Vec<&str> = schema["enum"]
+        .as_array()
+        .expect("a closed set of strings")
+        .iter()
+        .map(|value| value.as_str().unwrap())
+        .collect();
+    assert_eq!(variants.len(), 12);
+    assert!(variants.contains(&"ForeignReasoningState"));
+}

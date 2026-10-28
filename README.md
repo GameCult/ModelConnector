@@ -13,6 +13,9 @@ Crate `crates/model-connector`:
 
 - `src/contract.rs` - the v3 wire contract (`gamecult.model.*.v3`): `ProviderRequest`, `TransportInvocation`,
   `TransportResult`, `TransportReceipt`, the typed `StopReason`, `FailureKind` and `Refusal`,
+  `InputItem::ReasoningState` (a provider's opaque reasoning block, replayed by callers
+  verbatim via `TransportResult::transcript_items`; the service refuses another provider's
+  state in the in-flight tool exchange and drops it from earlier turns),
   and the canonical byte and digest functions that bind a result to its request. Every
   document is named MessagePack with unknown fields refused.
 - `src/envelope.rs` - the AES-256-GCM `TransportEnvelope` (binary ciphertext), its

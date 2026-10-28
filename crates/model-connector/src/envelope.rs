@@ -37,12 +37,13 @@ pub struct TransportEnvelope {
     pub ciphertext: Vec<u8>,
 }
 
-/// The ciphertext is MessagePack `bin` on the wire, never an array of integers.
-fn binary_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+/// Raw bytes are MessagePack `bin` on the wire, never an array of integers.
+/// Serves the ciphertext and both reasoning states.
+pub(crate) fn binary_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
     schemars::json_schema!({
         "type": "string",
         "format": "binary",
-        "description": "MessagePack bin: the raw ciphertext bytes, never an array of integers"
+        "description": "MessagePack bin: raw bytes, never an array of integers"
     })
 }
 
@@ -556,7 +557,7 @@ mod tests {
     fn the_outer_identity_must_match_the_sealed_result_on_each_field() {
         let key = security("epiphany-distinct-test-key");
         let invocation = invocation();
-        let result = TransportResult::transported(&invocation, Vec::new(), receipt(&invocation));
+        let result = TransportResult::transported(Vec::new(), receipt(&invocation));
         let plaintext = wire_encode(&result).unwrap();
         let seal = |caller: &str, request_id: &str| {
             encrypt_message(caller, request_id, EnvelopeKind::Result, &plaintext, &key).unwrap()

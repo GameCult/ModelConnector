@@ -7,9 +7,9 @@ use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 use crate::contract::{
-    ContractError, FailureKind, RECEIPT_SCHEMA_ID, RESULT_SCHEMA_ID, Refusal, TransportDisposition,
-    TransportInvocation, TransportKey, TransportOutcome, TransportReceipt, TransportResult,
-    canonical_invocation_bytes, require_id,
+    ContractError, FailureKind, InputItem, ProviderRequest, RECEIPT_SCHEMA_ID, RESULT_SCHEMA_ID,
+    Refusal, TransportDisposition, TransportEvent, TransportInvocation, TransportKey,
+    TransportOutcome, TransportReceipt, TransportResult, canonical_invocation_bytes, require_id,
 };
 use crate::envelope::{
     EnvelopeKind, MAX_IDENTITY_BYTES, ServiceError, TransportEnvelope, decrypt_invocation,
@@ -106,15 +106,57 @@ struct ReplayRecord {
     state: ReplayState,
 }
 
+/// What a backend is handed: the request with every foreign reasoning item
+/// already removed, and the means to answer it. The caller's own invocation is
+/// not held here at all, so no path from a call (Debug included) reaches
+/// foreign reasoning state, and a backend cannot write the identity of its
+/// receipt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderCall {
+    request: ProviderRequest,
+    receipt: TransportReceipt,
+}
+
+impl ProviderCall {
+    /// The request as the provider may see it: foreign reasoning items absent,
+    /// every other item in the caller's order.
+    pub fn request(&self) -> &ProviderRequest {
+        &self.request
+    }
+
+    /// How many foreign reasoning items the service removed from the request.
+    pub fn foreign_reasoning_dropped(&self) -> u32 {
+        self.receipt.foreign_reasoning_dropped
+    }
+
+    /// The result of this call. The whole receipt (schema, ids, both digests,
+    /// model, provider tag and drop count) is derived here, so a backend
+    /// writes only the events and the outcome.
+    pub fn transported(
+        &self,
+        events: Vec<TransportEvent>,
+        outcome: TransportOutcome,
+    ) -> TransportResult {
+        TransportResult::transported(
+            events,
+            TransportReceipt {
+                outcome,
+                ..self.receipt.clone()
+            },
+        )
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecutionClaim {
+    call: ProviderCall,
     invocation: TransportInvocation,
     invocation_sha256: [u8; 32],
 }
 
 impl ExecutionClaim {
-    pub fn invocation(&self) -> &TransportInvocation {
-        &self.invocation
+    pub fn call(&self) -> &ProviderCall {
+        &self.call
     }
 }
 
@@ -129,15 +171,23 @@ pub struct TransportService {
     live: HashSet<RequestIdentity>,
     replay_store: CultCache,
     max_expiry_skew_ms: u64,
+    provider: String,
 }
 
 impl TransportService {
+    /// `provider` is the tag of the backend this service fronts. The service
+    /// owns it from here on: it decides which reasoning state is foreign and
+    /// what provider every receipt names.
     pub fn open(
         replay_store_path: &Path,
+        provider: &str,
         admissions: impl IntoIterator<Item = CallerAdmission>,
         max_expiry_skew_ms: u64,
     ) -> Result<Self, ServiceError> {
-        if max_expiry_skew_ms == 0 {
+        if max_expiry_skew_ms == 0
+            || require_id(provider, "provider").is_err()
+            || provider == STAND_IN_PROVIDER
+        {
             return Err(ServiceError::InvalidAdmission);
         }
         let mut callers = HashMap::new();
@@ -195,6 +245,7 @@ impl TransportService {
             live: HashSet::new(),
             replay_store,
             max_expiry_skew_ms,
+            provider: provider.to_string(),
         })
     }
 
@@ -242,6 +293,11 @@ impl TransportService {
         if invocation.request.max_output_tokens > caller.max_output_tokens {
             return self.reply_refusal(&invocation, Refusal::OutputBound, &security);
         }
+        let (request, foreign_reasoning_dropped) =
+            match partition_reasoning(&invocation.request, &self.provider) {
+                Ok(partition) => partition,
+                Err(refusal) => return self.reply_refusal(&invocation, refusal, &security),
+            };
 
         let identity = RequestIdentity {
             caller_runtime_id: invocation.caller_runtime_id.clone(),
@@ -262,7 +318,12 @@ impl TransportService {
                     if fits_frame(response, max_frame_bytes)? {
                         return Ok(TransportAdmission::Reply(response.clone()));
                     }
-                    let stand_in = self.seal_stand_in(&invocation, &security, max_frame_bytes)?;
+                    let stand_in = self.seal_stand_in(
+                        &invocation,
+                        &security,
+                        max_frame_bytes,
+                        FailureKind::ResultSize,
+                    )?;
                     self.replay_store
                         .put(
                             replay_key(&identity),
@@ -308,6 +369,24 @@ impl TransportService {
             .map_err(replay_store_error)?;
         self.live.insert(identity);
         Ok(TransportAdmission::Execute(Box::new(ExecutionClaim {
+            call: ProviderCall {
+                receipt: TransportReceipt {
+                    schema_id: RECEIPT_SCHEMA_ID.to_string(),
+                    request_id: invocation.request_id().to_string(),
+                    caller_runtime_id: invocation.caller_runtime_id.clone(),
+                    native_request_sha256: invocation.native_request_sha256,
+                    provider_request_sha256: invocation.provider_request_sha256,
+                    model: invocation.request.model.clone(),
+                    provider: self.provider.clone(),
+                    foreign_reasoning_dropped,
+                    // Replaced by the backend's outcome in `transported`.
+                    outcome: TransportOutcome::Failed {
+                        kind: FailureKind::Provider,
+                        message: String::new(),
+                    },
+                },
+                request,
+            },
             invocation,
             invocation_sha256,
         })))
@@ -324,16 +403,10 @@ impl TransportService {
         result: TransportResult,
         max_frame_bytes: usize,
     ) -> Result<TransportEnvelope, ServiceError> {
-        if !matches!(
-            &result.disposition,
-            TransportDisposition::Transported { .. }
-        ) {
-            return Err(ServiceError::InvalidCompletion);
-        }
-        result.validate_against(&claim.invocation)?;
+        let invocation = &claim.invocation;
         let identity = RequestIdentity {
-            caller_runtime_id: claim.invocation.caller_runtime_id.clone(),
-            request_id: claim.invocation.request_id().to_string(),
+            caller_runtime_id: invocation.caller_runtime_id.clone(),
+            request_id: invocation.request_id().to_string(),
         };
         if !self.live.contains(&identity) {
             return Err(ServiceError::NoActiveRequest);
@@ -353,17 +426,39 @@ impl TransportService {
             .get(&identity.caller_runtime_id)
             .ok_or(ServiceError::CallerNotAdmitted)?;
         let security = caller.security.clone();
-        let mut response = encrypt_result(&result, &security)?;
-        if !fits_frame(&response, max_frame_bytes)? {
-            response = match self.seal_stand_in(&claim.invocation, &security, max_frame_bytes) {
-                Ok(stand_in) => stand_in,
-                Err(error) => {
-                    // Nothing is recorded, but the caller's slot is not held
-                    // by a request that can no longer finish.
+        // A result the service refuses (not a transported result, not bound to
+        // this invocation, or carrying a provider tag or drop count the call
+        // did not derive) is answered like an oversized one: a typed failure
+        // is recorded and the slot released, so the caller gets an answer and
+        // a retry replays it.
+        let admissible = self.admits_result(&result, &claim);
+        let mut response = if admissible {
+            encrypt_result(&result, &security)?
+        } else {
+            self.seal_stand_in(
+                invocation,
+                &security,
+                max_frame_bytes,
+                FailureKind::Provider,
+            )
+            .inspect_err(|_| {
+                self.live.remove(&identity);
+            })?
+        };
+        if admissible && !fits_frame(&response, max_frame_bytes)? {
+            // Nothing is recorded when even the stand-in cannot be carried,
+            // but the caller's slot is not held by a request that can no
+            // longer finish.
+            response = self
+                .seal_stand_in(
+                    invocation,
+                    &security,
+                    max_frame_bytes,
+                    FailureKind::ResultSize,
+                )
+                .inspect_err(|_| {
                     self.live.remove(&identity);
-                    return Err(error);
-                }
-            };
+                })?;
         }
         let caller = self
             .callers
@@ -374,7 +469,7 @@ impl TransportService {
             request_id: identity.request_id.clone(),
             connection_key_epoch: caller.connection_key_epoch,
             invocation_sha256: claim.invocation_sha256,
-            expires_at_unix_ms: claim.invocation.expires_at_unix_ms,
+            expires_at_unix_ms: invocation.expires_at_unix_ms,
             state: ReplayState::Completed {
                 response: response.clone(),
             },
@@ -392,14 +487,20 @@ impl TransportService {
         invocation: &TransportInvocation,
         security: &TransportKey,
         max_frame_bytes: usize,
+        kind: FailureKind,
     ) -> Result<TransportEnvelope, ServiceError> {
+        let (_, foreign_reasoning_dropped) =
+            partition_reasoning(&invocation.request, &self.provider)
+                .map_err(|_| ServiceError::InvalidCompletion)?;
         let stand_in = encrypt_result(
-            &result_size_failure(
+            &stand_in_failure(
                 &invocation.caller_runtime_id,
                 invocation.request_id(),
                 &invocation.request.model,
                 invocation.native_request_sha256,
                 invocation.provider_request_sha256,
+                foreign_reasoning_dropped,
+                kind,
             ),
             security,
         )?;
@@ -408,6 +509,18 @@ impl TransportService {
         } else {
             Err(ServiceError::FrameBound)
         }
+    }
+
+    /// Whether `result` is the answer to this claim's call: transported,
+    /// bound to the caller's invocation, and carrying the provider tag and drop
+    /// count the service derived.
+    fn admits_result(&self, result: &TransportResult, claim: &ExecutionClaim) -> bool {
+        let TransportDisposition::Transported { receipt, .. } = &result.disposition else {
+            return false;
+        };
+        result.validate_against(&claim.invocation).is_ok()
+            && receipt.provider == self.provider
+            && receipt.foreign_reasoning_dropped == claim.call.receipt.foreign_reasoning_dropped
     }
 
     fn reply_refusal(
@@ -433,13 +546,41 @@ const STAND_IN_PROVIDER: &str = "model-connector";
 /// The failed result that stands in for one whose sealed frame cannot be
 /// carried: the same shape a provider failure takes, with nothing a provider
 /// controls but the identities the invocation already bound.
+#[cfg(test)]
 pub(crate) fn result_size_failure(
     caller_runtime_id: &str,
     request_id: &str,
     model: &str,
     native_request_sha256: [u8; 32],
     provider_request_sha256: [u8; 32],
+    foreign_reasoning_dropped: u32,
 ) -> TransportResult {
+    stand_in_failure(
+        caller_runtime_id,
+        request_id,
+        model,
+        native_request_sha256,
+        provider_request_sha256,
+        foreign_reasoning_dropped,
+        FailureKind::ResultSize,
+    )
+}
+
+/// The stand-in failure for `kind`: `ResultSize` for a result that cannot be
+/// carried, `Provider` for one the service refused.
+fn stand_in_failure(
+    caller_runtime_id: &str,
+    request_id: &str,
+    model: &str,
+    native_request_sha256: [u8; 32],
+    provider_request_sha256: [u8; 32],
+    foreign_reasoning_dropped: u32,
+    kind: FailureKind,
+) -> TransportResult {
+    let message = match kind {
+        FailureKind::ResultSize => "provider result exceeded its byte bound",
+        _ => "the service refused the backend's result",
+    };
     TransportResult {
         schema_id: RESULT_SCHEMA_ID.to_string(),
         request_id: request_id.to_string(),
@@ -454,13 +595,48 @@ pub(crate) fn result_size_failure(
                 provider_request_sha256,
                 model: model.to_string(),
                 provider: STAND_IN_PROVIDER.to_string(),
+                foreign_reasoning_dropped,
                 outcome: TransportOutcome::Failed {
-                    kind: FailureKind::ResultSize,
-                    message: "provider result exceeded its byte bound".to_string(),
+                    kind,
+                    message: message.to_string(),
                 },
             }),
         },
     }
+}
+
+/// The one place foreignness is decided. A reasoning item of another provider
+/// in the in-flight exchange (after the last user text; the whole input when
+/// there is none) is refused, because dropping it would break the provider's
+/// own tool-exchange rules. Earlier foreign items are removed and counted.
+/// Foreignness is the provider tag alone: another model of this provider
+/// passes through for the provider to judge.
+fn partition_reasoning(
+    request: &ProviderRequest,
+    provider: &str,
+) -> Result<(ProviderRequest, u32), Refusal> {
+    let in_flight_from = request
+        .input
+        .iter()
+        .rposition(|item| matches!(item, InputItem::UserText { .. }))
+        .map_or(0, |last_user_text| last_user_text + 1);
+    let mut input = Vec::with_capacity(request.input.len());
+    let mut dropped = 0u32;
+    for (position, item) in request.input.iter().enumerate() {
+        if let InputItem::ReasoningState { provider: tag, .. } = item
+            && tag != provider
+        {
+            if position >= in_flight_from {
+                return Err(Refusal::ForeignReasoningState);
+            }
+            dropped += 1;
+            continue;
+        }
+        input.push(item.clone());
+    }
+    let mut filtered = request.clone();
+    filtered.input = input;
+    Ok((filtered, dropped))
 }
 
 fn replay_key(identity: &RequestIdentity) -> String {
@@ -509,6 +685,7 @@ mod tests {
         assert!(matches!(
             TransportService::open(
                 &store.path,
+                "fixture-sse",
                 [
                     caller("epiphany-yggdrasil", "shared-key", 1),
                     caller("ghostlight-yggdrasil", "shared-key", 1),
@@ -566,7 +743,6 @@ mod tests {
             .complete(
                 *claim,
                 TransportResult::transported(
-                    &invocation,
                     vec![TransportEvent {
                         sequence: 0,
                         payload: TransportEventPayload::ToolCall {
@@ -710,6 +886,7 @@ mod tests {
         assert!(matches!(
             TransportService::open(
                 &store.path,
+                "fixture-sse",
                 [CallerAdmission::new(
                     "epiphany-yggdrasil",
                     "rotated-connection-key",
@@ -818,7 +995,7 @@ mod tests {
                 32_768,
             )
             .unwrap();
-            TransportService::open(&store.path, [admission], 5_000)
+            TransportService::open(&store.path, "fixture-sse", [admission], 5_000)
                 .unwrap()
                 .begin(&envelope, 1_000, FRAME)
         };
@@ -887,7 +1064,15 @@ mod tests {
     fn restart_refuses_each_malformed_replay_record() {
         let control = TestStore::new();
         seed(&control.path, &seeded_key(), |_| {});
-        assert!(TransportService::open(&control.path, [caller(CALLER, KEY, 1)], 5_000).is_ok());
+        assert!(
+            TransportService::open(
+                &control.path,
+                "fixture-sse",
+                [caller(CALLER, KEY, 1)],
+                5_000
+            )
+            .is_ok()
+        );
 
         type Edit = fn(&mut ReplayRecord);
         let cases: [(&str, Edit); 3] = [
@@ -905,7 +1090,12 @@ mod tests {
             seed(&store.path, &key, edit);
             assert!(
                 matches!(
-                    TransportService::open(&store.path, [caller(CALLER, KEY, 1)], 5_000),
+                    TransportService::open(
+                        &store.path,
+                        "fixture-sse",
+                        [caller(CALLER, KEY, 1)],
+                        5_000
+                    ),
                     Err(ServiceError::InvalidReplayRecord)
                 ),
                 "{name}"
@@ -921,16 +1111,7 @@ mod tests {
         let TransportAdmission::Execute(claim) = admission else {
             panic!("first invocation must execute");
         };
-        let result = TransportResult::transported(
-            claim.invocation(),
-            vec![TransportEvent {
-                sequence: 0,
-                payload: TransportEventPayload::TextDelta {
-                    text: "done".to_string(),
-                },
-            }],
-            receipt(claim.invocation()),
-        );
+        let result = text_result(claim.call(), "done");
 
         let mut forged = (*claim).clone();
         forged.invocation_sha256 = [1; 32];
@@ -1071,22 +1252,15 @@ mod tests {
         }
     }
 
-    fn text_result(
-        invocation: &TransportInvocation,
-        text: &str,
-        transport: &str,
-    ) -> TransportResult {
-        let mut receipt = receipt(invocation);
-        receipt.provider = transport.to_string();
-        TransportResult::transported(
-            invocation,
+    fn text_result(call: &ProviderCall, text: &str) -> TransportResult {
+        call.transported(
             vec![TransportEvent {
                 sequence: 0,
                 payload: TransportEventPayload::TextDelta {
                     text: text.to_string(),
                 },
             }],
-            receipt,
+            receipt(&invocation_for(CALLER, "outcome")).outcome,
         )
     }
 
@@ -1095,7 +1269,7 @@ mod tests {
         let store = TestStore::new();
         let mut service = open_service(&store, 8);
         let (claim, invocation) = claim_for(&mut service, "stand-in");
-        let big = text_result(&invocation, &"y".repeat(4000), &"t".repeat(5000));
+        let big = text_result(claim.call(), &"y".repeat(4000));
         let response = service.complete(*claim, big, 2000).unwrap();
         assert!(encode_result_frame(&response).unwrap().len() <= 2000);
         let stand_in = decrypt_result(&response, &security(KEY), &invocation).unwrap();
@@ -1107,6 +1281,7 @@ mod tests {
                 &invocation.request.model,
                 invocation.native_request_sha256,
                 invocation.provider_request_sha256,
+                0,
             )
         );
         let TransportDisposition::Transported { receipt, .. } = &stand_in.disposition else {
@@ -1129,7 +1304,7 @@ mod tests {
         let store = TestStore::new();
         let mut service = open_service(&store, 8);
         let (claim, invocation) = claim_for(&mut service, "fits");
-        let small = text_result(&invocation, "done", "fixture-sse");
+        let small = text_result(claim.call(), "done");
         let response = service.complete(*claim, small.clone(), 1 << 20).unwrap();
         assert_eq!(
             decrypt_result(&response, &security(KEY), &invocation).unwrap(),
@@ -1142,7 +1317,7 @@ mod tests {
         let store = TestStore::new();
         let mut service = open_service(&store, 1);
         let (claim, invocation) = claim_for(&mut service, "wedge");
-        let big = text_result(&invocation, "y", "fixture-sse");
+        let big = text_result(claim.call(), "y");
         assert_eq!(
             service.complete(*claim, big, 10).unwrap_err(),
             ServiceError::FrameBound
@@ -1169,7 +1344,7 @@ mod tests {
         let store = TestStore::new();
         let mut service = open_service(&store, 8);
         let (claim, invocation) = claim_for(&mut service, "restart");
-        let big = text_result(&invocation, &"y".repeat(4000), "fixture-sse");
+        let big = text_result(claim.call(), &"y".repeat(4000));
         let recorded = service.complete(*claim, big, FRAME).unwrap();
         assert!(encode_result_frame(&recorded).unwrap().len() > 2000);
         drop(service);
@@ -1200,6 +1375,7 @@ mod tests {
                 &invocation.request.model,
                 invocation.native_request_sha256,
                 invocation.provider_request_sha256,
+                0,
             )
         );
         // The stand-in is what is recorded now, byte for byte, at any frame.
@@ -1217,7 +1393,7 @@ mod tests {
         let store = TestStore::new();
         let mut service = open_service(&store, 8);
         let (claim, invocation) = claim_for(&mut service, "no-room");
-        let big = text_result(&invocation, "y", "fixture-sse");
+        let big = text_result(claim.call(), "y");
         service.complete(*claim, big, FRAME).unwrap();
         assert_eq!(
             service.begin(&raw_envelope(&invocation), 1_000, 10).err(),
@@ -1230,7 +1406,7 @@ mod tests {
         let store = TestStore::new();
         let mut service = open_service(&store, 8);
         let (claim, invocation) = claim_for(&mut service, "nothing-fits");
-        let big = text_result(&invocation, "y", "fixture-sse");
+        let big = text_result(claim.call(), "y");
         assert_eq!(
             service.complete(*claim, big, 10).unwrap_err(),
             ServiceError::FrameBound
@@ -1270,5 +1446,325 @@ mod tests {
         ] {
             assert_eq!(contract_refusal(&other), Refusal::Malformed, "{other:?}");
         }
+    }
+
+    fn user(text: &str) -> InputItem {
+        InputItem::UserText {
+            text: text.to_string(),
+        }
+    }
+
+    fn state(provider: &str, model: &str, byte: u8) -> InputItem {
+        InputItem::ReasoningState {
+            provider: provider.to_string(),
+            model: model.to_string(),
+            state: vec![byte],
+        }
+    }
+
+    fn admit_input(
+        service: &mut TransportService,
+        request_id: &str,
+        input: Vec<InputItem>,
+    ) -> (TransportAdmission, TransportInvocation) {
+        run(service, request_id, |request| request.input = input)
+    }
+
+    #[test]
+    fn foreign_reasoning_in_flight_is_refused_and_never_executed() {
+        let store = TestStore::new();
+        let mut service = open_service(&store, 1);
+        let (admission, invocation) = admit_input(
+            &mut service,
+            "in-flight",
+            vec![
+                user("question"),
+                state("fixture-sse", "gpt-5.4", 1),
+                state("other-provider", "x", 2),
+                InputItem::ToolResult {
+                    call_id: "call-1".to_string(),
+                    output: "evidence".to_string(),
+                },
+            ],
+        );
+        assert_eq!(
+            refusal_of(admission, &invocation),
+            Refusal::ForeignReasoningState
+        );
+        // Nothing was recorded or held: the caller's one slot is free and the
+        // same request id is not a replay.
+        let (admission, _) = admit_input(&mut service, "in-flight", vec![user("question")]);
+        assert!(matches!(admission, TransportAdmission::Execute(_)));
+    }
+
+    #[test]
+    fn foreign_reasoning_with_no_user_text_is_in_flight() {
+        let store = TestStore::new();
+        let mut service = open_service(&store, 4);
+        let (admission, invocation) = admit_input(
+            &mut service,
+            "no-user-text",
+            vec![
+                state("other-provider", "x", 2),
+                InputItem::AssistantText {
+                    text: "earlier".to_string(),
+                },
+            ],
+        );
+        assert_eq!(
+            refusal_of(admission, &invocation),
+            Refusal::ForeignReasoningState
+        );
+        // The boundary is the position after the last user text: a foreign item
+        // directly after it is in flight too.
+        let (admission, invocation) = admit_input(
+            &mut service,
+            "just-after",
+            vec![user("a"), state("other-provider", "x", 2)],
+        );
+        assert_eq!(
+            refusal_of(admission, &invocation),
+            Refusal::ForeignReasoningState
+        );
+    }
+
+    #[test]
+    fn foreign_reasoning_in_completed_turns_is_dropped_and_counted() {
+        let store = TestStore::new();
+        let mut service = open_service(&store, 4);
+        let own = state("fixture-sse", "gpt-5.4", 3);
+        let tool_call = InputItem::ToolCall {
+            call_id: "call-1".to_string(),
+            name: "read_source".to_string(),
+            arguments: "{}".to_string(),
+        };
+        let (admission, invocation) = admit_input(
+            &mut service,
+            "completed-turns",
+            vec![
+                state("other-provider", "x", 1),
+                user("first"),
+                own.clone(),
+                state("third-provider", "y", 2),
+                tool_call.clone(),
+                user("second"),
+                tool_call.clone(),
+                own.clone(),
+            ],
+        );
+        let TransportAdmission::Execute(claim) = admission else {
+            panic!("foreign state in completed turns must not stop the request");
+        };
+        assert_eq!(
+            claim.call().request().input,
+            vec![
+                user("first"),
+                own.clone(),
+                tool_call.clone(),
+                user("second"),
+                tool_call,
+                own,
+            ]
+        );
+        assert_eq!(claim.call().foreign_reasoning_dropped(), 2);
+        // The caller's digest binds what the caller sent, not the filtered view,
+        // and the completion below is accepted against it.
+        assert_ne!(
+            invocation.provider_request_sha256,
+            provider_request_sha256(claim.call().request()).unwrap()
+        );
+        let result = text_result(claim.call(), "done");
+        let response = service.complete(*claim, result, FRAME).unwrap();
+        let TransportDisposition::Transported { receipt, .. } =
+            decrypt_result(&response, &security(KEY), &invocation)
+                .unwrap()
+                .disposition
+        else {
+            panic!("completed");
+        };
+        assert_eq!(receipt.foreign_reasoning_dropped, 2);
+    }
+
+    #[test]
+    fn same_provider_other_model_reasoning_passes_through() {
+        let store = TestStore::new();
+        let mut service = open_service(&store, 4);
+        let other_model = state("fixture-sse", "some-other-model", 9);
+        let (admission, _) = admit_input(
+            &mut service,
+            "other-model",
+            vec![other_model.clone(), user("first"), other_model.clone()],
+        );
+        let TransportAdmission::Execute(claim) = admission else {
+            panic!("an own-provider item is never foreign");
+        };
+        assert_eq!(
+            claim.call().request().input,
+            vec![other_model.clone(), user("first"), other_model]
+        );
+        assert_eq!(claim.call().foreign_reasoning_dropped(), 0);
+    }
+
+    #[test]
+    fn open_refuses_a_blank_or_stand_in_provider_tag() {
+        let store = TestStore::new();
+        for tag in ["", " ", STAND_IN_PROVIDER] {
+            assert!(
+                matches!(
+                    TransportService::open(&store.path, tag, [caller(CALLER, KEY, 1)], 5_000),
+                    Err(ServiceError::InvalidAdmission)
+                ),
+                "{tag:?}"
+            );
+        }
+        assert!(
+            TransportService::open(&store.path, "fixture-sse", [caller(CALLER, KEY, 1)], 5_000)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn complete_answers_a_hand_built_receipt_with_another_provider_or_count_as_a_typed_failure() {
+        let store = TestStore::new();
+        let mut service = open_service(&store, 1);
+        let input = vec![state("other-provider", "x", 1), user("first")];
+        let tamper_edits: [fn(&mut TransportReceipt); 4] = [
+            |receipt| receipt.provider = "other-provider".to_string(),
+            |receipt| receipt.provider = STAND_IN_PROVIDER.to_string(),
+            |receipt| receipt.foreign_reasoning_dropped = 2,
+            |receipt| receipt.foreign_reasoning_dropped = 0,
+        ];
+        for (index, edit) in tamper_edits.into_iter().enumerate() {
+            let id = format!("hand-built-{index}");
+            let (admission, invocation) = admit_input(&mut service, &id, input.clone());
+            let TransportAdmission::Execute(claim) = admission else {
+                panic!("a refused completion must have released the slot");
+            };
+            assert_eq!(claim.call().foreign_reasoning_dropped(), 1);
+            let mut bad = text_result(claim.call(), "done");
+            let TransportDisposition::Transported { receipt, .. } = &mut bad.disposition else {
+                unreachable!();
+            };
+            edit(receipt);
+            let response = service.complete(*claim, bad, FRAME).unwrap();
+            let answer = decrypt_result(&response, &security(KEY), &invocation).unwrap();
+            let TransportDisposition::Transported { events, receipt } = &answer.disposition else {
+                panic!("a typed failure is transported");
+            };
+            assert!(events.is_empty());
+            assert_eq!(receipt.provider, STAND_IN_PROVIDER);
+            assert_eq!(receipt.foreign_reasoning_dropped, 1);
+            assert!(matches!(
+                receipt.outcome,
+                TransportOutcome::Failed {
+                    kind: FailureKind::Provider,
+                    ..
+                }
+            ));
+            // A retry of the same id replays the failure, not ReplayConflict.
+            let TransportAdmission::Reply(replay) = service
+                .begin(&raw_envelope(&invocation), 1_000, FRAME)
+                .unwrap()
+            else {
+                panic!("a retry must replay the recorded failure");
+            };
+            assert_eq!(replay, response);
+        }
+    }
+
+    #[test]
+    fn a_result_that_fails_validation_is_answered_as_a_typed_failure_and_releases_the_slot() {
+        let store = TestStore::new();
+        let mut service = open_service(&store, 1);
+        let (claim, invocation) = claim_for(&mut service, "invalid-result");
+        let mut bad = text_result(claim.call(), "done");
+        bad.request_id = "someone-elses".to_string();
+        let response = service.complete(*claim, bad, FRAME).unwrap();
+        let answer = decrypt_result(&response, &security(KEY), &invocation).unwrap();
+        let TransportDisposition::Transported { receipt, .. } = &answer.disposition else {
+            panic!("a typed failure is transported");
+        };
+        assert!(matches!(
+            receipt.outcome,
+            TransportOutcome::Failed {
+                kind: FailureKind::Provider,
+                ..
+            }
+        ));
+        // The caller's only slot is free for the next request.
+        let (next, _) = claim_for(&mut service, "next");
+        drop(next);
+    }
+
+    #[test]
+    fn a_provider_call_formats_without_foreign_reasoning_state() {
+        let store = TestStore::new();
+        let mut service = open_service(&store, 1);
+        let canary = "canary-foreign-provider-tag";
+        let foreign = InputItem::ReasoningState {
+            provider: canary.to_string(),
+            model: canary.to_string(),
+            state: vec![0xC7, 0xC8, 0xC9, 0xCA],
+        };
+        let (admission, _) = admit_input(&mut service, "debug-leak", vec![foreign, user("first")]);
+        let TransportAdmission::Execute(claim) = admission else {
+            panic!("expected an execution claim");
+        };
+        assert_eq!(claim.call().foreign_reasoning_dropped(), 1);
+        for text in [
+            format!("{:?}", claim.call()),
+            format!("{:#?}", claim.call()),
+        ] {
+            assert!(!text.contains(canary), "{text}");
+            assert!(!text.contains("199, 200, 201, 202"), "{text}");
+        }
+    }
+
+    #[test]
+    fn stand_in_carries_the_drop_count() {
+        let store = TestStore::new();
+        let mut service = open_service(&store, 4);
+        let input = vec![state("other-provider", "x", 1), user("first")];
+        let (admission, invocation) = admit_input(&mut service, "stand-in-count", input.clone());
+        let TransportAdmission::Execute(claim) = admission else {
+            panic!("expected an execution claim");
+        };
+        let big = text_result(claim.call(), &"y".repeat(4000));
+        let response = service.complete(*claim, big, 2000).unwrap();
+        let expected = result_size_failure(
+            CALLER,
+            "stand-in-count",
+            &invocation.request.model,
+            invocation.native_request_sha256,
+            invocation.provider_request_sha256,
+            1,
+        );
+        assert_eq!(
+            decrypt_result(&response, &security(KEY), &invocation).unwrap(),
+            expected
+        );
+
+        // A recorded wide result replayed at a smaller frame keeps the count too.
+        let (admission, invocation) = admit_input(&mut service, "replay-count", input);
+        let TransportAdmission::Execute(claim) = admission else {
+            panic!("expected an execution claim");
+        };
+        let big = text_result(claim.call(), &"y".repeat(4000));
+        service.complete(*claim, big, FRAME).unwrap();
+        let TransportAdmission::Reply(smaller) = service
+            .begin(&raw_envelope(&invocation), 1_000, 2000)
+            .unwrap()
+        else {
+            panic!("expected a replay");
+        };
+        let TransportDisposition::Transported { receipt, .. } =
+            decrypt_result(&smaller, &security(KEY), &invocation)
+                .unwrap()
+                .disposition
+        else {
+            panic!("expected the stand-in");
+        };
+        assert_eq!(receipt.provider, STAND_IN_PROVIDER);
+        assert_eq!(receipt.foreign_reasoning_dropped, 1);
     }
 }

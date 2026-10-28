@@ -6,6 +6,12 @@
     "caller_runtime_id": {
       "type": "string"
     },
+    "foreign_reasoning_dropped": {
+      "description": "How many foreign `ReasoningState` items the service removed from the\nrequest before the backend saw it.",
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
     "model": {
       "type": "string"
     },
@@ -53,6 +59,7 @@
     "provider_request_sha256",
     "model",
     "provider",
+    "foreign_reasoning_dropped",
     "outcome"
   ],
   "$defs": {

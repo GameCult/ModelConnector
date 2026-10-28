@@ -69,6 +69,7 @@ pub(crate) fn receipt(invocation: &TransportInvocation) -> TransportReceipt {
         provider_request_sha256: invocation.provider_request_sha256,
         model: invocation.request.model.clone(),
         provider: "fixture-sse".to_string(),
+        foreign_reasoning_dropped: 0,
         outcome: TransportOutcome::Completed {
             provider_response_id: Some("response-1".to_string()),
             stop_reason: StopReason::EndTurn,
@@ -104,6 +105,7 @@ pub(crate) fn caller(
 pub(crate) fn open_service(store: &TestStore, max_concurrent_requests: usize) -> TransportService {
     TransportService::open(
         &store.path,
+        "fixture-sse",
         [
             caller(
                 "epiphany-yggdrasil",

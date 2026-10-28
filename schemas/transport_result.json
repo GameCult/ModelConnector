@@ -50,7 +50,8 @@
         "InFlight",
         "Indeterminate",
         "ReplayConflict",
-        "Malformed"
+        "Malformed",
+        "ForeignReasoningState"
       ]
     },
     "StopReason": {
@@ -178,6 +179,30 @@
           "required": [
             "ToolCall"
           ]
+        },
+        {
+          "description": "One reasoning block of the provider that answered. It carries no\nprovider or model: the receipt names them, so a backend cannot tag its\nown state.",
+          "type": "object",
+          "properties": {
+            "ReasoningState": {
+              "type": "object",
+              "properties": {
+                "state": {
+                  "description": "MessagePack bin: raw bytes, never an array of integers",
+                  "type": "string",
+                  "format": "binary"
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "state"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "ReasoningState"
+          ]
         }
       ]
     },
@@ -247,6 +272,12 @@
         "caller_runtime_id": {
           "type": "string"
         },
+        "foreign_reasoning_dropped": {
+          "description": "How many foreign `ReasoningState` items the service removed from the\nrequest before the backend saw it.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
         "model": {
           "type": "string"
         },
@@ -294,6 +325,7 @@
         "provider_request_sha256",
         "model",
         "provider",
+        "foreign_reasoning_dropped",
         "outcome"
       ]
     },
