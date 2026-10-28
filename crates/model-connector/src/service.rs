@@ -3201,7 +3201,7 @@ mod tests {
     fn run_window(service: &mut TransportService, prefix: &str, now: u64) -> u32 {
         let mut admitted = 0;
         for i in 0..20u64 {
-            let (admission, _) = begin_at(service, &format!("{prefix}-{i:02}"), now + i, MAX_COST);
+            let (admission, _) = begin_at(service, &format!("{prefix}-{i:02}"), now, MAX_COST);
             let TransportAdmission::Execute(claim) = admission else {
                 break;
             };
@@ -3317,6 +3317,28 @@ mod tests {
             cache_write_long: xorshift(state) % 50_000_000,
             cache_read: xorshift(state) % 50_000_000,
             output: xorshift(state) % 200_000_000,
+        }
+    }
+
+    #[test]
+    fn the_property_test_generator_is_xorshift64_within_the_rate_bounds() {
+        let mut s = 0x9E37_79B9_7F4A_7C15u64;
+        let first: Vec<u64> = (0..3).map(|_| xorshift(&mut s)).collect();
+        assert_eq!(
+            first,
+            [0xdc1b77ae0bf34dad, 0x64f0eeb9026e6076, 0x7b07ce91e5906136]
+        );
+        for _ in 0..200 {
+            let rates = random_rates(&mut s);
+            for (rate, bound) in [
+                (rates.input, 50_000_000),
+                (rates.cache_write_short, 50_000_000),
+                (rates.cache_write_long, 50_000_000),
+                (rates.cache_read, 50_000_000),
+                (rates.output, 200_000_000),
+            ] {
+                assert!(rate < bound);
+            }
         }
     }
 
