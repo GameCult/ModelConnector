@@ -435,17 +435,27 @@ impl TransportService {
         let mut response = if admissible {
             encrypt_result(&result, &security)?
         } else {
-            self.seal_stand_in(invocation, &security, max_frame_bytes, FailureKind::Provider)
-                .inspect_err(|_| {
-                    self.live.remove(&identity);
-                })?
+            self.seal_stand_in(
+                invocation,
+                &security,
+                max_frame_bytes,
+                FailureKind::Provider,
+            )
+            .inspect_err(|_| {
+                self.live.remove(&identity);
+            })?
         };
         if admissible && !fits_frame(&response, max_frame_bytes)? {
             // Nothing is recorded when even the stand-in cannot be carried,
             // but the caller's slot is not held by a request that can no
             // longer finish.
             response = self
-                .seal_stand_in(invocation, &security, max_frame_bytes, FailureKind::ResultSize)
+                .seal_stand_in(
+                    invocation,
+                    &security,
+                    max_frame_bytes,
+                    FailureKind::ResultSize,
+                )
                 .inspect_err(|_| {
                     self.live.remove(&identity);
                 })?;
@@ -1701,7 +1711,10 @@ mod tests {
             panic!("expected an execution claim");
         };
         assert_eq!(claim.call().foreign_reasoning_dropped(), 1);
-        for text in [format!("{:?}", claim.call()), format!("{:#?}", claim.call())] {
+        for text in [
+            format!("{:?}", claim.call()),
+            format!("{:#?}", claim.call()),
+        ] {
             assert!(!text.contains(canary), "{text}");
             assert!(!text.contains("199, 200, 201, 202"), "{text}");
         }
