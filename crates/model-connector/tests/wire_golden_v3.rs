@@ -96,6 +96,7 @@ fn receipt(outcome: TransportOutcome) -> TransportReceipt {
         provider: "anthropic-messages".to_string(),
         foreign_reasoning_dropped: 2,
         cost_micro_usd: 1_234_567,
+        overrun_micro_usd: 89,
         outcome,
     }
 }

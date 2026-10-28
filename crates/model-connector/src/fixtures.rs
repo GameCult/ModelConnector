@@ -50,7 +50,7 @@ impl Drop for TestStore {
 #[cfg(feature = "daemon")]
 pub(crate) struct FlakyStore {
     held: Arc<Mutex<BTreeMap<String, CultCacheEnvelope>>>,
-    pushes_allowed: AtomicUsize,
+    pushes_allowed: Arc<AtomicUsize>,
 }
 
 #[cfg(feature = "daemon")]
@@ -58,15 +58,21 @@ impl FlakyStore {
     pub(crate) fn new(pushes_allowed: usize) -> Self {
         Self {
             held: Arc::default(),
-            pushes_allowed: AtomicUsize::new(pushes_allowed),
+            pushes_allowed: Arc::new(AtomicUsize::new(pushes_allowed)),
         }
+    }
+
+    /// The remaining writes this store accepts, shared with it after it has
+    /// been handed to a service.
+    pub(crate) fn allowance(&self) -> Arc<AtomicUsize> {
+        self.pushes_allowed.clone()
     }
 
     /// A store over the same records that accepts `pushes_allowed` more writes.
     pub(crate) fn reopened(&self, pushes_allowed: usize) -> Self {
         Self {
             held: self.held.clone(),
-            pushes_allowed: AtomicUsize::new(pushes_allowed),
+            pushes_allowed: Arc::new(AtomicUsize::new(pushes_allowed)),
         }
     }
 }
@@ -150,6 +156,7 @@ pub(crate) fn receipt(invocation: &TransportInvocation) -> TransportReceipt {
         provider: "fixture-sse".to_string(),
         foreign_reasoning_dropped: 0,
         cost_micro_usd: FIXTURE_USAGE_COST,
+        overrun_micro_usd: 0,
         outcome: TransportOutcome::Completed {
             provider_response_id: Some("response-1".to_string()),
             stop_reason: StopReason::EndTurn,
@@ -205,8 +212,8 @@ pub(crate) fn caller(
         max_concurrent_requests,
         64 * 1024,
         32_768,
-        CEILING,
-        WINDOW_MS,
+        SpendCeiling(CEILING),
+        SpendWindowMs(WINDOW_MS),
     )
     .unwrap()
 }

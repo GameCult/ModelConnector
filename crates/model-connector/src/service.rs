@@ -17,6 +17,34 @@ use crate::envelope::{
     encode_result_frame, encrypt_result, validate_envelope,
 };
 
+/// What a caller may spend in one window, in micro-USD. A distinct type from
+/// [`SpendWindowMs`] so the pair cannot be passed swapped:
+///
+/// ```
+/// use model_connector::{CallerAdmission, SpendCeiling, SpendWindowMs};
+/// CallerAdmission::new(
+///     "caller-1", "a-connection-key", 1, ["model-1".to_string()], 1, 1, 1,
+///     SpendCeiling(50_000_000), SpendWindowMs(3_600_000),
+/// )
+/// .unwrap();
+/// ```
+///
+/// ```compile_fail
+/// use model_connector::{CallerAdmission, SpendCeiling, SpendWindowMs};
+/// CallerAdmission::new(
+///     "caller-1", "a-connection-key", 1, ["model-1".to_string()], 1, 1, 1,
+///     SpendWindowMs(3_600_000), SpendCeiling(50_000_000),
+/// )
+/// .unwrap();
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpendCeiling(pub u64);
+
+/// How long a spend window lasts, in milliseconds. Windows are fixed and
+/// aligned to the unix epoch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpendWindowMs(pub u64);
+
 pub struct CallerAdmission {
     caller_runtime_id: String,
     connection_key_epoch: u32,
@@ -41,9 +69,10 @@ impl CallerAdmission {
         max_concurrent_requests: usize,
         max_payload_bytes: usize,
         max_output_tokens: u32,
-        spend_ceiling_micro_usd: u64,
-        spend_window_ms: u64,
+        spend_ceiling: SpendCeiling,
+        spend_window: SpendWindowMs,
     ) -> Result<Self, ServiceError> {
+        let (spend_ceiling_micro_usd, spend_window_ms) = (spend_ceiling.0, spend_window.0);
         let caller_runtime_id = caller_runtime_id.into();
         require_id(&caller_runtime_id, "caller_runtime_id")?;
         let allowed_models = allowed_models.into_iter().collect::<HashSet<_>>();
@@ -122,10 +151,28 @@ pub type PriceTable = BTreeMap<String, ModelPrice>;
 
 const TOKENS_PER_RATE: u128 = 1_000_000;
 
-fn ceil_micro_usd(rate_weighted_tokens: u128) -> u64 {
+/// Rounds up to whole micro-USD; `None` when the amount does not fit a u64.
+fn checked_ceil_micro_usd(rate_weighted_tokens: u128) -> Option<u64> {
     let whole = rate_weighted_tokens / TOKENS_PER_RATE;
     let rounded = whole + u128::from(!rate_weighted_tokens.is_multiple_of(TOKENS_PER_RATE));
-    u64::try_from(rounded).unwrap_or(u64::MAX)
+    u64::try_from(rounded).ok()
+}
+
+fn ceil_micro_usd(rate_weighted_tokens: u128) -> u64 {
+    checked_ceil_micro_usd(rate_weighted_tokens).unwrap_or(u64::MAX)
+}
+
+impl Rates {
+    /// The dearer of each class.
+    fn dearest(self, other: Rates) -> Rates {
+        Rates {
+            input: self.input.max(other.input),
+            cache_write_short: self.cache_write_short.max(other.cache_write_short),
+            cache_write_long: self.cache_write_long.max(other.cache_write_long),
+            cache_read: self.cache_read.max(other.cache_read),
+            output: self.output.max(other.output),
+        }
+    }
 }
 
 fn rates_for(price: &ModelPrice, prompt_tokens: u128) -> &Rates {
@@ -168,20 +215,29 @@ pub(crate) fn cost_micro_usd(
 /// The worst case `request` can cost, in micro-USD: its encoded length plus
 /// the model's overhead as input tokens (a token is at least one byte) at the
 /// dearest input rate the cache retention allows, plus `max_output_tokens` at
-/// the output rate, rounded up once.
+/// the output rate, rounded up once. A prompt that may cross the long-context
+/// threshold is bounded at the dearer of the two rate sets, so a backend whose
+/// usage prices above this broke its contract. `None` when the worst case does
+/// not fit a u64: such a request can never be afforded.
 pub(crate) fn reservation_micro_usd(
     price: &ModelPrice,
     request: &ProviderRequest,
-) -> Result<u64, ContractError> {
+) -> Result<Option<u64>, ContractError> {
     let bound = (wire_encode(request)?.len() as u128) + u128::from(price.overhead_tokens);
-    let rates = rates_for(price, bound);
+    let rates = match &price.long_context {
+        Some(long) if bound > u128::from(long.above_prompt_tokens) => {
+            price.rates.dearest(long.rates)
+        }
+        _ => price.rates,
+    };
     let input_rate = rates
         .input
         .max(rates.cache_read)
-        .max(write_rate(rates, request.cache_retention));
-    let total = (bound * u128::from(input_rate))
-        .saturating_add(u128::from(request.max_output_tokens) * u128::from(rates.output));
-    Ok(ceil_micro_usd(total))
+        .max(write_rate(&rates, request.cache_retention));
+    let total = bound.checked_mul(u128::from(input_rate)).and_then(|input| {
+        input.checked_add(u128::from(request.max_output_tokens) * u128::from(rates.output))
+    });
+    Ok(total.and_then(checked_ceil_micro_usd))
 }
 
 /// Moves `held` of a caller's window: releases `release`, then adds `charge`.
@@ -200,6 +256,41 @@ fn add_spend(
     *held = held.saturating_sub(release).saturating_add(charge);
 }
 
+/// Drops the windows of `caller_runtime_id` that nothing can still read:
+/// those before `floor` that hold no live request's reservation. Admission
+/// reads the current window alone, and a live request settles into the window
+/// it was admitted in, so nothing older is kept.
+fn prune_windows(
+    window_spend: &mut HashMap<String, BTreeMap<u64, u64>>,
+    live: &HashMap<RequestIdentity, u64>,
+    caller_runtime_id: &str,
+    floor: u64,
+) {
+    if let Some(windows) = window_spend.get_mut(caller_runtime_id) {
+        windows.retain(|window, _| {
+            *window >= floor
+                || live.iter().any(|(identity, live_window)| {
+                    live_window == window && identity.caller_runtime_id == caller_runtime_id
+                })
+        });
+    }
+}
+
+/// `prune_windows` with the caller's newest window as the floor, for the
+/// places that do not know the clock (open, settle).
+fn prune_to_latest(
+    window_spend: &mut HashMap<String, BTreeMap<u64, u64>>,
+    live: &HashMap<RequestIdentity, u64>,
+    caller_runtime_id: &str,
+) {
+    let latest = window_spend
+        .get(caller_runtime_id)
+        .and_then(|windows| windows.keys().next_back().copied());
+    if let Some(latest) = latest {
+        prune_windows(window_spend, live, caller_runtime_id, latest);
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct RequestIdentity {
     caller_runtime_id: String,
@@ -212,9 +303,12 @@ enum ReplayState {
     /// caller's window until the request settles (an indeterminate one is
     /// billed at it).
     Active { reserved_micro_usd: u64 },
+    /// `overrun_micro_usd` is what the charge exceeded the reservation by: a
+    /// backend contract breach, kept so a replayed stand-in still says so.
     Completed {
         response: TransportEnvelope,
         charged_micro_usd: u64,
+        overrun_micro_usd: u64,
     },
 }
 
@@ -270,14 +364,22 @@ impl ProviderCall {
         events: Vec<TransportEvent>,
         outcome: TransportOutcome,
     ) -> TransportResult {
-        TransportResult::transported(
-            events,
+        TransportResult::transported(events, {
+            let cost_micro_usd = self.cost_of(&outcome);
             TransportReceipt {
-                cost_micro_usd: self.cost_of(&outcome),
+                cost_micro_usd,
+                overrun_micro_usd: self.overrun_of(cost_micro_usd),
                 outcome,
                 ..self.receipt.clone()
-            },
-        )
+            }
+        })
+    }
+
+    /// How far `cost_micro_usd` exceeds what was reserved. The reservation is
+    /// the worst case the kit can compute, so a nonzero overrun means the
+    /// backend broke its contract (usage above its own request's bounds).
+    fn overrun_of(&self, cost_micro_usd: u64) -> u64 {
+        cost_micro_usd.saturating_sub(self.reserved_micro_usd)
     }
 
     /// What `outcome` costs: its usage priced, or the whole reservation when a
@@ -314,7 +416,9 @@ pub enum TransportAdmission {
 
 pub struct TransportService {
     callers: HashMap<String, CallerAdmission>,
-    live: HashSet<RequestIdentity>,
+    /// The requests between claim and settlement, each with the window it was
+    /// admitted in.
+    live: HashMap<RequestIdentity, u64>,
     replay_store: CultCache,
     max_expiry_skew_ms: u64,
     provider: String,
@@ -323,7 +427,9 @@ pub struct TransportService {
     /// Active records and the charges of its Completed ones. A cache of the
     /// replay records, re-derived at open and moved only after a record's put
     /// returns Ok; the records are the ledger. A request belongs to the window
-    /// it was admitted in, so settlement never moves it to another.
+    /// it was admitted in, so settlement never moves it to another. Only what
+    /// admission and settlement can still read is kept: the caller's newest
+    /// window and any older one a live request is reserved in.
     window_spend: HashMap<String, BTreeMap<u64, u64>>,
 }
 
@@ -434,9 +540,14 @@ impl TransportService {
                 held,
             );
         }
+        let live = HashMap::new();
+        let spenders: Vec<String> = window_spend.keys().cloned().collect();
+        for caller_runtime_id in &spenders {
+            prune_to_latest(&mut window_spend, &live, caller_runtime_id);
+        }
         Ok(Self {
             callers,
-            live: HashSet::new(),
+            live,
             replay_store,
             max_expiry_skew_ms,
             provider: provider.to_string(),
@@ -506,17 +617,6 @@ impl TransportService {
                 Ok(partition) => partition,
                 Err(refusal) => return self.reply_refusal(&invocation, refusal, &security),
             };
-        // The worst case is decided by the invocation alone, so it is refused
-        // before the replay lookup, like every other refusal of this kind.
-        let price = *self
-            .prices
-            .get(&invocation.request.model)
-            .ok_or_else(|| ServiceError::UnpricedModel(invocation.request.model.clone()))?;
-        let reserved_micro_usd = reservation_micro_usd(&price, &request)?;
-        if reserved_micro_usd > invocation.max_cost_micro_usd {
-            return self.reply_refusal(&invocation, Refusal::CostBound, &security);
-        }
-
         let identity = RequestIdentity {
             caller_runtime_id: invocation.caller_runtime_id.clone(),
             request_id: invocation.request_id().to_string(),
@@ -535,6 +635,7 @@ impl TransportService {
                 ReplayState::Completed {
                     response,
                     charged_micro_usd,
+                    overrun_micro_usd,
                 } => {
                     if fits_frame(response, max_frame_bytes)? {
                         return Ok(TransportAdmission::Reply(response.clone()));
@@ -546,7 +647,10 @@ impl TransportService {
                         &security,
                         max_frame_bytes,
                         FailureKind::ResultSize,
-                        *charged_micro_usd,
+                        Charge {
+                            cost_micro_usd: *charged_micro_usd,
+                            overrun_micro_usd: *overrun_micro_usd,
+                        },
                     )?;
                     self.replay_store
                         .put(
@@ -555,6 +659,7 @@ impl TransportService {
                                 state: ReplayState::Completed {
                                     response: stand_in.clone(),
                                     charged_micro_usd: *charged_micro_usd,
+                                    overrun_micro_usd: *overrun_micro_usd,
                                 },
                                 ..record.clone()
                             },
@@ -563,7 +668,7 @@ impl TransportService {
                     Ok(TransportAdmission::Reply(stand_in))
                 }
                 ReplayState::Active { .. } => {
-                    let refusal = if self.live.contains(&identity) {
+                    let refusal = if self.live.contains_key(&identity) {
                         Refusal::InFlight
                     } else {
                         Refusal::Indeterminate
@@ -572,9 +677,20 @@ impl TransportService {
                 }
             };
         }
+        // The worst case is priced at today's table, so it is checked only for
+        // new work: a request already recorded is answered whatever it would
+        // cost now.
+        let price = *self
+            .prices
+            .get(&invocation.request.model)
+            .ok_or_else(|| ServiceError::UnpricedModel(invocation.request.model.clone()))?;
+        let reserved_micro_usd = match reservation_micro_usd(&price, &request)? {
+            Some(reserved) if reserved <= invocation.max_cost_micro_usd => reserved,
+            _ => return self.reply_refusal(&invocation, Refusal::CostBound, &security),
+        };
         let active_for_caller = self
             .live
-            .iter()
+            .keys()
             .filter(|key| key.caller_runtime_id == invocation.caller_runtime_id)
             .count();
         if active_for_caller >= max_concurrent_requests {
@@ -584,6 +700,12 @@ impl TransportService {
         // checked after the replay lookup, so a recorded answer is replayed
         // whatever the caller has left.
         let window = now_unix_ms / spend_window_ms;
+        prune_windows(
+            &mut self.window_spend,
+            &self.live,
+            &identity.caller_runtime_id,
+            window,
+        );
         if self
             .window_spend(&identity.caller_runtime_id, window)
             .saturating_add(reserved_micro_usd)
@@ -613,7 +735,7 @@ impl TransportService {
             0,
             reserved_micro_usd,
         );
-        self.live.insert(identity);
+        self.live.insert(identity, window);
         Ok(TransportAdmission::Execute(Box::new(ExecutionClaim {
             call: ProviderCall {
                 receipt: TransportReceipt {
@@ -627,6 +749,7 @@ impl TransportService {
                     foreign_reasoning_dropped,
                     // Replaced by the backend's outcome in `transported`.
                     cost_micro_usd: 0,
+                    overrun_micro_usd: 0,
                     outcome: TransportOutcome::Failed {
                         kind: FailureKind::Provider,
                         message: String::new(),
@@ -658,7 +781,7 @@ impl TransportService {
             caller_runtime_id: invocation.caller_runtime_id.clone(),
             request_id: invocation.request_id().to_string(),
         };
-        if !self.live.contains(&identity) {
+        if !self.live.contains_key(&identity) {
             return Err(ServiceError::NoActiveRequest);
         }
         let active = self
@@ -688,21 +811,28 @@ impl TransportService {
         // An admissible result charges the cost its receipt carries (the real
         // cost, even when the answer is replaced by a stand-in that fits the
         // frame); a result the service refused charges the whole reservation.
-        let charged_micro_usd = match &result.disposition {
-            TransportDisposition::Transported { receipt, .. } if admissible => {
-                receipt.cost_micro_usd
-            }
-            _ => reserved_micro_usd,
+        let charge = match &result.disposition {
+            TransportDisposition::Transported { receipt, .. } if admissible => Charge {
+                cost_micro_usd: receipt.cost_micro_usd,
+                overrun_micro_usd: receipt.overrun_micro_usd,
+            },
+            _ => Charge {
+                cost_micro_usd: reserved_micro_usd,
+                overrun_micro_usd: 0,
+            },
         };
+        let charged_micro_usd = charge.cost_micro_usd;
         let mut response = if admissible {
-            encrypt_result(&result, &security)?
+            encrypt_result(&result, &security).inspect_err(|_| {
+                self.live.remove(&identity);
+            })?
         } else {
             self.seal_stand_in(
                 invocation,
                 &security,
                 max_frame_bytes,
                 FailureKind::Provider,
-                charged_micro_usd,
+                charge,
             )
             .inspect_err(|_| {
                 self.live.remove(&identity);
@@ -718,7 +848,7 @@ impl TransportService {
                     &security,
                     max_frame_bytes,
                     FailureKind::ResultSize,
-                    charged_micro_usd,
+                    charge,
                 )
                 .inspect_err(|_| {
                     self.live.remove(&identity);
@@ -733,12 +863,19 @@ impl TransportService {
             state: ReplayState::Completed {
                 response: response.clone(),
                 charged_micro_usd,
+                overrun_micro_usd: charge.overrun_micro_usd,
             },
             admitted_at_unix_ms: active.admitted_at_unix_ms,
         };
+        // A failed settle write frees the caller's slot and answers the typed
+        // store failure; the Active record stays, so the reservation stays
+        // counted and a retry is told the request is indeterminate.
         self.replay_store
             .put(replay_key(&identity), &replay_record)
-            .map_err(replay_store_error)?;
+            .map_err(replay_store_error)
+            .inspect_err(|_| {
+                self.live.remove(&identity);
+            })?;
         // Settled: the window the request was admitted in holds the charge in
         // place of the reservation. A failed put above leaves the reservation
         // counted, as the store does.
@@ -750,6 +887,11 @@ impl TransportService {
             charged_micro_usd,
         );
         self.live.remove(&identity);
+        prune_to_latest(
+            &mut self.window_spend,
+            &self.live,
+            &identity.caller_runtime_id,
+        );
         Ok(response)
     }
 
@@ -760,7 +902,7 @@ impl TransportService {
         security: &TransportKey,
         max_frame_bytes: usize,
         kind: FailureKind,
-        cost_micro_usd: u64,
+        charge: Charge,
     ) -> Result<TransportEnvelope, ServiceError> {
         let (_, foreign_reasoning_dropped) =
             partition_reasoning(&invocation.request, &self.provider)
@@ -774,7 +916,7 @@ impl TransportService {
                 invocation.provider_request_sha256,
                 foreign_reasoning_dropped,
                 kind,
-                cost_micro_usd,
+                charge,
             ),
             security,
         )?;
@@ -796,6 +938,7 @@ impl TransportService {
             && receipt.provider == self.provider
             && receipt.foreign_reasoning_dropped == claim.call.receipt.foreign_reasoning_dropped
             && receipt.cost_micro_usd == claim.call.cost_of(&receipt.outcome)
+            && receipt.overrun_micro_usd == claim.call.overrun_of(receipt.cost_micro_usd)
     }
 
     fn reply_refusal(
@@ -831,6 +974,10 @@ pub(crate) fn result_size_failure(
     foreign_reasoning_dropped: u32,
     cost_micro_usd: u64,
 ) -> TransportResult {
+    let charge = Charge {
+        cost_micro_usd,
+        overrun_micro_usd: 0,
+    };
     stand_in_failure(
         caller_runtime_id,
         request_id,
@@ -839,8 +986,15 @@ pub(crate) fn result_size_failure(
         provider_request_sha256,
         foreign_reasoning_dropped,
         FailureKind::ResultSize,
-        cost_micro_usd,
+        charge,
     )
+}
+
+/// What a request cost, and by how much that exceeded its reservation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Charge {
+    cost_micro_usd: u64,
+    overrun_micro_usd: u64,
 }
 
 /// The stand-in failure for `kind`: `ResultSize` for a result that cannot be
@@ -855,7 +1009,7 @@ fn stand_in_failure(
     provider_request_sha256: [u8; 32],
     foreign_reasoning_dropped: u32,
     kind: FailureKind,
-    cost_micro_usd: u64,
+    charge: Charge,
 ) -> TransportResult {
     let message = match kind {
         FailureKind::ResultSize => "provider result exceeded its byte bound",
@@ -876,7 +1030,8 @@ fn stand_in_failure(
                 model: model.to_string(),
                 provider: STAND_IN_PROVIDER.to_string(),
                 foreign_reasoning_dropped,
-                cost_micro_usd,
+                cost_micro_usd: charge.cost_micro_usd,
+                overrun_micro_usd: charge.overrun_micro_usd,
                 outcome: TransportOutcome::Failed {
                     kind,
                     message: message.to_string(),
@@ -1184,8 +1339,8 @@ mod tests {
                     1,
                     64 * 1024,
                     32_768,
-                    CEILING,
-                    WINDOW_MS,
+                    SpendCeiling(CEILING),
+                    SpendWindowMs(WINDOW_MS)
                 )
                 .unwrap()],
                 5_000,
@@ -1285,8 +1440,8 @@ mod tests {
                 4,
                 max_payload_bytes,
                 32_768,
-                CEILING,
-                WINDOW_MS,
+                SpendCeiling(CEILING),
+                SpendWindowMs(WINDOW_MS),
             )
             .unwrap();
             TransportService::open(
@@ -1440,6 +1595,7 @@ mod tests {
         record.state = ReplayState::Completed {
             response: encrypt_result(&result, &security(KEY)).unwrap(),
             charged_micro_usd: 0,
+            overrun_micro_usd: 0,
         };
         service.replay_store.put(key, &record).unwrap();
         assert_eq!(
@@ -1459,8 +1615,8 @@ mod tests {
                 4,
                 64 * 1024,
                 32_768,
-                CEILING,
-                WINDOW_MS,
+                SpendCeiling(CEILING),
+                SpendWindowMs(WINDOW_MS),
             )
         };
         let at = "i".repeat(MAX_IDENTITY_BYTES);
@@ -2199,8 +2355,8 @@ mod tests {
                 8,
                 65_536,
                 32_768,
-                ceiling,
-                window_ms,
+                SpendCeiling(ceiling),
+                SpendWindowMs(window_ms),
             )
             .unwrap()],
             5_000,
@@ -2326,11 +2482,15 @@ mod tests {
         let length = wire_encode(&request).unwrap().len() as u64;
         let bound = length + 7;
         assert_eq!(
-            reservation_micro_usd(&price(bound, 7), &request).unwrap(),
+            reservation_micro_usd(&price(bound, 7), &request)
+                .unwrap()
+                .unwrap(),
             expected_reservation(&request, &fixture_price().rates, 7)
         );
         assert_eq!(
-            reservation_micro_usd(&price(bound - 1, 7), &request).unwrap(),
+            reservation_micro_usd(&price(bound - 1, 7), &request)
+                .unwrap()
+                .unwrap(),
             expected_reservation(&request, &long, 7)
         );
     }
@@ -2394,7 +2554,7 @@ mod tests {
                 let mut request = request();
                 request.cache_retention = retention;
                 assert_eq!(
-                    reservation_micro_usd(&price, &request).unwrap(),
+                    reservation_micro_usd(&price, &request).unwrap().unwrap(),
                     expected_reservation(&request, &rates, overhead_tokens),
                     "{rates:?} {retention:?}"
                 );
@@ -2407,7 +2567,7 @@ mod tests {
         for max_output_tokens in [1, 1_000, 1_001_000] {
             let mut request = request();
             request.max_output_tokens = max_output_tokens;
-            let amount = reservation_micro_usd(&price, &request).unwrap();
+            let amount = reservation_micro_usd(&price, &request).unwrap().unwrap();
             assert_eq!(
                 amount,
                 expected_reservation(&request, &price.rates, 100),
@@ -2684,7 +2844,8 @@ mod tests {
         drop(service);
 
         let mut service = open_limited(&store, FIXTURE_USAGE_COST + 2 * reserved, window);
-        assert_eq!(service.window_spend(CALLER, 0), FIXTURE_USAGE_COST);
+        // Only the current window is kept: the earlier one is pruned.
+        assert_eq!(service.window_spend(CALLER, 0), 0);
         assert_eq!(
             service.window_spend(CALLER, 1),
             FIXTURE_USAGE_COST + reserved
@@ -2741,13 +2902,247 @@ mod tests {
                 4,
                 64 * 1024,
                 32_768,
-                ceiling,
-                window_ms,
+                SpendCeiling(ceiling),
+                SpendWindowMs(window_ms),
             )
         };
         assert!(admit(1, 1).is_ok());
         assert!(matches!(admit(0, 1), Err(ServiceError::InvalidAdmission)));
         assert!(matches!(admit(1, 0), Err(ServiceError::InvalidAdmission)));
+    }
+
+    // ---- settle past the reservation, pruning, extremes ----
+
+    fn overrun_result(call: &ProviderCall, text: &str) -> TransportResult {
+        let mut outcome = receipt(&invocation_for(CALLER, "outcome")).outcome;
+        let TransportOutcome::Completed { usage, .. } = &mut outcome else {
+            unreachable!();
+        };
+        // 2 million output tokens at 15,000,000 per million: 30,000,000.
+        *usage = self::usage(0, 0, 0, 2 * MTOK);
+        call.transported(
+            vec![TransportEvent {
+                sequence: 0,
+                payload: TransportEventPayload::TextDelta {
+                    text: text.to_string(),
+                },
+            }],
+            outcome,
+        )
+    }
+
+    const OVERRUN_COST: u64 = 30_000_000;
+
+    #[test]
+    fn an_overrun_settles_at_the_true_cost_and_the_receipt_says_so() {
+        let reserved = reservation();
+        let store = TestStore::new();
+        let mut service = open_limited(&store, 2 * reserved, 3_600_000);
+        let claim = claim_at(&mut service, "request-1", 1_000);
+        let result = overrun_result(claim.call(), "done");
+        let invocation = invocation_at("request-1", 1_000, MAX_COST);
+        let response = service.complete(*claim, result, FRAME).unwrap();
+        let receipt = receipt_of(&response, &invocation);
+        // The provider's own answer, not a stand-in, carrying the true cost
+        // and the marker.
+        assert_eq!(receipt.provider, "fixture-sse");
+        assert_eq!(receipt.cost_micro_usd, OVERRUN_COST);
+        assert_eq!(receipt.overrun_micro_usd, OVERRUN_COST - reserved);
+        assert_eq!(charged_of(&service, "request-1"), OVERRUN_COST);
+        assert_eq!(service.window_spend(CALLER, 0), OVERRUN_COST);
+        // The ceiling holds for every later request in the window.
+        assert_eq!(
+            refusal_at(&mut service, "request-2", 1_000, MAX_COST),
+            Refusal::SpendCeiling
+        );
+        // A result inside its reservation carries no marker.
+        drop(service);
+        let mut service = open_service(&store, 4);
+        let claim = claim_at(&mut service, "request-3", 1_000);
+        let result = text_result(claim.call(), "done");
+        let invocation = invocation_at("request-3", 1_000, MAX_COST);
+        let response = service.complete(*claim, result, FRAME).unwrap();
+        assert_eq!(receipt_of(&response, &invocation).overrun_micro_usd, 0);
+    }
+
+    #[test]
+    fn an_overrun_survives_the_result_size_stand_in_and_its_replay() {
+        let reserved = reservation();
+        let store = TestStore::new();
+        let mut service = open_service(&store, 4);
+        let claim = claim_at(&mut service, "request-1", 1_000);
+        let big = overrun_result(claim.call(), &"y".repeat(4000));
+        let invocation = invocation_at("request-1", 1_000, MAX_COST);
+        let response = service.complete(*claim, big, 2000).unwrap();
+        let receipt = receipt_of(&response, &invocation);
+        assert_eq!(receipt.provider, STAND_IN_PROVIDER);
+        assert_eq!(receipt.cost_micro_usd, OVERRUN_COST);
+        assert_eq!(receipt.overrun_micro_usd, OVERRUN_COST - reserved);
+
+        let claim = claim_at(&mut service, "request-2", 1_000);
+        let big = overrun_result(claim.call(), &"y".repeat(4000));
+        service.complete(*claim, big, FRAME).unwrap();
+        drop(service);
+        let mut service = open_service(&store, 4);
+        let invocation = invocation_at("request-2", 1_000, MAX_COST);
+        let TransportAdmission::Reply(smaller) = service
+            .begin(&raw_envelope(&invocation), 1_000, 2000)
+            .unwrap()
+        else {
+            panic!("expected a replay");
+        };
+        let receipt = receipt_of(&smaller, &invocation);
+        assert_eq!(receipt.provider, STAND_IN_PROVIDER);
+        assert_eq!(receipt.cost_micro_usd, OVERRUN_COST);
+        assert_eq!(receipt.overrun_micro_usd, OVERRUN_COST - reserved);
+    }
+
+    #[test]
+    fn a_backend_overrun_misreport_is_answered_with_the_stand_in() {
+        let reserved = reservation();
+        for (index, overrun) in [1, 0].into_iter().enumerate() {
+            let store = TestStore::new();
+            let mut service = open_service(&store, 4);
+            let id = format!("request-{index}");
+            let claim = claim_at(&mut service, &id, 1_000);
+            // The first result is inside its reservation and claims an overrun;
+            // the second overran and claims none.
+            let mut result = if index == 0 {
+                text_result(claim.call(), "done")
+            } else {
+                overrun_result(claim.call(), "done")
+            };
+            let TransportDisposition::Transported { receipt, .. } = &mut result.disposition else {
+                unreachable!();
+            };
+            receipt.overrun_micro_usd = overrun;
+            let invocation = invocation_at(&id, 1_000, MAX_COST);
+            let response = service.complete(*claim, result, FRAME).unwrap();
+            let receipt = receipt_of(&response, &invocation);
+            assert_eq!(receipt.provider, STAND_IN_PROVIDER, "{index}");
+            assert_eq!(receipt.cost_micro_usd, reserved, "{index}");
+            assert_eq!(receipt.overrun_micro_usd, 0, "{index}");
+        }
+    }
+
+    #[test]
+    fn the_window_map_stays_bounded_live_and_after_reopen() {
+        let window = 10;
+        let store = TestStore::new();
+        let mut service = open_limited(&store, 1 << 40, window);
+        let held =
+            |service: &TransportService| service.window_spend.get(CALLER).map_or(0, |w| w.len());
+        for index in 0..300u64 {
+            let id = format!("request-{index}");
+            let claim = claim_at(&mut service, &id, 1_000 + index * window);
+            let result = text_result(claim.call(), "done");
+            service.complete(*claim, result, FRAME).unwrap();
+            assert_eq!(held(&service), 1, "{index}");
+        }
+        // A request still in flight keeps its own window until it settles.
+        let early = claim_at(&mut service, "request-e", 1_000 + 300 * window);
+        claim_at(&mut service, "request-l", 1_000 + 305 * window);
+        assert_eq!(held(&service), 2);
+        let result = text_result(early.call(), "done");
+        service.complete(*early, result, FRAME).unwrap();
+        assert_eq!(held(&service), 1);
+        drop(service);
+        let service = open_limited(&store, 1 << 40, window);
+        assert_eq!(held(&service), 1);
+        assert_eq!(
+            service.window_spend(CALLER, 1_000 / window + 305),
+            reservation()
+        );
+    }
+
+    #[test]
+    fn a_reservation_that_overflows_is_refused_cost_bound_not_wrapped() {
+        for price in [
+            ModelPrice {
+                overhead_tokens: u64::MAX,
+                ..flat_price(u64::MAX)
+            },
+            ModelPrice {
+                overhead_tokens: u64::MAX,
+                ..flat_price(1 << 40)
+            },
+        ] {
+            assert_eq!(reservation_micro_usd(&price, &request()).unwrap(), None);
+            let store = TestStore::new();
+            let mut service = TransportService::open(
+                &store.path,
+                "fixture-sse",
+                PriceTable::from([("gpt-5.4".to_string(), price)]),
+                [caller(CALLER, KEY, 4)],
+                5_000,
+            )
+            .unwrap();
+            // Not even a caller that bounds its request at u64::MAX can afford it.
+            assert_eq!(
+                refusal_at(&mut service, "request-1", 1_000, u64::MAX),
+                Refusal::CostBound
+            );
+            assert!(record_of(&service, "request-1").is_none());
+        }
+    }
+
+    #[test]
+    fn a_recorded_answer_replays_after_a_price_raise() {
+        let store = TestStore::new();
+        let mut service = open_service(&store, 4);
+        let (admission, _) = begin_at(&mut service, "request-1", 1_000, reservation());
+        let TransportAdmission::Execute(claim) = admission else {
+            panic!("expected an execution claim");
+        };
+        let result = text_result(claim.call(), "done");
+        service.complete(*claim, result, FRAME).unwrap();
+        drop(service);
+
+        let mut dear = fixture_price();
+        dear.rates.output *= 2;
+        let mut service = TransportService::open(
+            &store.path,
+            "fixture-sse",
+            PriceTable::from([("gpt-5.4".to_string(), dear)]),
+            [caller(CALLER, KEY, 4)],
+            5_000,
+        )
+        .unwrap();
+        let (admission, invocation) = begin_at(&mut service, "request-1", 1_000, reservation());
+        let TransportAdmission::Reply(response) = admission else {
+            panic!("expected the recorded answer");
+        };
+        assert_eq!(
+            receipt_of(&response, &invocation).cost_micro_usd,
+            FIXTURE_USAGE_COST
+        );
+        // New work is still checked against today's prices.
+        assert_eq!(
+            refusal_at(&mut service, "request-2", 1_000, reservation()),
+            Refusal::CostBound
+        );
+    }
+
+    #[test]
+    fn a_settle_write_failure_releases_the_slot_and_keeps_the_reservation() {
+        let store = FlakyStore::new(1);
+        let allowance = store.allowance();
+        let mut service = open_flaky(store);
+        let claim = claim_at(&mut service, "request-1", 1_000);
+        let result = text_result(claim.call(), "done");
+        assert!(matches!(
+            service.complete(*claim, result, FRAME),
+            Err(ServiceError::ReplayStore(_))
+        ));
+        assert!(service.live.is_empty());
+        assert_eq!(service.window_spend(CALLER, 0), reservation());
+        // The store recovers: the caller's only slot is free again, and the
+        // unsettled request is told it is indeterminate, not in flight.
+        allowance.store(5, std::sync::atomic::Ordering::SeqCst);
+        claim_at(&mut service, "request-2", 1_000);
+        assert_eq!(service.window_spend(CALLER, 0), 2 * reservation());
+        let (admission, invocation) = begin_at(&mut service, "request-1", 1_000, MAX_COST);
+        assert_eq!(refusal_of(admission, &invocation), Refusal::Indeterminate);
     }
 
     fn open_flaky(store: FlakyStore) -> TransportService {

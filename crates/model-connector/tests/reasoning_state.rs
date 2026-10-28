@@ -106,8 +106,8 @@ fn start_with(backend: Arc<dyn ProviderBackend>, max_concurrent: usize) -> Conne
         max_concurrent,
         64 * 1024,
         32_768,
-        1 << 40,
-        3_600_000,
+        SpendCeiling(1 << 40),
+        SpendWindowMs(3_600_000),
     )
     .unwrap();
     let limits = ServeLimits {

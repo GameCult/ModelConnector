@@ -16,7 +16,8 @@ use crate::envelope::{
     frame_bytes_for_payload, read_transport_frame, write_transport_frame,
 };
 use crate::service::{
-    CallerAdmission, PriceTable, ProviderCall, TransportAdmission, TransportService,
+    CallerAdmission, PriceTable, ProviderCall, SpendCeiling, SpendWindowMs, TransportAdmission,
+    TransportService,
 };
 
 /// The only provider seam of the connector kit. A connector binary implements
@@ -139,8 +140,8 @@ pub fn load_admissions(callers: &[CallerConfig]) -> Result<Vec<CallerAdmission>,
                 caller.max_concurrent_requests,
                 caller.max_payload_bytes,
                 caller.max_output_tokens,
-                caller.spend_ceiling_micro_usd,
-                caller.spend_window_ms,
+                SpendCeiling(caller.spend_ceiling_micro_usd),
+                SpendWindowMs(caller.spend_window_ms),
             )
             .map_err(ServeError::Service)?,
         );
@@ -858,8 +859,8 @@ mod tests {
             slots,
             payload,
             32_768,
-            CEILING,
-            WINDOW_MS,
+            SpendCeiling(CEILING),
+            SpendWindowMs(WINDOW_MS),
         )
         .unwrap()
     }

@@ -488,6 +488,12 @@ pub struct TransportReceipt {
     /// What the request cost, in micro-USD. The service derives it from the
     /// outcome's usage and its price table; a backend never writes it.
     pub cost_micro_usd: u64,
+    /// How far `cost_micro_usd` exceeds what the service reserved for the
+    /// request: zero unless the backend reported usage above the worst case
+    /// the request allowed, which is a breach of the backend's contract. The
+    /// cost is still the true one and the caller's window is charged all of
+    /// it. The service derives this; a backend never writes it.
+    pub overrun_micro_usd: u64,
     pub outcome: TransportOutcome,
 }
 
