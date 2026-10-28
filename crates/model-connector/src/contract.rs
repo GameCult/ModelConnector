@@ -326,17 +326,14 @@ impl TransportResult {
         }
     }
 
-    /// Built by `ProviderCall` in the daemon and by in-crate tests only.
+    /// Built by `ProviderCall` in the daemon and by in-crate tests only; the
+    /// result's identity is its receipt's.
     #[cfg(any(test, feature = "daemon"))]
-    pub(crate) fn transported(
-        invocation: &TransportInvocation,
-        events: Vec<TransportEvent>,
-        receipt: TransportReceipt,
-    ) -> Self {
+    pub(crate) fn transported(events: Vec<TransportEvent>, receipt: TransportReceipt) -> Self {
         Self {
             schema_id: RESULT_SCHEMA_ID.to_string(),
-            request_id: invocation.request_id().to_string(),
-            caller_runtime_id: invocation.caller_runtime_id.clone(),
+            request_id: receipt.request_id.clone(),
+            caller_runtime_id: receipt.caller_runtime_id.clone(),
             disposition: TransportDisposition::Transported {
                 events,
                 receipt: Box::new(receipt),
@@ -769,7 +766,6 @@ mod tests {
     fn transported_result_binds_identity_digest_and_event_order() {
         let invocation = invocation();
         let result = TransportResult::transported(
-            &invocation,
             vec![TransportEvent {
                 sequence: 0,
                 payload: TransportEventPayload::ToolCall {
@@ -830,7 +826,7 @@ mod tests {
             ]
         );
         let invocation = invocation();
-        let result = TransportResult::transported(&invocation, Vec::new(), receipt(&invocation));
+        let result = TransportResult::transported(Vec::new(), receipt(&invocation));
         let TransportDisposition::Transported { receipt: sent, .. } = &result.disposition else {
             unreachable!()
         };
@@ -876,7 +872,7 @@ mod tests {
     #[test]
     fn an_unknown_field_is_refused_not_dropped() {
         let invocation = invocation();
-        let result = TransportResult::transported(&invocation, Vec::new(), receipt(&invocation));
+        let result = TransportResult::transported(Vec::new(), receipt(&invocation));
         let TransportDisposition::Transported { receipt: sent, .. } = &result.disposition else {
             unreachable!()
         };
@@ -968,7 +964,7 @@ mod tests {
     #[test]
     fn validate_against_refuses_each_identity_field() {
         let invocation = invocation();
-        let result = TransportResult::transported(&invocation, Vec::new(), receipt(&invocation));
+        let result = TransportResult::transported(Vec::new(), receipt(&invocation));
         assert_eq!(result.validate_against(&invocation), Ok(()));
         let mut other_request = result.clone();
         other_request.request_id = "request-2".to_string();
@@ -1031,7 +1027,7 @@ mod tests {
             event(4, text("three")),
             event(5, reasoning(&[7])),
         ];
-        let result = TransportResult::transported(&invocation, events, receipt(&invocation));
+        let result = TransportResult::transported(events, receipt(&invocation));
         assert_eq!(
             result.transcript_items(),
             vec![
@@ -1072,7 +1068,6 @@ mod tests {
             message: "slow down".to_string(),
         };
         let partial = TransportResult::transported(
-            &invocation,
             vec![event(0, text("half")), event(1, reasoning(&[1, 2, 3]))],
             failed,
         );

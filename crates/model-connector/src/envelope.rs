@@ -557,7 +557,7 @@ mod tests {
     fn the_outer_identity_must_match_the_sealed_result_on_each_field() {
         let key = security("epiphany-distinct-test-key");
         let invocation = invocation();
-        let result = TransportResult::transported(&invocation, Vec::new(), receipt(&invocation));
+        let result = TransportResult::transported(Vec::new(), receipt(&invocation));
         let plaintext = wire_encode(&result).unwrap();
         let seal = |caller: &str, request_id: &str| {
             encrypt_message(caller, request_id, EnvelopeKind::Result, &plaintext, &key).unwrap()

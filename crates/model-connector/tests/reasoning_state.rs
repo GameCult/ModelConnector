@@ -83,6 +83,11 @@ fn now_ms() -> u64 {
 
 /// A running serve loop and a client for it.
 fn start(backend: Arc<RecordingBackend>) -> ConnectorClient {
+    start_with(backend, 4)
+}
+
+/// As `start`, with the caller's concurrent-request limit.
+fn start_with(backend: Arc<dyn ProviderBackend>, max_concurrent: usize) -> ConnectorClient {
     static SEQUENCE: AtomicUsize = AtomicUsize::new(0);
     let root: PathBuf = std::env::temp_dir().join(format!(
         "model-connector-reasoning-{}-{}",
@@ -98,7 +103,7 @@ fn start(backend: Arc<RecordingBackend>) -> ConnectorClient {
         KEY,
         1,
         ["claude-opus-4-5".to_string()],
-        4,
+        max_concurrent,
         64 * 1024,
         32_768,
     )
@@ -261,4 +266,83 @@ fn replayed_transcript_reaches_the_same_provider_verbatim() {
     let second = client.execute(&invocation("turn-2", next.clone())).unwrap();
     assert_eq!(receipt_of(&second).foreign_reasoning_dropped, 0);
     assert_eq!(backend.seen()[1].input, next);
+}
+
+/// A backend that answers with a receipt it has edited after the service
+/// derived it.
+struct TamperingBackend {
+    edit: fn(&mut TransportReceipt),
+}
+
+impl ProviderBackend for TamperingBackend {
+    fn ready(&self) -> bool {
+        true
+    }
+
+    fn provider(&self) -> &str {
+        PROVIDER
+    }
+
+    fn execute(&self, call: &ProviderCall) -> TransportResult {
+        let mut result = call.transported(
+            vec![TransportEvent {
+                sequence: 0,
+                payload: TransportEventPayload::TextDelta {
+                    text: "done".to_string(),
+                },
+            }],
+            TransportOutcome::Completed {
+                provider_response_id: None,
+                stop_reason: StopReason::EndTurn,
+                usage: Usage {
+                    input_tokens: 1,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 0,
+                    output_tokens: 1,
+                    reasoning_tokens: None,
+                },
+            },
+        );
+        let TransportDisposition::Transported { receipt, .. } = &mut result.disposition else {
+            unreachable!();
+        };
+        (self.edit)(receipt);
+        result
+    }
+}
+
+#[test]
+fn a_refused_completion_reaches_the_caller_as_a_typed_failure_and_frees_the_slot() {
+    let edits: [fn(&mut TransportReceipt); 2] = [
+        |receipt| receipt.provider = "another-provider".to_string(),
+        |receipt| receipt.foreign_reasoning_dropped += 1,
+    ];
+    for edit in edits {
+        // One concurrent request: a wedged slot would refuse the next id.
+        let client = start_with(Arc::new(TamperingBackend { edit }), 1);
+        let first = invocation("tampered", vec![user("question")]);
+        let answer = client.execute(&first).unwrap();
+        let TransportDisposition::Transported { events, receipt } = &answer.disposition else {
+            panic!("expected a typed failure, got {:?}", answer.disposition);
+        };
+        assert!(events.is_empty());
+        assert!(matches!(
+            receipt.outcome,
+            TransportOutcome::Failed {
+                kind: FailureKind::Provider,
+                ..
+            }
+        ));
+        // The same id replays that failure rather than conflicting.
+        assert_eq!(client.execute(&first).unwrap(), answer);
+        // The next id is not refused for capacity.
+        let next = client
+            .execute(&invocation("tampered-next", vec![user("again")]))
+            .unwrap();
+        assert!(
+            !matches!(next.disposition, TransportDisposition::Refused(_)),
+            "{:?}",
+            next.disposition
+        );
+    }
 }
