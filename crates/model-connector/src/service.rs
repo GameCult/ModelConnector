@@ -871,7 +871,9 @@ mod tests {
         edit(&mut record);
         let mut cache = CultCache::new();
         cache.register_entry_type::<ReplayRecord>().unwrap();
-        cache.add_generic_backing_store(OwnedRedbMessagePackBackingStore::new(path).unwrap());
+        cache
+            .add_generic_backing_store(OwnedRedbMessagePackBackingStore::new(path).unwrap())
+            .unwrap();
         cache.pull_all_backing_stores().unwrap();
         cache.put(key.to_string(), &record).unwrap();
     }
