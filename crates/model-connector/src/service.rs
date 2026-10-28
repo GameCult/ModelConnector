@@ -718,7 +718,8 @@ mod tests {
         seed(&control.path, &seeded_key(), |_| {});
         assert!(TransportService::open(&control.path, [caller(CALLER, KEY, 1)], 5_000).is_ok());
 
-        let cases: [(&str, fn(&mut ReplayRecord)); 3] = [
+        type Edit = fn(&mut ReplayRecord);
+        let cases: [(&str, Edit); 3] = [
             ("wrong-key", |_| {}),
             ("zero-digest", |record| record.invocation_sha256 = [0; 32]),
             ("zero-expiry", |record| record.expires_at_unix_ms = 0),
