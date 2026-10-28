@@ -15,7 +15,9 @@ use crate::envelope::{
     ServiceError, TransportFrameError, decode_invocation_frame, encode_result_frame,
     frame_bytes_for_payload, read_transport_frame, write_transport_frame,
 };
-use crate::service::{CallerAdmission, ProviderCall, TransportAdmission, TransportService};
+use crate::service::{
+    CallerAdmission, PriceTable, ProviderCall, TransportAdmission, TransportService,
+};
 
 /// The only provider seam of the connector kit. A connector binary implements
 /// it over one model provider; the kit names no provider.
@@ -111,6 +113,12 @@ pub struct CallerConfig {
     pub max_concurrent_requests: usize,
     pub max_payload_bytes: usize,
     pub max_output_tokens: u32,
+    /// The most the caller may spend in one window, in micro-USD. Required
+    /// nonzero. A fuse set once, generously above what the dial allows.
+    pub spend_ceiling_micro_usd: u64,
+    /// The length of the caller's spend window, in milliseconds. Windows are
+    /// fixed and aligned to the unix epoch. Required nonzero.
+    pub spend_window_ms: u64,
 }
 
 pub fn load_admissions(callers: &[CallerConfig]) -> Result<Vec<CallerAdmission>, ServeError> {
@@ -131,6 +139,8 @@ pub fn load_admissions(callers: &[CallerConfig]) -> Result<Vec<CallerAdmission>,
                 caller.max_concurrent_requests,
                 caller.max_payload_bytes,
                 caller.max_output_tokens,
+                caller.spend_ceiling_micro_usd,
+                caller.spend_window_ms,
             )
             .map_err(ServeError::Service)?,
         );
@@ -139,12 +149,15 @@ pub fn load_admissions(callers: &[CallerConfig]) -> Result<Vec<CallerAdmission>,
 }
 
 /// Serves admitted callers on a loopback listener until the listener fails.
+/// `prices` is the connector binary's config document's table of what every
+/// allowed model costs (B4 owns that document).
 /// The caller binds; a listener that is not bound to loopback is refused, and
 /// peers that are not loopback are dropped.
 pub fn serve(
     listener: TcpListener,
     limits: ServeLimits,
     admissions: Vec<CallerAdmission>,
+    prices: PriceTable,
     replay_store: &Path,
     backend: Arc<dyn ProviderBackend>,
 ) -> Result<(), ServeError> {
@@ -163,6 +176,7 @@ pub fn serve(
     let service = Arc::new(Mutex::new(TransportService::open(
         replay_store,
         backend.provider(),
+        prices,
         admissions,
         limits.max_expiry_skew_ms,
     )?));
@@ -336,7 +350,10 @@ mod tests {
         FailureKind, Refusal, TransportDisposition, TransportEvent, TransportEventPayload,
         TransportInvocation, TransportOutcome, TransportResult,
     };
-    use crate::fixtures::{TestStore, caller, invocation_for, receipt, request};
+    use crate::fixtures::{
+        CEILING, MAX_COST, TestStore, WINDOW_MS, caller, fixture_prices, invocation_for, receipt,
+        request,
+    };
 
     const CALLER: &str = "epiphany-yggdrasil";
     const KEY: &str = "epiphany-distinct-test-key";
@@ -412,7 +429,14 @@ mod tests {
         let (sender, receiver) = std::sync::mpsc::channel();
         let path = path.to_path_buf();
         thread::spawn(move || {
-            let _ = sender.send(serve(listener, limits, admissions, &path, backend));
+            let _ = sender.send(serve(
+                listener,
+                limits,
+                admissions,
+                fixture_prices(),
+                &path,
+                backend,
+            ));
         });
         receiver.recv_timeout(Duration::from_secs(2)).ok()
     }
@@ -438,7 +462,16 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let endpoint = listener.local_addr().unwrap();
         let path = store.path.clone();
-        thread::spawn(move || serve(listener, limits(), admissions, &path, backend));
+        thread::spawn(move || {
+            serve(
+                listener,
+                limits(),
+                admissions,
+                fixture_prices(),
+                &path,
+                backend,
+            )
+        });
         let client =
             ConnectorClient::new(endpoint, KEY, FRAME, Some(Duration::from_secs(5))).unwrap();
         (client, endpoint)
@@ -456,8 +489,35 @@ mod tests {
                 max_concurrent_requests: *capacity,
                 max_payload_bytes: 1_048_576,
                 max_output_tokens: 16_384,
+                spend_ceiling_micro_usd: CEILING,
+                spend_window_ms: WINDOW_MS,
             })
             .collect()
+    }
+
+    #[test]
+    fn serve_refuses_a_request_over_its_max_cost_without_executing_it() {
+        let store = TestStore::new();
+        let backend = CountingBackend::new(true);
+        let (client, _) = start(backend.clone(), &store);
+        let mut invocation = fresh("request-costly");
+        invocation.max_cost_micro_usd = 1;
+        let refused = client.execute(&invocation).unwrap();
+        assert_eq!(
+            refused.disposition,
+            TransportDisposition::Refused(Refusal::CostBound)
+        );
+        assert_eq!(backend.executions.load(Ordering::SeqCst), 0);
+
+        // The refusal was not recorded: the same id with a budget that holds
+        // the worst case is admitted and executed.
+        invocation.max_cost_micro_usd = MAX_COST;
+        let admitted = client.execute(&invocation).unwrap();
+        assert!(matches!(
+            admitted.disposition,
+            TransportDisposition::Transported { .. }
+        ));
+        assert_eq!(backend.executions.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -496,6 +556,7 @@ mod tests {
             CALLER,
             invocation.expires_at_unix_ms,
             [7; 32],
+            MAX_COST,
             conflicting_request,
         )
         .unwrap();
@@ -580,6 +641,7 @@ mod tests {
         let mut service = TransportService::open(
             &store.path,
             "fixture-sse",
+            fixture_prices(),
             vec![caller(CALLER, KEY, 4)],
             300_000,
         )
@@ -611,6 +673,7 @@ mod tests {
                 listener,
                 narrowed,
                 vec![caller(CALLER, KEY, 4)],
+                fixture_prices(),
                 &path,
                 served,
             )
@@ -693,7 +756,13 @@ mod tests {
     fn the_smallest_frame_also_carries_the_failure_that_stands_in_for_a_result() {
         let long = "x".repeat(crate::envelope::MAX_IDENTITY_BYTES);
         let plaintext = crate::contract::wire_encode(&crate::service::result_size_failure(
-            &long, &long, &long, [0xff; 32], [0xff; 32], 0,
+            &long,
+            &long,
+            &long,
+            [0xff; 32],
+            [0xff; 32],
+            0,
+            u64::MAX,
         ))
         .unwrap()
         .len();
@@ -781,7 +850,18 @@ mod tests {
     }
 
     fn admission(id: &str, key: &str, slots: usize, payload: usize) -> CallerAdmission {
-        CallerAdmission::new(id, key, 1, ["gpt-5.4".to_string()], slots, payload, 32_768).unwrap()
+        CallerAdmission::new(
+            id,
+            key,
+            1,
+            ["gpt-5.4".to_string()],
+            slots,
+            payload,
+            32_768,
+            CEILING,
+            WINDOW_MS,
+        )
+        .unwrap()
     }
 
     /// `Some(field)` when serve refused the configuration, `None` while it serves.
@@ -887,7 +967,7 @@ mod tests {
             ..limits()
         };
         let admissions = vec![admission(CALLER, KEY, 4, bound)];
-        thread::spawn(move || serve(listener, tight, admissions, &path, served));
+        thread::spawn(move || serve(listener, tight, admissions, fixture_prices(), &path, served));
         let client =
             ConnectorClient::new(endpoint, KEY, frame, Some(Duration::from_secs(5))).unwrap();
         let reply = client.execute(&invocation).unwrap();
@@ -987,6 +1067,7 @@ mod tests {
                     && receipt.outcome == TransportOutcome::Failed {
                         kind: FailureKind::ResultSize,
                         message: "provider result exceeded its byte bound".to_string(),
+                        usage: None,
                     }
         )
     }
@@ -1001,6 +1082,7 @@ mod tests {
         let mut service = TransportService::open(
             &store.path,
             "fixture-sse",
+            fixture_prices(),
             vec![caller(CALLER, KEY, 4)],
             300_000,
         )
@@ -1103,6 +1185,7 @@ mod tests {
                 TransportService::open(
                     &store.path,
                     "fixture-sse",
+                    fixture_prices(),
                     vec![caller(CALLER, KEY, 4)],
                     300_000,
                 )
@@ -1160,7 +1243,16 @@ mod tests {
         let backend = CountingBackend::new(true);
         let path = store.path.clone();
         let served = backend.clone();
-        thread::spawn(move || serve(listener, limits(), admissions, &path, served));
+        thread::spawn(move || {
+            serve(
+                listener,
+                limits(),
+                admissions,
+                fixture_prices(),
+                &path,
+                served,
+            )
+        });
         let client =
             ConnectorClient::new(endpoint, KEY, FRAME, Some(Duration::from_secs(5))).unwrap();
         client.execute(&fresh("request-key")).unwrap();

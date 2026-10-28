@@ -110,6 +110,8 @@ fn the_refusal_schema_is_one_flat_string_enum() {
         .iter()
         .map(|value| value.as_str().unwrap())
         .collect();
-    assert_eq!(variants.len(), 12);
+    assert_eq!(variants.len(), 14);
     assert!(variants.contains(&"ForeignReasoningState"));
+    assert!(variants.contains(&"CostBound"));
+    assert!(variants.contains(&"SpendCeiling"));
 }

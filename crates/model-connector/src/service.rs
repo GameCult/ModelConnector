@@ -1,15 +1,16 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
-use cultcache_rs::{CultCache, DatabaseEntry, OwnedRedbMessagePackBackingStore};
+use cultcache_rs::{CacheBackingStore, CultCache, DatabaseEntry, OwnedRedbMessagePackBackingStore};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 use crate::contract::{
-    ContractError, FailureKind, InputItem, ProviderRequest, RECEIPT_SCHEMA_ID, RESULT_SCHEMA_ID,
-    Refusal, TransportDisposition, TransportEvent, TransportInvocation, TransportKey,
-    TransportOutcome, TransportReceipt, TransportResult, canonical_invocation_bytes, require_id,
+    CacheRetention, ContractError, FailureKind, InputItem, ProviderRequest, RECEIPT_SCHEMA_ID,
+    RESULT_SCHEMA_ID, Refusal, TransportDisposition, TransportEvent, TransportInvocation,
+    TransportKey, TransportOutcome, TransportReceipt, TransportResult, Usage,
+    canonical_invocation_bytes, require_id, wire_encode,
 };
 use crate::envelope::{
     EnvelopeKind, MAX_IDENTITY_BYTES, ServiceError, TransportEnvelope, decrypt_invocation,
@@ -24,9 +25,14 @@ pub struct CallerAdmission {
     max_concurrent_requests: usize,
     max_payload_bytes: usize,
     max_output_tokens: u32,
+    spend_ceiling_micro_usd: u64,
+    spend_window_ms: u64,
 }
 
 impl CallerAdmission {
+    // The ceiling and window ride beside the other limits the root-owned caller
+    // config sets, one parameter each.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         caller_runtime_id: impl Into<String>,
         connection_key: impl Into<String>,
@@ -35,6 +41,8 @@ impl CallerAdmission {
         max_concurrent_requests: usize,
         max_payload_bytes: usize,
         max_output_tokens: u32,
+        spend_ceiling_micro_usd: u64,
+        spend_window_ms: u64,
     ) -> Result<Self, ServiceError> {
         let caller_runtime_id = caller_runtime_id.into();
         require_id(&caller_runtime_id, "caller_runtime_id")?;
@@ -48,6 +56,8 @@ impl CallerAdmission {
             || max_concurrent_requests == 0
             || max_payload_bytes == 0
             || max_output_tokens == 0
+            || spend_ceiling_micro_usd == 0
+            || spend_window_ms == 0
         {
             return Err(ServiceError::InvalidAdmission);
         }
@@ -61,6 +71,8 @@ impl CallerAdmission {
             max_concurrent_requests,
             max_payload_bytes,
             max_output_tokens,
+            spend_ceiling_micro_usd,
+            spend_window_ms,
         })
     }
 
@@ -77,6 +89,117 @@ impl CallerAdmission {
     }
 }
 
+/// What one million tokens of each class cost, in micro-USD.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Rates {
+    pub input: u64,
+    pub cache_write_short: u64,
+    pub cache_write_long: u64,
+    pub cache_read: u64,
+    pub output: u64,
+}
+
+/// The rates a prompt strictly above `above_prompt_tokens` is priced at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LongContext {
+    pub above_prompt_tokens: u64,
+    pub rates: Rates,
+}
+
+/// One model's price. Explicit zero rates are admitted (a local model is
+/// free); a missing price is not. `overhead_tokens` is added to the byte
+/// bound of a request when its worst case is reserved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModelPrice {
+    pub rates: Rates,
+    pub long_context: Option<LongContext>,
+    pub overhead_tokens: u64,
+}
+
+/// The price of every model a caller may be allowed, supplied at open by the
+/// connector binary's config document.
+pub type PriceTable = BTreeMap<String, ModelPrice>;
+
+const TOKENS_PER_RATE: u128 = 1_000_000;
+
+fn ceil_micro_usd(rate_weighted_tokens: u128) -> u64 {
+    let whole = rate_weighted_tokens / TOKENS_PER_RATE;
+    let rounded = whole + u128::from(!rate_weighted_tokens.is_multiple_of(TOKENS_PER_RATE));
+    u64::try_from(rounded).unwrap_or(u64::MAX)
+}
+
+fn rates_for(price: &ModelPrice, prompt_tokens: u128) -> &Rates {
+    match &price.long_context {
+        Some(long) if prompt_tokens > u128::from(long.above_prompt_tokens) => &long.rates,
+        _ => &price.rates,
+    }
+}
+
+/// A cache write nobody asked to keep short is priced dear.
+fn write_rate(rates: &Rates, retention: Option<CacheRetention>) -> u64 {
+    match retention {
+        Some(CacheRetention::Short) => rates.cache_write_short,
+        Some(CacheRetention::Long) | None => rates.cache_write_long,
+    }
+}
+
+/// What `usage` costs under `price`, in micro-USD: the sum over token classes
+/// of tokens times rate, rounded up once, saturating at `u64::MAX`.
+pub(crate) fn cost_micro_usd(
+    price: &ModelPrice,
+    usage: &Usage,
+    retention: Option<CacheRetention>,
+) -> u64 {
+    let prompt = u128::from(usage.input_tokens)
+        + u128::from(usage.cache_read_tokens)
+        + u128::from(usage.cache_write_tokens);
+    let rates = rates_for(price, prompt);
+    let total = [
+        u128::from(usage.input_tokens) * u128::from(rates.input),
+        u128::from(usage.cache_read_tokens) * u128::from(rates.cache_read),
+        u128::from(usage.cache_write_tokens) * u128::from(write_rate(rates, retention)),
+        u128::from(usage.output_tokens) * u128::from(rates.output),
+    ]
+    .into_iter()
+    .fold(0u128, u128::saturating_add);
+    ceil_micro_usd(total)
+}
+
+/// The worst case `request` can cost, in micro-USD: its encoded length plus
+/// the model's overhead as input tokens (a token is at least one byte) at the
+/// dearest input rate the cache retention allows, plus `max_output_tokens` at
+/// the output rate, rounded up once.
+pub(crate) fn reservation_micro_usd(
+    price: &ModelPrice,
+    request: &ProviderRequest,
+) -> Result<u64, ContractError> {
+    let bound = (wire_encode(request)?.len() as u128) + u128::from(price.overhead_tokens);
+    let rates = rates_for(price, bound);
+    let input_rate = rates
+        .input
+        .max(rates.cache_read)
+        .max(write_rate(rates, request.cache_retention));
+    let total = (bound * u128::from(input_rate))
+        .saturating_add(u128::from(request.max_output_tokens) * u128::from(rates.output));
+    Ok(ceil_micro_usd(total))
+}
+
+/// Moves `held` of a caller's window: releases `release`, then adds `charge`.
+fn add_spend(
+    window_spend: &mut HashMap<String, BTreeMap<u64, u64>>,
+    caller_runtime_id: &str,
+    window: u64,
+    release: u64,
+    charge: u64,
+) {
+    let held = window_spend
+        .entry(caller_runtime_id.to_string())
+        .or_default()
+        .entry(window)
+        .or_insert(0);
+    *held = held.saturating_sub(release).saturating_add(charge);
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct RequestIdentity {
     caller_runtime_id: String,
@@ -85,12 +208,18 @@ struct RequestIdentity {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 enum ReplayState {
-    Active,
-    Completed { response: TransportEnvelope },
+    /// Admitted and possibly executing: the worst case is held against the
+    /// caller's window until the request settles (an indeterminate one is
+    /// billed at it).
+    Active { reserved_micro_usd: u64 },
+    Completed {
+        response: TransportEnvelope,
+        charged_micro_usd: u64,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, DatabaseEntry)]
-#[cultcache(type = "gamecult.model.replay_record.v1")]
+#[cultcache(type = "gamecult.model.replay_record.v2")]
 struct ReplayRecord {
     #[cultcache(key = 0)]
     caller_runtime_id: String,
@@ -104,6 +233,8 @@ struct ReplayRecord {
     expires_at_unix_ms: u64,
     #[cultcache(key = 5)]
     state: ReplayState,
+    #[cultcache(key = 6)]
+    admitted_at_unix_ms: u64,
 }
 
 /// What a backend is handed: the request with every foreign reasoning item
@@ -115,6 +246,8 @@ struct ReplayRecord {
 pub struct ProviderCall {
     request: ProviderRequest,
     receipt: TransportReceipt,
+    price: ModelPrice,
+    reserved_micro_usd: u64,
 }
 
 impl ProviderCall {
@@ -130,7 +263,7 @@ impl ProviderCall {
     }
 
     /// The result of this call. The whole receipt (schema, ids, both digests,
-    /// model, provider tag and drop count) is derived here, so a backend
+    /// model, provider tag, drop count and cost) is derived here, so a backend
     /// writes only the events and the outcome.
     pub fn transported(
         &self,
@@ -140,10 +273,23 @@ impl ProviderCall {
         TransportResult::transported(
             events,
             TransportReceipt {
+                cost_micro_usd: self.cost_of(&outcome),
                 outcome,
                 ..self.receipt.clone()
             },
         )
+    }
+
+    /// What `outcome` costs: its usage priced, or the whole reservation when a
+    /// failure does not say what it billed (unknown is billed as the worst case).
+    fn cost_of(&self, outcome: &TransportOutcome) -> u64 {
+        match outcome {
+            TransportOutcome::Completed { usage, .. }
+            | TransportOutcome::Failed {
+                usage: Some(usage), ..
+            } => cost_micro_usd(&self.price, usage, self.request.cache_retention),
+            TransportOutcome::Failed { usage: None, .. } => self.reserved_micro_usd,
+        }
     }
 }
 
@@ -172,15 +318,41 @@ pub struct TransportService {
     replay_store: CultCache,
     max_expiry_skew_ms: u64,
     provider: String,
+    prices: PriceTable,
+    /// Per caller, what each spend window holds: the reservations of its
+    /// Active records and the charges of its Completed ones. A cache of the
+    /// replay records, re-derived at open and moved only after a record's put
+    /// returns Ok; the records are the ledger. A request belongs to the window
+    /// it was admitted in, so settlement never moves it to another.
+    window_spend: HashMap<String, BTreeMap<u64, u64>>,
 }
 
 impl TransportService {
     /// `provider` is the tag of the backend this service fronts. The service
     /// owns it from here on: it decides which reasoning state is foreign and
-    /// what provider every receipt names.
+    /// what provider every receipt names. `prices` must price every model any
+    /// caller is allowed.
     pub fn open(
         replay_store_path: &Path,
         provider: &str,
+        prices: PriceTable,
+        admissions: impl IntoIterator<Item = CallerAdmission>,
+        max_expiry_skew_ms: u64,
+    ) -> Result<Self, ServiceError> {
+        Self::with_store(
+            OwnedRedbMessagePackBackingStore::new(replay_store_path).map_err(replay_store_error)?,
+            provider,
+            prices,
+            admissions,
+            max_expiry_skew_ms,
+        )
+    }
+
+    /// `open` over any backing store, so a test can inject one that fails.
+    pub fn with_store(
+        store: impl CacheBackingStore + 'static,
+        provider: &str,
+        prices: PriceTable,
         admissions: impl IntoIterator<Item = CallerAdmission>,
         max_expiry_skew_ms: u64,
     ) -> Result<Self, ServiceError> {
@@ -204,21 +376,27 @@ impl TransportService {
         if callers.is_empty() {
             return Err(ServiceError::InvalidAdmission);
         }
+        if let Some(model) = callers
+            .values()
+            .flat_map(|caller| caller.allowed_models.iter())
+            .filter(|model| !prices.contains_key(*model))
+            .min()
+        {
+            return Err(ServiceError::UnpricedModel(model.clone()));
+        }
 
         let mut replay_store = CultCache::new();
         replay_store
             .register_entry_type::<ReplayRecord>()
             .map_err(replay_store_error)?;
         replay_store
-            .add_generic_backing_store(
-                OwnedRedbMessagePackBackingStore::new(replay_store_path)
-                    .map_err(replay_store_error)?,
-            )
+            .add_generic_backing_store(store)
             .map_err(replay_store_error)?;
         replay_store
             .pull_all_backing_stores()
             .map_err(replay_store_error)?;
 
+        let mut window_spend: HashMap<String, BTreeMap<u64, u64>> = HashMap::new();
         for (key, record) in replay_store
             .get_all_with_keys::<ReplayRecord>()
             .map_err(replay_store_error)?
@@ -230,6 +408,7 @@ impl TransportService {
             if key != replay_key(&identity)
                 || record.invocation_sha256 == [0; 32]
                 || record.expires_at_unix_ms == 0
+                || record.admitted_at_unix_ms == 0
             {
                 return Err(ServiceError::InvalidReplayRecord);
             }
@@ -239,6 +418,21 @@ impl TransportService {
             if record.connection_key_epoch != caller.connection_key_epoch {
                 return Err(ServiceError::ReplayCallerKeyMismatch);
             }
+            // An Active record left by a crash counts at its full reservation:
+            // indeterminate is billed as the worst case.
+            let held = match &record.state {
+                ReplayState::Active { reserved_micro_usd } => *reserved_micro_usd,
+                ReplayState::Completed {
+                    charged_micro_usd, ..
+                } => *charged_micro_usd,
+            };
+            add_spend(
+                &mut window_spend,
+                &record.caller_runtime_id,
+                record.admitted_at_unix_ms / caller.spend_window_ms,
+                0,
+                held,
+            );
         }
         Ok(Self {
             callers,
@@ -246,7 +440,18 @@ impl TransportService {
             replay_store,
             max_expiry_skew_ms,
             provider: provider.to_string(),
+            prices,
+            window_spend,
         })
+    }
+
+    /// What `caller_runtime_id`'s spend window `window` holds.
+    pub(crate) fn window_spend(&self, caller_runtime_id: &str, window: u64) -> u64 {
+        self.window_spend
+            .get(caller_runtime_id)
+            .and_then(|windows| windows.get(&window))
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Admits one request. `max_frame_bytes` is the frame every reply must
@@ -269,6 +474,9 @@ impl TransportService {
             .ok_or(ServiceError::CallerNotAdmitted)?;
         let security = caller.security.clone();
         let max_concurrent_requests = caller.max_concurrent_requests;
+        let connection_key_epoch = caller.connection_key_epoch;
+        let spend_ceiling = caller.spend_ceiling_micro_usd;
+        let spend_window_ms = caller.spend_window_ms;
         let invocation = decrypt_invocation(envelope, &security)?;
         if envelope.request_id.len() > MAX_IDENTITY_BYTES {
             let refusal = encrypt_result(
@@ -298,6 +506,16 @@ impl TransportService {
                 Ok(partition) => partition,
                 Err(refusal) => return self.reply_refusal(&invocation, refusal, &security),
             };
+        // The worst case is decided by the invocation alone, so it is refused
+        // before the replay lookup, like every other refusal of this kind.
+        let price = *self
+            .prices
+            .get(&invocation.request.model)
+            .ok_or_else(|| ServiceError::UnpricedModel(invocation.request.model.clone()))?;
+        let reserved_micro_usd = reservation_micro_usd(&price, &request)?;
+        if reserved_micro_usd > invocation.max_cost_micro_usd {
+            return self.reply_refusal(&invocation, Refusal::CostBound, &security);
+        }
 
         let identity = RequestIdentity {
             caller_runtime_id: invocation.caller_runtime_id.clone(),
@@ -314,15 +532,21 @@ impl TransportService {
                 return self.reply_refusal(&invocation, Refusal::ReplayConflict, &security);
             }
             return match &record.state {
-                ReplayState::Completed { response } => {
+                ReplayState::Completed {
+                    response,
+                    charged_micro_usd,
+                } => {
                     if fits_frame(response, max_frame_bytes)? {
                         return Ok(TransportAdmission::Reply(response.clone()));
                     }
+                    // The stand-in keeps the recorded charge: the request cost
+                    // what it cost whatever frame its answer travels in.
                     let stand_in = self.seal_stand_in(
                         &invocation,
                         &security,
                         max_frame_bytes,
                         FailureKind::ResultSize,
+                        *charged_micro_usd,
                     )?;
                     self.replay_store
                         .put(
@@ -330,6 +554,7 @@ impl TransportService {
                             &ReplayRecord {
                                 state: ReplayState::Completed {
                                     response: stand_in.clone(),
+                                    charged_micro_usd: *charged_micro_usd,
                                 },
                                 ..record.clone()
                             },
@@ -337,7 +562,7 @@ impl TransportService {
                         .map_err(replay_store_error)?;
                     Ok(TransportAdmission::Reply(stand_in))
                 }
-                ReplayState::Active => {
+                ReplayState::Active { .. } => {
                     let refusal = if self.live.contains(&identity) {
                         Refusal::InFlight
                     } else {
@@ -355,18 +580,39 @@ impl TransportService {
         if active_for_caller >= max_concurrent_requests {
             return self.reply_refusal(&invocation, Refusal::Capacity, &security);
         }
+        // A request belongs to the window it is admitted in. The ceiling is
+        // checked after the replay lookup, so a recorded answer is replayed
+        // whatever the caller has left.
+        let window = now_unix_ms / spend_window_ms;
+        if self
+            .window_spend(&identity.caller_runtime_id, window)
+            .saturating_add(reserved_micro_usd)
+            > spend_ceiling
+        {
+            return self.reply_refusal(&invocation, Refusal::SpendCeiling, &security);
+        }
 
+        // Reserving and claiming the request are one write: a ledger that
+        // cannot be written means nothing runs.
         let replay_record = ReplayRecord {
             caller_runtime_id: identity.caller_runtime_id.clone(),
             request_id: identity.request_id.clone(),
-            connection_key_epoch: caller.connection_key_epoch,
+            connection_key_epoch,
             invocation_sha256,
             expires_at_unix_ms: invocation.expires_at_unix_ms,
-            state: ReplayState::Active,
+            state: ReplayState::Active { reserved_micro_usd },
+            admitted_at_unix_ms: now_unix_ms,
         };
         self.replay_store
             .put(replay_key(&identity), &replay_record)
             .map_err(replay_store_error)?;
+        add_spend(
+            &mut self.window_spend,
+            &identity.caller_runtime_id,
+            window,
+            0,
+            reserved_micro_usd,
+        );
         self.live.insert(identity);
         Ok(TransportAdmission::Execute(Box::new(ExecutionClaim {
             call: ProviderCall {
@@ -380,12 +626,16 @@ impl TransportService {
                     provider: self.provider.clone(),
                     foreign_reasoning_dropped,
                     // Replaced by the backend's outcome in `transported`.
+                    cost_micro_usd: 0,
                     outcome: TransportOutcome::Failed {
                         kind: FailureKind::Provider,
                         message: String::new(),
+                        usage: None,
                     },
                 },
                 request,
+                price,
+                reserved_micro_usd,
             },
             invocation,
             invocation_sha256,
@@ -416,9 +666,10 @@ impl TransportService {
             .get::<ReplayRecord>(&replay_key(&identity))
             .map_err(replay_store_error)?
             .ok_or(ServiceError::NoActiveRequest)?;
-        if active.invocation_sha256 != claim.invocation_sha256
-            || !matches!(active.state, ReplayState::Active)
-        {
+        let ReplayState::Active { reserved_micro_usd } = active.state else {
+            return Err(ServiceError::ActiveRequestMismatch);
+        };
+        if active.invocation_sha256 != claim.invocation_sha256 {
             return Err(ServiceError::ActiveRequestMismatch);
         }
         let caller = self
@@ -426,12 +677,23 @@ impl TransportService {
             .get(&identity.caller_runtime_id)
             .ok_or(ServiceError::CallerNotAdmitted)?;
         let security = caller.security.clone();
+        let connection_key_epoch = caller.connection_key_epoch;
+        let spend_window_ms = caller.spend_window_ms;
         // A result the service refuses (not a transported result, not bound to
         // this invocation, or carrying a provider tag or drop count the call
         // did not derive) is answered like an oversized one: a typed failure
         // is recorded and the slot released, so the caller gets an answer and
         // a retry replays it.
         let admissible = self.admits_result(&result, &claim);
+        // An admissible result charges the cost its receipt carries (the real
+        // cost, even when the answer is replaced by a stand-in that fits the
+        // frame); a result the service refused charges the whole reservation.
+        let charged_micro_usd = match &result.disposition {
+            TransportDisposition::Transported { receipt, .. } if admissible => {
+                receipt.cost_micro_usd
+            }
+            _ => reserved_micro_usd,
+        };
         let mut response = if admissible {
             encrypt_result(&result, &security)?
         } else {
@@ -440,6 +702,7 @@ impl TransportService {
                 &security,
                 max_frame_bytes,
                 FailureKind::Provider,
+                charged_micro_usd,
             )
             .inspect_err(|_| {
                 self.live.remove(&identity);
@@ -455,28 +718,37 @@ impl TransportService {
                     &security,
                     max_frame_bytes,
                     FailureKind::ResultSize,
+                    charged_micro_usd,
                 )
                 .inspect_err(|_| {
                     self.live.remove(&identity);
                 })?;
         }
-        let caller = self
-            .callers
-            .get(&identity.caller_runtime_id)
-            .ok_or(ServiceError::CallerNotAdmitted)?;
         let replay_record = ReplayRecord {
             caller_runtime_id: identity.caller_runtime_id.clone(),
             request_id: identity.request_id.clone(),
-            connection_key_epoch: caller.connection_key_epoch,
+            connection_key_epoch,
             invocation_sha256: claim.invocation_sha256,
             expires_at_unix_ms: invocation.expires_at_unix_ms,
             state: ReplayState::Completed {
                 response: response.clone(),
+                charged_micro_usd,
             },
+            admitted_at_unix_ms: active.admitted_at_unix_ms,
         };
         self.replay_store
             .put(replay_key(&identity), &replay_record)
             .map_err(replay_store_error)?;
+        // Settled: the window the request was admitted in holds the charge in
+        // place of the reservation. A failed put above leaves the reservation
+        // counted, as the store does.
+        add_spend(
+            &mut self.window_spend,
+            &identity.caller_runtime_id,
+            active.admitted_at_unix_ms / spend_window_ms,
+            reserved_micro_usd,
+            charged_micro_usd,
+        );
         self.live.remove(&identity);
         Ok(response)
     }
@@ -488,6 +760,7 @@ impl TransportService {
         security: &TransportKey,
         max_frame_bytes: usize,
         kind: FailureKind,
+        cost_micro_usd: u64,
     ) -> Result<TransportEnvelope, ServiceError> {
         let (_, foreign_reasoning_dropped) =
             partition_reasoning(&invocation.request, &self.provider)
@@ -501,6 +774,7 @@ impl TransportService {
                 invocation.provider_request_sha256,
                 foreign_reasoning_dropped,
                 kind,
+                cost_micro_usd,
             ),
             security,
         )?;
@@ -512,8 +786,8 @@ impl TransportService {
     }
 
     /// Whether `result` is the answer to this claim's call: transported,
-    /// bound to the caller's invocation, and carrying the provider tag and drop
-    /// count the service derived.
+    /// bound to the caller's invocation, and carrying the provider tag, drop
+    /// count and cost the service derived.
     fn admits_result(&self, result: &TransportResult, claim: &ExecutionClaim) -> bool {
         let TransportDisposition::Transported { receipt, .. } = &result.disposition else {
             return false;
@@ -521,6 +795,7 @@ impl TransportService {
         result.validate_against(&claim.invocation).is_ok()
             && receipt.provider == self.provider
             && receipt.foreign_reasoning_dropped == claim.call.receipt.foreign_reasoning_dropped
+            && receipt.cost_micro_usd == claim.call.cost_of(&receipt.outcome)
     }
 
     fn reply_refusal(
@@ -554,6 +829,7 @@ pub(crate) fn result_size_failure(
     native_request_sha256: [u8; 32],
     provider_request_sha256: [u8; 32],
     foreign_reasoning_dropped: u32,
+    cost_micro_usd: u64,
 ) -> TransportResult {
     stand_in_failure(
         caller_runtime_id,
@@ -563,11 +839,14 @@ pub(crate) fn result_size_failure(
         provider_request_sha256,
         foreign_reasoning_dropped,
         FailureKind::ResultSize,
+        cost_micro_usd,
     )
 }
 
 /// The stand-in failure for `kind`: `ResultSize` for a result that cannot be
 /// carried, `Provider` for one the service refused.
+// One argument per fact the stand-in repeats from the invocation it answers.
+#[allow(clippy::too_many_arguments)]
 fn stand_in_failure(
     caller_runtime_id: &str,
     request_id: &str,
@@ -576,6 +855,7 @@ fn stand_in_failure(
     provider_request_sha256: [u8; 32],
     foreign_reasoning_dropped: u32,
     kind: FailureKind,
+    cost_micro_usd: u64,
 ) -> TransportResult {
     let message = match kind {
         FailureKind::ResultSize => "provider result exceeded its byte bound",
@@ -596,9 +876,11 @@ fn stand_in_failure(
                 model: model.to_string(),
                 provider: STAND_IN_PROVIDER.to_string(),
                 foreign_reasoning_dropped,
+                cost_micro_usd,
                 outcome: TransportOutcome::Failed {
                     kind,
                     message: message.to_string(),
+                    usage: None,
                 },
             }),
         },
@@ -686,6 +968,7 @@ mod tests {
             TransportService::open(
                 &store.path,
                 "fixture-sse",
+                fixture_prices(),
                 [
                     caller("epiphany-yggdrasil", "shared-key", 1),
                     caller("ghostlight-yggdrasil", "shared-key", 1),
@@ -779,9 +1062,14 @@ mod tests {
 
         let mut changed_request = request();
         changed_request.instructions.push_str(" Different cargo.");
-        let conflicting =
-            TransportInvocation::new("epiphany-yggdrasil", 2_000, [7; 32], changed_request)
-                .unwrap();
+        let conflicting = TransportInvocation::new(
+            "epiphany-yggdrasil",
+            2_000,
+            [7; 32],
+            MAX_COST,
+            changed_request,
+        )
+        .unwrap();
         let refusal = match service
             .begin(
                 &encrypt_invocation(&conflicting, &security).unwrap(),
@@ -887,6 +1175,7 @@ mod tests {
             TransportService::open(
                 &store.path,
                 "fixture-sse",
+                fixture_prices(),
                 [CallerAdmission::new(
                     "epiphany-yggdrasil",
                     "rotated-connection-key",
@@ -895,6 +1184,8 @@ mod tests {
                     1,
                     64 * 1024,
                     32_768,
+                    CEILING,
+                    WINDOW_MS,
                 )
                 .unwrap()],
                 5_000,
@@ -913,7 +1204,8 @@ mod tests {
     ) -> (TransportAdmission, TransportInvocation) {
         let mut request = invocation_for(CALLER, request_id).request;
         edit(&mut request);
-        let invocation = TransportInvocation::new(CALLER, 2_000, [7; 32], request).unwrap();
+        let invocation =
+            TransportInvocation::new(CALLER, 2_000, [7; 32], MAX_COST, request).unwrap();
         let envelope = encrypt_invocation(&invocation, &security(KEY)).unwrap();
         (service.begin(&envelope, 1_000, FRAME).unwrap(), invocation)
     }
@@ -993,11 +1285,19 @@ mod tests {
                 4,
                 max_payload_bytes,
                 32_768,
+                CEILING,
+                WINDOW_MS,
             )
             .unwrap();
-            TransportService::open(&store.path, "fixture-sse", [admission], 5_000)
-                .unwrap()
-                .begin(&envelope, 1_000, FRAME)
+            TransportService::open(
+                &store.path,
+                "fixture-sse",
+                fixture_prices(),
+                [admission],
+                5_000,
+            )
+            .unwrap()
+            .begin(&envelope, 1_000, FRAME)
         };
         assert!(matches!(admit(size), Ok(TransportAdmission::Execute(_))));
         let refused = admit(size - 1).unwrap();
@@ -1041,7 +1341,10 @@ mod tests {
             connection_key_epoch: 1,
             invocation_sha256: [1; 32],
             expires_at_unix_ms: 5_000,
-            state: ReplayState::Active,
+            state: ReplayState::Active {
+                reserved_micro_usd: 1,
+            },
+            admitted_at_unix_ms: 1_000,
         };
         edit(&mut record);
         let mut cache = CultCache::new();
@@ -1068,6 +1371,7 @@ mod tests {
             TransportService::open(
                 &control.path,
                 "fixture-sse",
+                fixture_prices(),
                 [caller(CALLER, KEY, 1)],
                 5_000
             )
@@ -1075,10 +1379,11 @@ mod tests {
         );
 
         type Edit = fn(&mut ReplayRecord);
-        let cases: [(&str, Edit); 3] = [
+        let cases: [(&str, Edit); 4] = [
             ("wrong-key", |_| {}),
             ("zero-digest", |record| record.invocation_sha256 = [0; 32]),
             ("zero-expiry", |record| record.expires_at_unix_ms = 0),
+            ("zero-admission", |record| record.admitted_at_unix_ms = 0),
         ];
         for (name, edit) in cases {
             let store = TestStore::new();
@@ -1093,6 +1398,7 @@ mod tests {
                     TransportService::open(
                         &store.path,
                         "fixture-sse",
+                        fixture_prices(),
                         [caller(CALLER, KEY, 1)],
                         5_000
                     ),
@@ -1133,6 +1439,7 @@ mod tests {
             .unwrap();
         record.state = ReplayState::Completed {
             response: encrypt_result(&result, &security(KEY)).unwrap(),
+            charged_micro_usd: 0,
         };
         service.replay_store.put(key, &record).unwrap();
         assert_eq!(
@@ -1144,7 +1451,17 @@ mod tests {
     #[test]
     fn identities_are_bounded_at_admission_and_on_the_request() {
         let admit = |caller_id: String, model: String| {
-            CallerAdmission::new(caller_id, KEY, 1, [model], 4, 64 * 1024, 32_768)
+            CallerAdmission::new(
+                caller_id,
+                KEY,
+                1,
+                [model],
+                4,
+                64 * 1024,
+                32_768,
+                CEILING,
+                WINDOW_MS,
+            )
         };
         let at = "i".repeat(MAX_IDENTITY_BYTES);
         let over = "i".repeat(MAX_IDENTITY_BYTES + 1);
@@ -1282,6 +1599,7 @@ mod tests {
                 invocation.native_request_sha256,
                 invocation.provider_request_sha256,
                 0,
+                FIXTURE_USAGE_COST,
             )
         );
         let TransportDisposition::Transported { receipt, .. } = &stand_in.disposition else {
@@ -1303,7 +1621,7 @@ mod tests {
     fn a_result_whose_sealed_envelope_fits_is_recorded_as_the_backend_made_it() {
         let store = TestStore::new();
         let mut service = open_service(&store, 8);
-        let (claim, invocation) = claim_for(&mut service, "fits");
+        let (claim, invocation) = claim_for(&mut service, "request-4");
         let small = text_result(claim.call(), "done");
         let response = service.complete(*claim, small.clone(), 1 << 20).unwrap();
         assert_eq!(
@@ -1376,6 +1694,7 @@ mod tests {
                 invocation.native_request_sha256,
                 invocation.provider_request_sha256,
                 0,
+                FIXTURE_USAGE_COST,
             )
         );
         // The stand-in is what is recorded now, byte for byte, at any frame.
@@ -1611,15 +1930,27 @@ mod tests {
         for tag in ["", " ", STAND_IN_PROVIDER] {
             assert!(
                 matches!(
-                    TransportService::open(&store.path, tag, [caller(CALLER, KEY, 1)], 5_000),
+                    TransportService::open(
+                        &store.path,
+                        tag,
+                        fixture_prices(),
+                        [caller(CALLER, KEY, 1)],
+                        5_000
+                    ),
                     Err(ServiceError::InvalidAdmission)
                 ),
                 "{tag:?}"
             );
         }
         assert!(
-            TransportService::open(&store.path, "fixture-sse", [caller(CALLER, KEY, 1)], 5_000)
-                .is_ok()
+            TransportService::open(
+                &store.path,
+                "fixture-sse",
+                fixture_prices(),
+                [caller(CALLER, KEY, 1)],
+                5_000
+            )
+            .is_ok()
         );
     }
 
@@ -1738,6 +2069,7 @@ mod tests {
             invocation.native_request_sha256,
             invocation.provider_request_sha256,
             1,
+            FIXTURE_USAGE_COST,
         );
         assert_eq!(
             decrypt_result(&response, &security(KEY), &invocation).unwrap(),
@@ -1766,5 +2098,666 @@ mod tests {
         };
         assert_eq!(receipt.provider, STAND_IN_PROVIDER);
         assert_eq!(receipt.foreign_reasoning_dropped, 1);
+    }
+
+    // ---- spend ----
+
+    fn usage(input: u64, cache_read: u64, cache_write: u64, output: u64) -> Usage {
+        Usage {
+            input_tokens: input,
+            cache_read_tokens: cache_read,
+            cache_write_tokens: cache_write,
+            output_tokens: output,
+            reasoning_tokens: None,
+        }
+    }
+
+    const MTOK: u64 = 1_000_000;
+
+    fn flat_price(rate: u64) -> ModelPrice {
+        ModelPrice {
+            rates: Rates {
+                input: rate,
+                cache_write_short: rate,
+                cache_write_long: rate,
+                cache_read: rate,
+                output: rate,
+            },
+            long_context: None,
+            overhead_tokens: 0,
+        }
+    }
+
+    fn dearest_input(rates: &Rates, retention: Option<CacheRetention>) -> u64 {
+        let write = match retention {
+            Some(CacheRetention::Short) => rates.cache_write_short,
+            Some(CacheRetention::Long) | None => rates.cache_write_long,
+        };
+        rates.input.max(rates.cache_read).max(write)
+    }
+
+    /// ceil(((encoded length + overhead) x dearest input rate + max_output_tokens
+    /// x output rate) / 1e6), spelled out apart from the service.
+    fn expected_reservation(request: &ProviderRequest, rates: &Rates, overhead: u64) -> u64 {
+        let bound = wire_encode(request).unwrap().len() as u128 + u128::from(overhead);
+        let total = bound * u128::from(dearest_input(rates, request.cache_retention))
+            + u128::from(request.max_output_tokens) * u128::from(rates.output);
+        total.div_ceil(1_000_000) as u64
+    }
+
+    /// What every fixture request (request ids of one length) reserves.
+    fn reservation() -> u64 {
+        expected_reservation(&request(), &fixture_price().rates, 100)
+    }
+
+    fn invocation_at(request_id: &str, now: u64, max_cost: u64) -> TransportInvocation {
+        let mut request = request();
+        request.request_id = request_id.to_string();
+        TransportInvocation::new(CALLER, now + 1_000, [7; 32], max_cost, request).unwrap()
+    }
+
+    fn begin_at(
+        service: &mut TransportService,
+        request_id: &str,
+        now: u64,
+        max_cost: u64,
+    ) -> (TransportAdmission, TransportInvocation) {
+        let invocation = invocation_at(request_id, now, max_cost);
+        let admission = service
+            .begin(&raw_envelope(&invocation), now, FRAME)
+            .unwrap();
+        (admission, invocation)
+    }
+
+    fn claim_at(service: &mut TransportService, request_id: &str, now: u64) -> Box<ExecutionClaim> {
+        match begin_at(service, request_id, now, MAX_COST).0 {
+            TransportAdmission::Execute(claim) => claim,
+            TransportAdmission::Reply(_) => panic!("{request_id} should have executed"),
+        }
+    }
+
+    fn refusal_at(
+        service: &mut TransportService,
+        request_id: &str,
+        now: u64,
+        max_cost: u64,
+    ) -> Refusal {
+        let (admission, invocation) = begin_at(service, request_id, now, max_cost);
+        refusal_of(admission, &invocation)
+    }
+
+    fn open_limited(store: &TestStore, ceiling: u64, window_ms: u64) -> TransportService {
+        TransportService::open(
+            &store.path,
+            "fixture-sse",
+            fixture_prices(),
+            [CallerAdmission::new(
+                CALLER,
+                KEY,
+                1,
+                ["gpt-5.4".to_string()],
+                8,
+                65_536,
+                32_768,
+                ceiling,
+                window_ms,
+            )
+            .unwrap()],
+            5_000,
+        )
+        .unwrap()
+    }
+
+    fn record_of(service: &TransportService, request_id: &str) -> Option<ReplayRecord> {
+        service
+            .replay_store
+            .get::<ReplayRecord>(&replay_key(&RequestIdentity {
+                caller_runtime_id: CALLER.to_string(),
+                request_id: request_id.to_string(),
+            }))
+            .unwrap()
+    }
+
+    fn charged_of(service: &TransportService, request_id: &str) -> u64 {
+        match record_of(service, request_id).unwrap().state {
+            ReplayState::Completed {
+                charged_micro_usd, ..
+            } => charged_micro_usd,
+            ReplayState::Active { .. } => panic!("{request_id} is not completed"),
+        }
+    }
+
+    fn receipt_of(
+        response: &TransportEnvelope,
+        invocation: &TransportInvocation,
+    ) -> TransportReceipt {
+        let TransportDisposition::Transported { receipt, .. } =
+            decrypt_result(response, &security(KEY), invocation)
+                .unwrap()
+                .disposition
+        else {
+            panic!("expected a transported result");
+        };
+        *receipt
+    }
+
+    #[test]
+    fn cost_prices_each_usage_class_at_its_own_rate() {
+        let price = fixture_price();
+        let cost = |usage: Usage| cost_micro_usd(&price, &usage, Some(CacheRetention::Long));
+        assert_eq!(cost(usage(MTOK, 0, 0, 0)), 3_000_000);
+        assert_eq!(cost(usage(0, MTOK, 0, 0)), 300_000);
+        assert_eq!(cost(usage(0, 0, MTOK, 0)), 6_000_000);
+        assert_eq!(cost(usage(0, 0, 0, MTOK)), 15_000_000);
+        assert_eq!(
+            cost(usage(2 * MTOK, 3 * MTOK, 5 * MTOK, 7 * MTOK)),
+            6_000_000 + 900_000 + 30_000_000 + 105_000_000
+        );
+        // Reasoning tokens are a detail of the output tokens, never priced apart.
+        let mut reasoning_only = usage(0, 0, 0, 0);
+        reasoning_only.reasoning_tokens = Some(MTOK);
+        assert_eq!(cost(reasoning_only), 0);
+        let mut detailed = usage(0, 0, 0, MTOK);
+        detailed.reasoning_tokens = Some(MTOK);
+        assert_eq!(cost(detailed), 15_000_000);
+    }
+
+    #[test]
+    fn cost_rounds_up_once_per_request() {
+        let price = flat_price(10_000);
+        let cost = |usage: Usage| cost_micro_usd(&price, &usage, None);
+        assert_eq!(cost(usage(0, 1, 0, 0)), 1);
+        assert_eq!(cost(usage(0, 0, 0, 0)), 0);
+        // Four classes at one token each: 40,000 / 1e6 rounds up once, to 1.
+        assert_eq!(cost(usage(1, 1, 1, 1)), 1);
+        assert_eq!(cost(usage(100, 0, 0, 0)), 1);
+        assert_eq!(cost(usage(101, 0, 0, 0)), 2);
+    }
+
+    #[test]
+    fn cache_writes_price_by_retention() {
+        let price = fixture_price();
+        let written = usage(0, 0, MTOK, 0);
+        assert_eq!(
+            cost_micro_usd(&price, &written, Some(CacheRetention::Short)),
+            3_750_000
+        );
+        assert_eq!(
+            cost_micro_usd(&price, &written, Some(CacheRetention::Long)),
+            6_000_000
+        );
+        // A write nobody asked to keep short is priced dear.
+        assert_eq!(cost_micro_usd(&price, &written, None), 6_000_000);
+    }
+
+    #[test]
+    fn long_context_rates_apply_strictly_above_the_threshold() {
+        let long = Rates {
+            input: 9_000_000,
+            cache_write_short: 9_500_000,
+            cache_write_long: 12_000_000,
+            cache_read: 900_000,
+            output: 45_000_000,
+        };
+        let price = |above_prompt_tokens: u64, overhead_tokens: u64| ModelPrice {
+            long_context: Some(LongContext {
+                above_prompt_tokens,
+                rates: long,
+            }),
+            overhead_tokens,
+            ..fixture_price()
+        };
+        // Prompt tokens are input + cache reads + cache writes.
+        let at_threshold = cost_micro_usd(&price(100, 0), &usage(1, 1, 98, 0), None);
+        assert_eq!(at_threshold, 592); // 3e6 + 3e5 + 98 x 6e6 = 591.3e6, base rates
+        let above = cost_micro_usd(&price(100, 0), &usage(1, 1, 99, 0), None);
+        assert_eq!(above, 1198); // 9e6 + 9e5 + 99 x 12e6 = 1197.9e6, long rates
+        assert_eq!(
+            cost_micro_usd(&price(100, 0), &usage(100, 0, 0, 0), None),
+            300
+        );
+        assert_eq!(
+            cost_micro_usd(&price(100, 0), &usage(101, 0, 0, 0), None),
+            909
+        );
+
+        // The reservation switches at the same strict threshold, on its byte bound.
+        let request = request();
+        let length = wire_encode(&request).unwrap().len() as u64;
+        let bound = length + 7;
+        assert_eq!(
+            reservation_micro_usd(&price(bound, 7), &request).unwrap(),
+            expected_reservation(&request, &fixture_price().rates, 7)
+        );
+        assert_eq!(
+            reservation_micro_usd(&price(bound - 1, 7), &request).unwrap(),
+            expected_reservation(&request, &long, 7)
+        );
+    }
+
+    #[test]
+    fn cost_saturates_instead_of_wrapping() {
+        let price = fixture_price();
+        for huge in [
+            usage(u64::MAX, 0, 0, 0),
+            usage(0, 0, u64::MAX, 0),
+            usage(0, 0, 0, u64::MAX),
+            usage(u64::MAX, u64::MAX, u64::MAX, u64::MAX),
+        ] {
+            assert_eq!(cost_micro_usd(&price, &huge, None), u64::MAX, "{huge:?}");
+        }
+        // A class that does not overflow is exact: 300,000 x u64::MAX / 1e6, rounded up.
+        assert_eq!(
+            cost_micro_usd(&price, &usage(0, u64::MAX, 0, 0), None),
+            5_534_023_222_112_865_485
+        );
+    }
+
+    #[test]
+    fn reservation_is_the_byte_bound_plus_max_output() {
+        let rate_sets = [
+            (fixture_price().rates, 100),
+            // The dearest input rate is a cache read here...
+            (
+                Rates {
+                    input: 1_000_000,
+                    cache_write_short: 2_000_000,
+                    cache_write_long: 3_000_000,
+                    cache_read: 8_000_000,
+                    output: 5_000_000,
+                },
+                7,
+            ),
+            // ...and plain input here.
+            (
+                Rates {
+                    input: 9_000_000,
+                    cache_write_short: 1_000_000,
+                    cache_write_long: 2_000_000,
+                    cache_read: 3_000_000,
+                    output: 4_000_000,
+                },
+                0,
+            ),
+        ];
+        for (rates, overhead_tokens) in rate_sets {
+            let price = ModelPrice {
+                rates,
+                long_context: None,
+                overhead_tokens,
+            };
+            for retention in [
+                None,
+                Some(CacheRetention::Short),
+                Some(CacheRetention::Long),
+            ] {
+                let mut request = request();
+                request.cache_retention = retention;
+                assert_eq!(
+                    reservation_micro_usd(&price, &request).unwrap(),
+                    expected_reservation(&request, &rates, overhead_tokens),
+                    "{rates:?} {retention:?}"
+                );
+            }
+        }
+        // More output costs at least its price, and the bound follows the encoding
+        // (a wider integer is more bytes).
+        let price = fixture_price();
+        let mut reserved = Vec::new();
+        for max_output_tokens in [1, 1_000, 1_001_000] {
+            let mut request = request();
+            request.max_output_tokens = max_output_tokens;
+            let amount = reservation_micro_usd(&price, &request).unwrap();
+            assert_eq!(
+                amount,
+                expected_reservation(&request, &price.rates, 100),
+                "{max_output_tokens}"
+            );
+            reserved.push(amount);
+        }
+        assert!(reserved[2] - reserved[1] >= 15_000_000);
+    }
+
+    #[test]
+    fn worst_case_over_max_cost_is_refused_cost_bound_inclusively() {
+        let store = TestStore::new();
+        let mut service = open_service(&store, 1);
+        let reserved = reservation();
+        let (admission, _) = begin_at(&mut service, "request-1", 1_000, reserved);
+        assert!(matches!(admission, TransportAdmission::Execute(_)));
+        // The only slot is taken: a request refused for its cost is refused
+        // for that, before the replay lookup and the capacity check.
+        assert_eq!(
+            refusal_at(&mut service, "request-2", 1_000, reserved - 1),
+            Refusal::CostBound
+        );
+        assert!(record_of(&service, "request-2").is_none());
+        assert_eq!(service.window_spend(CALLER, 0), reserved);
+        assert_eq!(
+            refusal_at(&mut service, "request-3", 1_000, reserved),
+            Refusal::Capacity
+        );
+    }
+
+    #[test]
+    fn max_cost_zero_is_malformed() {
+        let store = TestStore::new();
+        let mut service = open_service(&store, 4);
+        assert_eq!(
+            refusal_at(&mut service, "request-1", 1_000, 0),
+            Refusal::Malformed
+        );
+        assert!(record_of(&service, "request-1").is_none());
+    }
+
+    #[test]
+    fn a_changed_max_cost_is_a_replay_conflict() {
+        let store = TestStore::new();
+        let mut service = open_service(&store, 4);
+        let claim = claim_at(&mut service, "request-1", 1_000);
+        let result = text_result(claim.call(), "done");
+        service.complete(*claim, result, FRAME).unwrap();
+        assert_eq!(
+            refusal_at(&mut service, "request-1", 1_000, MAX_COST + 1),
+            Refusal::ReplayConflict
+        );
+    }
+
+    #[test]
+    fn spend_ceiling_refuses_inclusively_and_resets_next_window() {
+        let reserved = reservation();
+        let window = 10_000;
+        let store = TestStore::new();
+        let mut service = open_limited(&store, 2 * reserved, window);
+        claim_at(&mut service, "request-1", 1_000);
+        // Windows are aligned to the epoch: the last millisecond of window 0.
+        claim_at(&mut service, "request-2", 9_999);
+        assert_eq!(service.window_spend(CALLER, 0), 2 * reserved);
+        assert_eq!(
+            refusal_at(&mut service, "request-3", 9_999, MAX_COST),
+            Refusal::SpendCeiling
+        );
+        assert!(record_of(&service, "request-3").is_none());
+        // The first millisecond of window 1: the same request id is admitted.
+        claim_at(&mut service, "request-3", 10_000);
+        assert_eq!(service.window_spend(CALLER, 0), 2 * reserved);
+        assert_eq!(service.window_spend(CALLER, 1), reserved);
+
+        // One micro-USD below the two reservations refuses the second.
+        let store = TestStore::new();
+        let mut service = open_limited(&store, 2 * reserved - 1, window);
+        claim_at(&mut service, "request-1", 1_000);
+        assert_eq!(
+            refusal_at(&mut service, "request-2", 1_000, MAX_COST),
+            Refusal::SpendCeiling
+        );
+    }
+
+    #[test]
+    fn a_recorded_answer_replays_past_an_exhausted_ceiling() {
+        let reserved = reservation();
+        let store = TestStore::new();
+        let mut service = open_limited(&store, reserved, 3_600_000);
+        let (admission, _) = begin_at(&mut service, "request-1", 1_000, MAX_COST);
+        let TransportAdmission::Execute(claim) = admission else {
+            panic!("the first request fits the ceiling exactly");
+        };
+        let result = text_result(claim.call(), "done");
+        let response = service.complete(*claim, result, FRAME).unwrap();
+        // Spent 75 of a ceiling that holds one reservation: nothing else fits.
+        assert_eq!(
+            refusal_at(&mut service, "request-2", 1_000, MAX_COST),
+            Refusal::SpendCeiling
+        );
+        // The recorded answer is replayed whatever the caller has left.
+        let (replay, _) = begin_at(&mut service, "request-1", 1_000, MAX_COST);
+        assert_eq!(replay, TransportAdmission::Reply(response));
+    }
+
+    #[test]
+    fn settlement_replaces_the_reservation_with_the_charge() {
+        let store = TestStore::new();
+        let mut service = open_service(&store, 4);
+        let claim = claim_at(&mut service, "request-1", 1_000);
+        assert_eq!(service.window_spend(CALLER, 0), reservation());
+        let result = text_result(claim.call(), "done");
+        service.complete(*claim, result, FRAME).unwrap();
+        assert_eq!(service.window_spend(CALLER, 0), FIXTURE_USAGE_COST);
+        assert_eq!(charged_of(&service, "request-1"), FIXTURE_USAGE_COST);
+    }
+
+    #[test]
+    fn failed_with_usage_charges_usage_and_failed_without_keeps_the_reservation() {
+        let failed = |usage: Option<Usage>| TransportOutcome::Failed {
+            kind: FailureKind::Provider,
+            message: "the provider refused".to_string(),
+            usage,
+        };
+        let store = TestStore::new();
+        let mut service = open_service(&store, 4);
+
+        let claim = claim_at(&mut service, "request-1", 1_000);
+        let result = claim
+            .call()
+            .transported(Vec::new(), failed(Some(usage(0, 0, 0, 0))));
+        let invocation = invocation_at("request-1", 1_000, MAX_COST);
+        let response = service.complete(*claim, result, FRAME).unwrap();
+        assert_eq!(receipt_of(&response, &invocation).cost_micro_usd, 0);
+        assert_eq!(charged_of(&service, "request-1"), 0);
+        assert_eq!(service.window_spend(CALLER, 0), 0);
+
+        let claim = claim_at(&mut service, "request-2", 1_000);
+        let result = claim
+            .call()
+            .transported(Vec::new(), failed(Some(usage(MTOK, 0, 0, 0))));
+        service.complete(*claim, result, FRAME).unwrap();
+        assert_eq!(charged_of(&service, "request-2"), 3_000_000);
+
+        let claim = claim_at(&mut service, "request-3", 1_000);
+        let result = claim.call().transported(Vec::new(), failed(None));
+        let invocation = invocation_at("request-3", 1_000, MAX_COST);
+        let response = service.complete(*claim, result, FRAME).unwrap();
+        assert_eq!(
+            receipt_of(&response, &invocation).cost_micro_usd,
+            reservation()
+        );
+        assert_eq!(charged_of(&service, "request-3"), reservation());
+        assert_eq!(service.window_spend(CALLER, 0), 3_000_000 + reservation());
+    }
+
+    #[test]
+    fn a_backend_cost_misreport_is_answered_with_the_stand_in() {
+        let edits: [fn(u64) -> u64; 3] = [|cost| cost + 1, |cost| cost - 1, |_| 0];
+        for (index, edit) in edits.into_iter().enumerate() {
+            let store = TestStore::new();
+            let mut service = open_service(&store, 4);
+            let id = format!("request-{index}");
+            let claim = claim_at(&mut service, &id, 1_000);
+            let mut result = text_result(claim.call(), "done");
+            let TransportDisposition::Transported { receipt, .. } = &mut result.disposition else {
+                unreachable!();
+            };
+            receipt.cost_micro_usd = edit(receipt.cost_micro_usd);
+            let invocation = invocation_at(&id, 1_000, MAX_COST);
+            let response = service.complete(*claim, result, FRAME).unwrap();
+            let receipt = receipt_of(&response, &invocation);
+            assert_eq!(receipt.provider, STAND_IN_PROVIDER, "{index}");
+            // A result the service refused is billed as the worst case.
+            assert_eq!(receipt.cost_micro_usd, reservation(), "{index}");
+            assert_eq!(charged_of(&service, &id), reservation(), "{index}");
+            assert_eq!(service.window_spend(CALLER, 0), reservation(), "{index}");
+        }
+    }
+
+    #[test]
+    fn result_size_stand_in_keeps_the_real_charge() {
+        let store = TestStore::new();
+        let mut service = open_service(&store, 4);
+        let claim = claim_at(&mut service, "request-1", 1_000);
+        let big = text_result(claim.call(), &"y".repeat(4000));
+        let invocation = invocation_at("request-1", 1_000, MAX_COST);
+        let response = service.complete(*claim, big, 2000).unwrap();
+        let receipt = receipt_of(&response, &invocation);
+        assert_eq!(receipt.provider, STAND_IN_PROVIDER);
+        assert_eq!(receipt.cost_micro_usd, FIXTURE_USAGE_COST);
+        assert_eq!(charged_of(&service, "request-1"), FIXTURE_USAGE_COST);
+        assert_eq!(service.window_spend(CALLER, 0), FIXTURE_USAGE_COST);
+
+        // The replay path: a wide record re-measured at a smaller frame.
+        let claim = claim_at(&mut service, "request-2", 1_000);
+        let big = text_result(claim.call(), &"y".repeat(4000));
+        service.complete(*claim, big, FRAME).unwrap();
+        drop(service);
+        let mut service = open_service(&store, 4);
+        let invocation = invocation_at("request-2", 1_000, MAX_COST);
+        let TransportAdmission::Reply(smaller) = service
+            .begin(&raw_envelope(&invocation), 1_000, 2000)
+            .unwrap()
+        else {
+            panic!("expected a replay");
+        };
+        let receipt = receipt_of(&smaller, &invocation);
+        assert_eq!(receipt.provider, STAND_IN_PROVIDER);
+        assert_eq!(receipt.cost_micro_usd, FIXTURE_USAGE_COST);
+        assert_eq!(charged_of(&service, "request-2"), FIXTURE_USAGE_COST);
+        assert_eq!(service.window_spend(CALLER, 0), 2 * FIXTURE_USAGE_COST);
+    }
+
+    #[test]
+    fn a_ledger_write_failure_executes_nothing() {
+        let refusing = FlakyStore::new(0);
+        let healthy = refusing.reopened(5);
+        let mut service = open_flaky(refusing);
+        let invocation = invocation_for(CALLER, "request-1");
+        assert!(matches!(
+            service.begin(&raw_envelope(&invocation), 1_000, FRAME),
+            Err(ServiceError::ReplayStore(_))
+        ));
+        assert_eq!(service.window_spend(CALLER, 0), 0);
+        assert!(service.live.is_empty());
+        assert!(record_of(&service, "request-1").is_none());
+        drop(service);
+
+        // Nothing was written, so the same ledger admits the request afresh.
+        let mut service = open_flaky(healthy);
+        claim_at(&mut service, "request-1", 1_000);
+    }
+
+    #[test]
+    fn a_settle_write_failure_keeps_the_reservation_counted() {
+        let one_write = FlakyStore::new(1);
+        let restart = one_write.reopened(5);
+        let mut service = open_flaky(one_write);
+        let claim = claim_at(&mut service, "request-1", 1_000);
+        let result = text_result(claim.call(), "done");
+        assert!(matches!(
+            service.complete(*claim, result, FRAME),
+            Err(ServiceError::ReplayStore(_))
+        ));
+        assert_eq!(service.window_spend(CALLER, 0), reservation());
+        assert!(matches!(
+            record_of(&service, "request-1").unwrap().state,
+            ReplayState::Active { .. }
+        ));
+        drop(service);
+
+        // A restart bills the indeterminate request at its whole reservation.
+        let service = open_flaky(restart);
+        assert_eq!(service.window_spend(CALLER, 0), reservation());
+    }
+
+    #[test]
+    fn restart_rederives_window_spend_from_the_records() {
+        let reserved = reservation();
+        let window = 10_000;
+        let store = TestStore::new();
+        let mut service = open_limited(&store, 1 << 40, window);
+        // An earlier window: completed.
+        let claim = claim_at(&mut service, "request-1", 1_000);
+        let result = text_result(claim.call(), "done");
+        service.complete(*claim, result, FRAME).unwrap();
+        // The current window: one completed, one left Active by a crash.
+        let claim = claim_at(&mut service, "request-2", 10_500);
+        let result = text_result(claim.call(), "done");
+        service.complete(*claim, result, FRAME).unwrap();
+        claim_at(&mut service, "request-3", 10_600);
+        drop(service);
+
+        let mut service = open_limited(&store, FIXTURE_USAGE_COST + 2 * reserved, window);
+        assert_eq!(service.window_spend(CALLER, 0), FIXTURE_USAGE_COST);
+        assert_eq!(
+            service.window_spend(CALLER, 1),
+            FIXTURE_USAGE_COST + reserved
+        );
+        // The ceiling sees the rebuilt window: one more reservation fits it
+        // exactly, and the next does not. The earlier window counts for nothing.
+        claim_at(&mut service, "request-4", 11_000);
+        assert_eq!(
+            refusal_at(&mut service, "request-5", 11_100, MAX_COST),
+            Refusal::SpendCeiling
+        );
+    }
+
+    #[test]
+    fn open_refuses_an_unpriced_model_and_admits_a_zero_price() {
+        let store = TestStore::new();
+        assert_eq!(
+            TransportService::open(
+                &store.path,
+                "fixture-sse",
+                PriceTable::from([("another-model".to_string(), fixture_price())]),
+                [caller(CALLER, KEY, 1)],
+                5_000,
+            )
+            .err(),
+            Some(ServiceError::UnpricedModel("gpt-5.4".to_string()))
+        );
+
+        let free = PriceTable::from([("gpt-5.4".to_string(), flat_price(0))]);
+        let mut service = TransportService::open(
+            &store.path,
+            "fixture-sse",
+            free,
+            [caller(CALLER, KEY, 1)],
+            5_000,
+        )
+        .unwrap();
+        let claim = claim_at(&mut service, "request-1", 1_000);
+        assert_eq!(service.window_spend(CALLER, 0), 0);
+        let result = text_result(claim.call(), "done");
+        service.complete(*claim, result, FRAME).unwrap();
+        assert_eq!(charged_of(&service, "request-1"), 0);
+        assert_eq!(service.window_spend(CALLER, 0), 0);
+    }
+
+    #[test]
+    fn a_ceiling_and_a_window_are_required_nonzero() {
+        let admit = |ceiling: u64, window_ms: u64| {
+            CallerAdmission::new(
+                CALLER,
+                KEY,
+                1,
+                ["gpt-5.4".to_string()],
+                4,
+                64 * 1024,
+                32_768,
+                ceiling,
+                window_ms,
+            )
+        };
+        assert!(admit(1, 1).is_ok());
+        assert!(matches!(admit(0, 1), Err(ServiceError::InvalidAdmission)));
+        assert!(matches!(admit(1, 0), Err(ServiceError::InvalidAdmission)));
+    }
+
+    fn open_flaky(store: FlakyStore) -> TransportService {
+        TransportService::with_store(
+            store,
+            "fixture-sse",
+            fixture_prices(),
+            [caller(CALLER, KEY, 1)],
+            5_000,
+        )
+        .unwrap()
     }
 }

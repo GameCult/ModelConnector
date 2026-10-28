@@ -106,6 +106,8 @@ fn start_with(backend: Arc<dyn ProviderBackend>, max_concurrent: usize) -> Conne
         max_concurrent,
         64 * 1024,
         32_768,
+        1 << 40,
+        3_600_000,
     )
     .unwrap();
     let limits = ServeLimits {
@@ -114,7 +116,21 @@ fn start_with(backend: Arc<dyn ProviderBackend>, max_concurrent: usize) -> Conne
         socket_timeout_ms: 5_000,
         max_expiry_skew_ms: 300_000,
     };
-    thread::spawn(move || serve(listener, limits, vec![admission], &store, backend));
+    let prices = PriceTable::from([(
+        "claude-opus-4-5".to_string(),
+        ModelPrice {
+            rates: Rates {
+                input: 5_000_000,
+                cache_write_short: 6_250_000,
+                cache_write_long: 10_000_000,
+                cache_read: 500_000,
+                output: 25_000_000,
+            },
+            long_context: None,
+            overhead_tokens: 100,
+        },
+    )]);
+    thread::spawn(move || serve(listener, limits, vec![admission], prices, &store, backend));
     ConnectorClient::new(endpoint, KEY, FRAME, Some(Duration::from_secs(5))).unwrap()
 }
 
@@ -127,7 +143,7 @@ fn invocation(request_id: &str, input: Vec<InputItem>) -> TransportInvocation {
         4_096,
     );
     request.input = input;
-    TransportInvocation::new(CALLER, now_ms() + 60_000, [7; 32], request).unwrap()
+    TransportInvocation::new(CALLER, now_ms() + 60_000, [7; 32], 10_000_000, request).unwrap()
 }
 
 fn user(text: &str) -> InputItem {
@@ -313,9 +329,10 @@ impl ProviderBackend for TamperingBackend {
 
 #[test]
 fn a_refused_completion_reaches_the_caller_as_a_typed_failure_and_frees_the_slot() {
-    let edits: [fn(&mut TransportReceipt); 2] = [
+    let edits: [fn(&mut TransportReceipt); 3] = [
         |receipt| receipt.provider = "another-provider".to_string(),
         |receipt| receipt.foreign_reasoning_dropped += 1,
+        |receipt| receipt.cost_micro_usd += 1,
     ];
     for edit in edits {
         // One concurrent request: a wedged slot would refuse the next id.
