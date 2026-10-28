@@ -1,8 +1,9 @@
 # Golden v2 wire fixtures
 
 Bytes of the v2 connector wire, produced once by CodexConnector at commit
-`fd7cec4176f4e3f9a5aaa75e77ba10ce5e1522f8` (the library Ghostlight pins),
-and pinned by `tests/wire_golden_v2.rs` so that the kit cannot drift from
+`fd7cec4176f4e3f9a5aaa75e77ba10ce5e1522f8`. Ghostlight pins CodexConnector
+`68fe94b`, not that commit; `src/lib.rs`, the whole v2 wire, is identical in
+both, so these bytes are Ghostlight's wire. They are pinned by `tests/wire_golden_v2.rs`, so the kit cannot drift from
 them. No CodexConnector code or dependency is part of this repository.
 
 Generator: `generator.rs` (not compiled here). Command, run in a clone of
