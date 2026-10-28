@@ -393,6 +393,34 @@ impl ProviderCall {
         })
     }
 
+    /// What a completed `result` is billed: the one owner of the charge
+    /// decision. A transported result bound to `invocation` by request id and
+    /// caller (on the result and on its receipt) costs what its own outcome's
+    /// usage derives, with the overrun past the reservation recorded
+    /// truthfully, whether or not it is otherwise malformed. Any other result
+    /// (refused, or bound to another request or caller) costs the whole
+    /// reservation. Validity decides what the caller is told, never this.
+    fn charge(&self, invocation: &TransportInvocation, result: &TransportResult) -> Charge {
+        match &result.disposition {
+            TransportDisposition::Transported { receipt, .. }
+                if result.request_id == invocation.request_id()
+                    && result.caller_runtime_id == invocation.caller_runtime_id
+                    && receipt.request_id == invocation.request_id()
+                    && receipt.caller_runtime_id == invocation.caller_runtime_id =>
+            {
+                let cost_micro_usd = self.cost_of(&receipt.outcome);
+                Charge {
+                    cost_micro_usd,
+                    overrun_micro_usd: self.overrun_of(cost_micro_usd),
+                }
+            }
+            _ => Charge {
+                cost_micro_usd: self.reserved_micro_usd,
+                overrun_micro_usd: 0,
+            },
+        }
+    }
+
     /// How far `cost_micro_usd` exceeds what was reserved. The reservation is
     /// the worst case the kit can compute, so a nonzero overrun means the
     /// backend broke its contract (usage above its own request's bounds).
@@ -839,28 +867,7 @@ impl TransportService {
         // is recorded and the slot released, so the caller gets an answer and
         // a retry replays it.
         let admissible = self.admits_result(&result, &claim);
-        // The service prices what the backend reported, but only for a result
-        // bound to this invocation: a transported result charges the cost its
-        // own outcome's usage derives, and its overrun past the reservation,
-        // whatever its receipt says (a receipt that misstates either is
-        // replaced by the stand-in but still charged the true cost). Any
-        // other result, including one bound to another request, charges the
-        // whole reservation.
-        let charge = match &result.disposition {
-            TransportDisposition::Transported { receipt, .. }
-                if result.validate_against(invocation).is_ok() =>
-            {
-                let cost_micro_usd = claim.call.cost_of(&receipt.outcome);
-                Charge {
-                    cost_micro_usd,
-                    overrun_micro_usd: claim.call.overrun_of(cost_micro_usd),
-                }
-            }
-            _ => Charge {
-                cost_micro_usd: reserved_micro_usd,
-                overrun_micro_usd: 0,
-            },
-        };
+        let charge = claim.call.charge(invocation, &result);
         let charged_micro_usd = charge.cost_micro_usd;
         let mut response = if admissible {
             encrypt_result(&result, &security).inspect_err(|_| {
@@ -3472,6 +3479,76 @@ mod tests {
     }
 
     #[test]
+    fn a_bound_malformed_overrun_is_charged_its_true_cost_and_reaches_the_ceiling() {
+        let reserved = reservation();
+        for case in 0..3 {
+            let store = TestStore::new();
+            let mut service = open_limited(&store, 2 * reserved, 3_600_000);
+            let claim = claim_at(&mut service, "request-1", 1_000);
+            let mut result = overrun_result(claim.call(), "done");
+            let TransportDisposition::Transported { events, receipt } = &mut result.disposition
+            else {
+                unreachable!();
+            };
+            match case {
+                0 => events[0].sequence = 1,
+                1 => {
+                    let TransportOutcome::Completed { usage, .. } = &receipt.outcome else {
+                        unreachable!();
+                    };
+                    receipt.outcome = TransportOutcome::Failed {
+                        kind: FailureKind::Provider,
+                        message: String::new(),
+                        usage: Some(usage.clone()),
+                    };
+                }
+                _ => receipt.provider = String::new(),
+            }
+            let invocation = invocation_at("request-1", 1_000, MAX_COST);
+            assert!(result.validate_against(&invocation).is_err(), "{case}");
+            let response = service.complete(*claim, result, FRAME).unwrap();
+            // The caller is told the result was refused; the bill is its true cost.
+            assert_eq!(
+                receipt_of(&response, &invocation).provider,
+                STAND_IN_PROVIDER,
+                "{case}"
+            );
+            assert_eq!(charged_of(&service, "request-1"), OVERRUN_COST, "{case}");
+            assert_eq!(service.window_spend(CALLER, 0), OVERRUN_COST, "{case}");
+            assert_eq!(
+                refusal_at(&mut service, "request-2", 1_000, MAX_COST),
+                Refusal::SpendCeiling,
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn each_binding_check_alone_sends_a_result_to_the_reservation() {
+        let reserved = reservation();
+        // Every other field is valid and the usage overruns: a guard that
+        // ignored the one changed identity field would charge 30,000,000.
+        for case in 0..4 {
+            let store = TestStore::new();
+            let mut service = open_limited(&store, 2 * reserved, 3_600_000);
+            let claim = claim_at(&mut service, "request-1", 1_000);
+            let mut result = overrun_result(claim.call(), "done");
+            let TransportDisposition::Transported { receipt, .. } = &mut result.disposition else {
+                unreachable!();
+            };
+            match case {
+                0 => result.request_id = "request-2".to_string(),
+                1 => result.caller_runtime_id = "another-caller".to_string(),
+                2 => receipt.request_id = "request-2".to_string(),
+                _ => receipt.caller_runtime_id = "another-caller".to_string(),
+            }
+            service.complete(*claim, result, FRAME).unwrap();
+            assert_eq!(charged_of(&service, "request-1"), reserved, "{case}");
+            assert_eq!(service.window_spend(CALLER, 0), reserved, "{case}");
+        }
+    }
+
+    #[test]
     fn a_result_that_is_not_transported_is_charged_the_reservation() {
         let store = TestStore::new();
         let mut service = open_service(&store, 4);
@@ -3518,10 +3595,7 @@ mod tests {
         let mut service = open_limited(&store, ceiling, window);
         assert_eq!(service.admission_window_start_unix_ms(CALLER), None);
         assert_eq!(run_window(&mut service, "fill", 50_000), 3);
-        assert_eq!(
-            service.admission_window_start_unix_ms(CALLER),
-            Some(50_000)
-        );
+        assert_eq!(service.admission_window_start_unix_ms(CALLER), Some(50_000));
         // Behind the full window: the cause is named, no slot is taken and
         // nothing is reserved.
         assert_eq!(
