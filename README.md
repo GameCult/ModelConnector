@@ -1,26 +1,48 @@
 # ModelConnector
 
-Status: planned. Nothing is implemented in this repository yet.
+The connector kit for GameCult minds: one typed, encrypted, replay-safe contract
+between a caller that needs a model turn and a daemon that holds the provider
+credential, so no project wires its own provider calls.
 
-## What it will hold
+Status: the `model-connector` crate is live. No connector binary exists yet
+(the Claude connector is first, then an OpenAI-compatible one).
 
-The connector kit for GameCult minds:
+## Entry points
 
-- the connector contract, a Rust crate defining the typed boundary every model
-  turn of a GameCult mind goes through;
-- connector daemons that implement the contract against a model provider,
-  Claude first, then an OpenAI-compatible connector.
+Crate `crates/model-connector`:
 
-The problem it solves: a mind should reach any model through one inspectable,
-typed contract, rather than each project wiring its own provider calls.
+- `src/contract.rs` - the v2 wire contract: `ProviderRequest`, `TransportInvocation`,
+  `TransportResult`, `TransportReceipt`, `Refusal`, and the canonical byte and digest
+  functions that bind a result to its request.
+- `src/envelope.rs` - the AES-256-GCM `TransportEnvelope`, its identity-binding AAD, and
+  the length-prefixed framing.
+- `src/client.rs` - `ConnectorClient`, the one-request caller side.
+- `src/service.rs` (feature `daemon`) - `TransportService`: caller admission, durable
+  replay (a retried request is answered byte-identically and the provider runs once),
+  in-flight and capacity refusals.
+- `src/serve.rs` (feature `daemon`) - `serve()`, the loopback accept loop, over the
+  `ProviderBackend` trait. A connector binary implements `ProviderBackend` for its
+  provider and calls `serve`; the kit names no provider.
 
-## Where it comes from
+The default feature set compiles contract, envelope and client only. Schema ids are
+still `gamecult.codex.*.v2`; renaming them changes the wire and belongs to a later
+contract version.
 
-[CodexConnector](https://github.com/GameCult/CodexConnector)
-(GameCult/CodexConnector) is the existing connector this kit is lifted from.
-The lift is the first piece of work here; until it lands there are no entry
-points to run.
+## Verify
 
-## License
+```
+cargo test --locked --workspace
+cargo test --locked --workspace --features model-connector/daemon
+```
+
+`tests/wire_parity_v2.rs` pins the kit byte-for-byte to CodexConnector fd7cec4 in both
+directions (it fetches that revision as a dev-dependency).
+
+## Provenance and license
 
 AGPL-3.0-only. See `LICENSE`.
+
+The contract, envelope, client, replay service and serve loop were lifted from
+[CodexConnector](https://github.com/GameCult/CodexConnector) at fd7cec4, formerly
+PolyForm Noncommercial. Its sole copyright holder relicensed the lifted material as
+AGPL-3.0-only for this repository.
