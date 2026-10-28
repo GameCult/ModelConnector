@@ -29,7 +29,7 @@ caller payload bound of `n` needs, `payload_bytes_for_frame(frame)` is the large
 a frame allows, and `MAX_IDENTITY_BYTES` (256) bounds caller ids, request ids and model names.
 `serve` refuses a frame/payload pair that violates them (`ServeError::FrameBound` states the frame
 needed); the smallest legal frame is `frame_bytes_for_payload(MIN_PAYLOAD_BYTES)`. A request id past
-the bound is refused on the wire as `Refusal::Malformed`, the reply naming it by its SHA-256.
+the bound is refused on the wire as `Refusal::Malformed`, the reply echoing the id (the connection is dropped only if that reply cannot fit the frame); `ConnectorClient` refuses such an id locally with `RequestIdTooLong`.
 
 The default feature set compiles contract, envelope and client only. Schema ids are
 still `gamecult.codex.*.v2`; renaming them changes the wire and belongs to a later
@@ -42,8 +42,8 @@ cargo test --locked --workspace
 cargo test --locked --workspace --features model-connector/daemon
 ```
 
-`tests/wire_parity_v2.rs` pins the kit byte-for-byte to CodexConnector fd7cec4 in both
-directions (it fetches that revision as a dev-dependency).
+`crates/model-connector/tests/wire_golden_v2.rs` pins the kit byte-for-byte to the golden v2
+fixtures in `crates/model-connector/tests/fixtures/wire_v2`.
 
 ## Provenance and license
 
