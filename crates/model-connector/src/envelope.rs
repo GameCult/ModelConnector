@@ -29,6 +29,7 @@ pub struct TransportEnvelope {
 
 /// The longest caller id, request id or model name a service admits. The
 /// frame arithmetic below depends on it, so a longer one is refused up front.
+#[cfg(feature = "daemon")]
 pub(crate) const MAX_IDENTITY_BYTES: usize = 256;
 
 /// The most bytes a serialized envelope holding `ciphertext_len` ciphertext
@@ -36,6 +37,7 @@ pub(crate) const MAX_IDENTITY_BYTES: usize = 256;
 /// array of integers: a byte of 128 or more takes two bytes, so the worst case
 /// is twice the ciphertext, plus the array header and the envelope's other
 /// fields at their longest. Measured from the real encoding, not assumed.
+#[cfg(feature = "daemon")]
 pub(crate) fn worst_frame_bytes(ciphertext_len: usize) -> usize {
     let shell = rmp_serde::to_vec(&TransportEnvelope {
         schema_id: ENVELOPE_SCHEMA_ID.to_string(),
@@ -429,6 +431,7 @@ mod tests {
         assert!(matches!(write(&[], 1_000), Err(TransportFrameError::Size)));
     }
 
+    #[cfg(feature = "daemon")]
     #[test]
     fn the_worst_frame_is_the_real_encoding_of_an_all_high_ciphertext() {
         let long = "x".repeat(MAX_IDENTITY_BYTES);
@@ -449,6 +452,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "daemon")]
     #[test]
     fn a_sealed_envelope_never_exceeds_the_worst_frame_for_its_ciphertext() {
         let key = security("epiphany-distinct-test-key");

@@ -917,16 +917,21 @@ mod tests {
         assert_eq!(executions, 1);
     }
 
+    /// The largest result plaintext whose sealed frame fits at the worst encoding.
+    fn widest_guaranteed_plaintext(base: usize) -> usize {
+        (base..=FRAME)
+            .take_while(|plaintext| worst_frame_bytes(plaintext + GCM_TAG) <= FRAME)
+            .last()
+            .unwrap_or(base)
+    }
+
     #[test]
     fn a_result_within_what_the_worst_encoding_leaves_is_delivered_intact() {
         // The largest plaintext whose sealed frame fits at the worst encoding is
         // always carried, whatever the ciphertext bytes turn out to be.
         for request_id in id_cases() {
             let base = empty_result_len(&request_id);
-            let mut plaintext = base;
-            while worst_frame_bytes(plaintext + 1 + GCM_TAG) <= FRAME {
-                plaintext += 1;
-            }
+            let plaintext = widest_guaranteed_plaintext(base);
             let (first, second, _) = call_twice(SizedBackend::new(plaintext - base), &request_id);
             let TransportDisposition::Transported { events, receipt } = &first.disposition else {
                 panic!("expected a transported result");
@@ -946,11 +951,8 @@ mod tests {
         // way the caller gets an answer, and the retry gets the same one.
         for request_id in id_cases() {
             let base = empty_result_len(&request_id);
-            let mut plaintext = base;
-            while worst_frame_bytes(plaintext + GCM_TAG) <= FRAME {
-                plaintext += 1;
-            }
-            for extra in [0, 1, 2] {
+            let plaintext = widest_guaranteed_plaintext(base);
+            for extra in [1, 2, 3] {
                 let backend = SizedBackend::new(plaintext + extra - base);
                 let (first, second, executions) = call_twice(backend, &request_id);
                 assert_eq!(first, second);
