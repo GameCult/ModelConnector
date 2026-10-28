@@ -38,28 +38,20 @@
       ]
     },
     "Refusal": {
-      "oneOf": [
-        {
-          "type": "string",
-          "enum": [
-            "Expired",
-            "IdentitySubstitution",
-            "ProviderDigestSubstitution",
-            "ModelNotAllowed",
-            "OutputBound",
-            "PayloadBound",
-            "Capacity",
-            "InFlight",
-            "Indeterminate",
-            "ReplayConflict",
-            "Malformed"
-          ]
-        },
-        {
-          "description": "A `ReasoningState` of another provider sits in the in-flight tool\nexchange, where dropping it would break the provider's own rules.",
-          "type": "string",
-          "const": "ForeignReasoningState"
-        }
+      "type": "string",
+      "enum": [
+        "Expired",
+        "IdentitySubstitution",
+        "ProviderDigestSubstitution",
+        "ModelNotAllowed",
+        "OutputBound",
+        "PayloadBound",
+        "Capacity",
+        "InFlight",
+        "Indeterminate",
+        "ReplayConflict",
+        "Malformed",
+        "ForeignReasoningState"
       ]
     },
     "StopReason": {

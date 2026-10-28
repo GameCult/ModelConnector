@@ -540,8 +540,9 @@ pub enum Refusal {
     Indeterminate,
     ReplayConflict,
     Malformed,
-    /// A `ReasoningState` of another provider sits in the in-flight tool
-    /// exchange, where dropping it would break the provider's own rules.
+    // A `ReasoningState` of another provider sits in the in-flight tool
+    // exchange, where dropping it would break the provider's own rules. A plain
+    // comment: a doc comment would split the published schema into a union.
     ForeignReasoningState,
 }
 
