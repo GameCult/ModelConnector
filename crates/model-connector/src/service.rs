@@ -536,6 +536,7 @@ const STAND_IN_PROVIDER: &str = "model-connector";
 /// The failed result that stands in for one whose sealed frame cannot be
 /// carried: the same shape a provider failure takes, with nothing a provider
 /// controls but the identities the invocation already bound.
+#[cfg(test)]
 pub(crate) fn result_size_failure(
     caller_runtime_id: &str,
     request_id: &str,
