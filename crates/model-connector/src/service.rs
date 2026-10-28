@@ -1111,7 +1111,7 @@ mod tests {
         let TransportDisposition::Transported { receipt, .. } = &stand_in.disposition else {
             panic!("expected a transported failure");
         };
-        assert_eq!(receipt.transport, "model-connector");
+        assert_eq!(receipt.provider, "model-connector");
 
         // The recorded replay is the stand-in's exact bytes.
         let TransportAdmission::Reply(replay) = service
