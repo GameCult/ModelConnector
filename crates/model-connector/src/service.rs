@@ -832,13 +832,17 @@ impl TransportService {
         // is recorded and the slot released, so the caller gets an answer and
         // a retry replays it.
         let admissible = self.admits_result(&result, &claim);
-        // The service prices what the backend reported: a transported result
-        // charges the cost its own outcome's usage derives, and its overrun
-        // past the reservation, whatever its receipt says (a receipt that
-        // misstates either is replaced by the stand-in but still charged the
-        // true cost). Anything else charges the whole reservation.
+        // The service prices what the backend reported, but only for a result
+        // bound to this invocation: a transported result charges the cost its
+        // own outcome's usage derives, and its overrun past the reservation,
+        // whatever its receipt says (a receipt that misstates either is
+        // replaced by the stand-in but still charged the true cost). Any
+        // other result, including one bound to another request, charges the
+        // whole reservation.
         let charge = match &result.disposition {
-            TransportDisposition::Transported { receipt, .. } => {
+            TransportDisposition::Transported { receipt, .. }
+                if result.validate_against(invocation).is_ok() =>
+            {
                 let cost_micro_usd = claim.call.cost_of(&receipt.outcome);
                 Charge {
                     cost_micro_usd,
@@ -3417,5 +3421,32 @@ mod tests {
             service.window_spend("ghostlight-yggdrasil", 0),
             reservation()
         );
+    }
+
+    #[test]
+    fn a_result_bound_to_another_request_is_charged_the_reservation() {
+        let store = TestStore::new();
+        let mut service = open_service(&store, 4);
+        let one = claim_at(&mut service, "request-1", 1_000);
+        let two = claim_at(&mut service, "request-2", 1_000);
+        // request-2's result reports no usage at all; request-1 must not be
+        // billed what another request's backend claims to have spent.
+        let foreign = two.call().transported(
+            Vec::new(),
+            TransportOutcome::Failed {
+                kind: FailureKind::Provider,
+                message: String::new(),
+                usage: Some(usage(0, 0, 0, 0)),
+            },
+        );
+        let invocation = invocation_at("request-1", 1_000, MAX_COST);
+        let response = service.complete(*one, foreign, FRAME).unwrap();
+        assert_eq!(
+            receipt_of(&response, &invocation).provider,
+            STAND_IN_PROVIDER
+        );
+        assert_eq!(charged_of(&service, "request-1"), reservation());
+        assert_eq!(service.window_spend(CALLER, 0), reservation());
+        drop(two);
     }
 }
