@@ -735,8 +735,12 @@ impl TransportService {
         // A request belongs to the window it is admitted in. The ceiling is
         // checked after the replay lookup, so a recorded answer is replayed
         // whatever the caller has left.
-        let admitted_at_unix_ms =
-            admission_clock(&self.window_spend, &identity.caller_runtime_id, now_unix_ms, spend_window_ms);
+        let admitted_at_unix_ms = admission_clock(
+            &self.window_spend,
+            &identity.caller_runtime_id,
+            now_unix_ms,
+            spend_window_ms,
+        );
         let window = admitted_at_unix_ms / spend_window_ms;
         prune_windows(
             &mut self.window_spend,
@@ -3375,7 +3379,10 @@ mod tests {
                 &usage(a, b, prompt - a - b, output),
                 request.cache_retention,
             );
-            assert!(cost <= reserved, "{price:?} {a} {b} {output}: {cost} > {reserved}");
+            assert!(
+                cost <= reserved,
+                "{price:?} {a} {b} {output}: {cost} > {reserved}"
+            );
         }
     }
 
@@ -3398,6 +3405,9 @@ mod tests {
         }
         assert_eq!(service.window_spend(CALLER, 0), 0);
         assert_eq!(service.window_spend(CALLER, 1), FIXTURE_USAGE_COST);
-        assert_eq!(service.window_spend("ghostlight-yggdrasil", 0), reservation());
+        assert_eq!(
+            service.window_spend("ghostlight-yggdrasil", 0),
+            reservation()
+        );
     }
 }
