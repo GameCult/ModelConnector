@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TransportEnvelope",
+  "type": "object",
+  "properties": {
+    "caller_runtime_id": {
+      "type": "string"
+    },
+    "ciphertext": {
+      "description": "MessagePack bin: the raw ciphertext bytes, never an array of integers",
+      "type": "string",
+      "format": "binary"
+    },
+    "message_kind": {
+      "$ref": "#/$defs/EnvelopeKind"
+    },
+    "nonce": {
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "format": "uint8",
+        "maximum": 255,
+        "minimum": 0
+      },
+      "maxItems": 12,
+      "minItems": 12
+    },
+    "request_id": {
+      "type": "string"
+    },
+    "schema_id": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "schema_id",
+    "caller_runtime_id",
+    "request_id",
+    "message_kind",
+    "nonce",
+    "ciphertext"
+  ],
+  "$defs": {
+    "EnvelopeKind": {
+      "type": "string",
+      "enum": [
+        "Invocation",
+        "Result"
+      ]
+    }
+  }
+}

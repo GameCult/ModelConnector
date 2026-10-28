@@ -1,5 +1,7 @@
 use std::collections::HashSet;
 
+use schemars::JsonSchema;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -7,11 +9,11 @@ use zeroize::Zeroize;
 
 use crate::envelope::ServiceError;
 
-pub const PROVIDER_REQUEST_SCHEMA_ID: &str = "gamecult.codex.provider_request.v2";
-pub const INVOCATION_SCHEMA_ID: &str = "gamecult.codex.transport_invocation.v2";
-pub const RESULT_SCHEMA_ID: &str = "gamecult.codex.transport_result.v2";
-pub const RECEIPT_SCHEMA_ID: &str = "gamecult.codex.transport_receipt.v2";
-pub const ENVELOPE_SCHEMA_ID: &str = "gamecult.codex.transport_envelope.v2";
+pub const PROVIDER_REQUEST_SCHEMA_ID: &str = "gamecult.model.provider_request.v3";
+pub const INVOCATION_SCHEMA_ID: &str = "gamecult.model.transport_invocation.v3";
+pub const RESULT_SCHEMA_ID: &str = "gamecult.model.transport_result.v3";
+pub const RECEIPT_SCHEMA_ID: &str = "gamecult.model.transport_receipt.v3";
+pub const ENVELOPE_SCHEMA_ID: &str = "gamecult.model.transport_envelope.v3";
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct TransportKey(pub(crate) [u8; 32]);
@@ -31,7 +33,8 @@ impl Drop for TransportKey {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ProviderRequest {
     pub schema_id: String,
     pub request_id: String,
@@ -39,17 +42,13 @@ pub struct ProviderRequest {
     pub model: String,
     pub instructions: String,
     pub input: Vec<InputItem>,
-    pub reasoning_effort: Option<String>,
-    pub reasoning_summary: Option<String>,
-    pub service_tier: Option<String>,
-    pub output_format_name: Option<String>,
-    pub previous_response_id: Option<String>,
+    pub reasoning_effort: Option<ReasoningEffort>,
+    pub cache_retention: Option<CacheRetention>,
     pub tools: Vec<ToolDefinition>,
     pub tool_choice: ToolChoice,
     pub parallel_tool_calls: bool,
     pub output_schema_json: Option<String>,
-    pub max_output_tokens: Option<u32>,
-    pub prompt_cache_key: Option<String>,
+    pub max_output_tokens: u32,
 }
 
 impl ProviderRequest {
@@ -58,6 +57,7 @@ impl ProviderRequest {
         conversation_id: impl Into<String>,
         model: impl Into<String>,
         instructions: impl Into<String>,
+        max_output_tokens: u32,
     ) -> Self {
         Self {
             schema_id: PROVIDER_REQUEST_SCHEMA_ID.to_string(),
@@ -67,16 +67,12 @@ impl ProviderRequest {
             instructions: instructions.into(),
             input: Vec::new(),
             reasoning_effort: None,
-            reasoning_summary: None,
-            service_tier: None,
-            output_format_name: None,
-            previous_response_id: None,
+            cache_retention: None,
             tools: Vec::new(),
             tool_choice: ToolChoice::Auto,
             parallel_tool_calls: false,
             output_schema_json: None,
-            max_output_tokens: None,
-            prompt_cache_key: None,
+            max_output_tokens,
         }
     }
 
@@ -88,38 +84,12 @@ impl ProviderRequest {
         require_id(&self.conversation_id, "conversation_id")?;
         require_id(&self.model, "model")?;
         require_content(&self.instructions, "instructions")?;
-        if matches!(self.max_output_tokens, Some(0)) {
+        if self.max_output_tokens == 0 {
             return Err(ContractError::Invalid("max_output_tokens"));
-        }
-        if self
-            .prompt_cache_key
-            .as_deref()
-            .is_some_and(|value| value.trim().is_empty())
-        {
-            return Err(ContractError::Invalid("prompt_cache_key"));
-        }
-        for (value, field) in [
-            (self.reasoning_effort.as_deref(), "reasoning_effort"),
-            (self.reasoning_summary.as_deref(), "reasoning_summary"),
-            (self.service_tier.as_deref(), "service_tier"),
-            (self.output_format_name.as_deref(), "output_format_name"),
-            (self.previous_response_id.as_deref(), "previous_response_id"),
-        ] {
-            if let Some(value) = value {
-                require_id(value, field)?;
-            }
         }
         if let Some(schema) = &self.output_schema_json {
             require_content(schema, "output_schema_json")?;
             require_json_object(schema, "output_schema_json")?;
-            require_provider_name(
-                self.output_format_name
-                    .as_deref()
-                    .ok_or(ContractError::Invalid("output_format_name"))?,
-                "output_format_name",
-            )?;
-        } else if self.output_format_name.is_some() {
-            return Err(ContractError::Invalid("output_schema_json"));
         }
 
         if self.tools.is_empty() && self.tool_choice == ToolChoice::Required {
@@ -160,14 +130,70 @@ impl ProviderRequest {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolChoice {
     Auto,
     Required,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningEffort {
+    Low,
+    Medium,
+    High,
+    Max,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CacheRetention {
+    Short,
+    Long,
+}
+
+/// Why a provider stopped producing output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum StopReason {
+    EndTurn,
+    ToolUse,
+    MaxOutputTokens,
+    StopSequence,
+    Refusal,
+    ContextWindow,
+}
+
+/// What kind of failure a provider reported. `ResultSize` is the connector's own
+/// stand-in for a result whose sealed frame cannot be carried.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureKind {
+    ResultSize,
+    InvalidRequest,
+    Authentication,
+    RateLimited,
+    Unavailable,
+    Timeout,
+    Provider,
+}
+
+/// Token accounting for one completed request. Cache reads and writes are
+/// counted apart from plain input; `reasoning_tokens` is absent when the
+/// provider does not report it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Usage {
+    pub input_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub output_tokens: u64,
+    pub reasoning_tokens: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub enum InputItem {
     UserText {
         text: String,
@@ -186,14 +212,16 @@ pub enum InputItem {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ToolDefinition {
     pub name: String,
     pub description: String,
     pub parameters_json: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct TransportInvocation {
     pub schema_id: String,
     pub caller_runtime_id: String,
@@ -246,7 +274,8 @@ impl TransportInvocation {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct TransportResult {
     pub schema_id: String,
     pub request_id: String,
@@ -254,7 +283,8 @@ pub struct TransportResult {
     pub disposition: TransportDisposition,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub enum TransportDisposition {
     Refused(Refusal),
     Transported {
@@ -312,7 +342,8 @@ impl TransportResult {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub enum TransportEventPayload {
     TextDelta {
         text: String,
@@ -324,7 +355,8 @@ pub enum TransportEventPayload {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct TransportEvent {
     pub sequence: u64,
     pub payload: TransportEventPayload,
@@ -347,7 +379,8 @@ impl TransportEvent {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct TransportReceipt {
     pub schema_id: String,
     pub request_id: String,
@@ -355,7 +388,7 @@ pub struct TransportReceipt {
     pub native_request_sha256: [u8; 32],
     pub provider_request_sha256: [u8; 32],
     pub model: String,
-    pub transport: String,
+    pub provider: String,
     pub outcome: TransportOutcome,
 }
 
@@ -376,17 +409,13 @@ impl TransportReceipt {
         if self.native_request_sha256 != invocation.native_request_sha256 {
             return Err(ContractError::NativeDigest);
         }
-        require_id(&self.transport, "receipt.transport")?;
+        require_id(&self.provider, "receipt.provider")?;
         match &self.outcome {
             TransportOutcome::Completed {
                 provider_response_id: Some(value),
                 ..
             } => require_id(value, "receipt.provider_response_id")?,
-            TransportOutcome::Failed {
-                failure_kind,
-                message,
-            } => {
-                require_id(failure_kind, "receipt.failure_kind")?;
+            TransportOutcome::Failed { message, .. } => {
                 require_content(message, "receipt.failure_message")?;
             }
             TransportOutcome::Completed {
@@ -398,27 +427,28 @@ impl TransportReceipt {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub enum TransportOutcome {
     Completed {
         provider_response_id: Option<String>,
-        input_tokens: Option<u64>,
-        output_tokens: Option<u64>,
-        reasoning_output_tokens: Option<u64>,
-        cached_input_tokens: Option<u64>,
+        stop_reason: StopReason,
+        usage: Usage,
     },
     Failed {
-        failure_kind: String,
+        kind: FailureKind,
         message: String,
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub enum Refusal {
     Expired,
     IdentitySubstitution,
     ProviderDigestSubstitution,
-    Policy,
+    ModelNotAllowed,
+    OutputBound,
+    PayloadBound,
     Capacity,
     InFlight,
     Indeterminate,
@@ -426,11 +456,61 @@ pub enum Refusal {
     Malformed,
 }
 
+/// The one wire codec of every v3 document: named MessagePack (struct fields
+/// are keyed by name), with unknown fields refused by the types themselves.
+pub(crate) fn wire_encode<T: Serialize + ?Sized>(document: &T) -> Result<Vec<u8>, ContractError> {
+    rmp_serde::to_vec_named(document).map_err(|_| ContractError::Encoding)
+}
+
+/// Decodes a document and refuses every dialect the wire does not name. The
+/// typed decoder alone also reads a positional array for a struct, an integer
+/// array where `bin` is declared and an enum as its index; so the bytes must
+/// equal what [`wire_encode`] writes for the decoded value, compared as
+/// MessagePack values: key order, integer width and an absent optional field
+/// do not matter, array against map, array against `bin` and index against name do.
+pub(crate) fn wire_decode<T: DeserializeOwned + Serialize>(
+    bytes: &[u8],
+) -> Result<T, ContractError> {
+    let document: T = rmp_serde::from_slice(bytes).map_err(|_| ContractError::Encoding)?;
+    if named_form(bytes)? != named_form(&wire_encode(&document)?)? {
+        return Err(ContractError::Encoding);
+    }
+    Ok(document)
+}
+
+fn named_form(bytes: &[u8]) -> Result<rmpv::Value, ContractError> {
+    let mut reader = bytes;
+    let value = rmpv::decode::read_value(&mut reader).map_err(|_| ContractError::Encoding)?;
+    if !reader.is_empty() {
+        return Err(ContractError::Encoding);
+    }
+    Ok(order_free(value))
+}
+
+/// A map compared as a set of its present entries: sorted by key, nil entries dropped.
+fn order_free(value: rmpv::Value) -> rmpv::Value {
+    match value {
+        rmpv::Value::Map(entries) => {
+            let mut kept: Vec<(rmpv::Value, rmpv::Value)> = entries
+                .into_iter()
+                .filter(|(_, entry)| !entry.is_nil())
+                .map(|(key, entry)| (key, order_free(entry)))
+                .collect();
+            kept.sort_by_key(|(key, _)| key.to_string());
+            rmpv::Value::Map(kept)
+        }
+        rmpv::Value::Array(items) => {
+            rmpv::Value::Array(items.into_iter().map(order_free).collect())
+        }
+        other => other,
+    }
+}
+
 pub fn canonical_provider_request_bytes(
     request: &ProviderRequest,
 ) -> Result<Vec<u8>, ContractError> {
     request.validate()?;
-    rmp_serde::to_vec(request).map_err(|_| ContractError::Encoding)
+    wire_encode(request)
 }
 
 pub fn provider_request_sha256(request: &ProviderRequest) -> Result<[u8; 32], ContractError> {
@@ -444,7 +524,7 @@ pub fn canonical_invocation_bytes(
     if invocation.provider_request_sha256 != provider_request_sha256(&invocation.request)? {
         return Err(ContractError::ProviderDigest);
     }
-    rmp_serde::to_vec(invocation).map_err(|_| ContractError::Encoding)
+    wire_encode(invocation)
 }
 
 pub(crate) fn require_id(value: &str, field: &'static str) -> Result<(), ContractError> {
@@ -508,7 +588,7 @@ pub enum ContractError {
     Expiry,
     #[error("transport event sequence is not contiguous")]
     EventSequence,
-    #[error("canonical MessagePack encoding failed")]
+    #[error("wire encoding failed")]
     Encoding,
 }
 
@@ -537,14 +617,14 @@ mod tests {
     #[test]
     fn provider_contract_refuses_transport_side_fixup_pressure() {
         let mut request = request();
-        request.output_format_name = Some("epiphany.role.result".to_string());
         request.output_schema_json = Some(r#"{"type":"object"}"#.to_string());
+        assert_eq!(request.validate(), Ok(()));
+        request.output_schema_json = Some("[]".to_string());
         assert_eq!(
             request.validate(),
-            Err(ContractError::Invalid("output_format_name"))
+            Err(ContractError::Invalid("output_schema_json"))
         );
 
-        request.output_format_name = None;
         request.output_schema_json = None;
         request.input.push(InputItem::ToolResult {
             call_id: "x".repeat(65),
@@ -584,8 +664,8 @@ mod tests {
     #[test]
     fn typed_tool_round_survives_messagepack() {
         let invocation = invocation();
-        let bytes = rmp_serde::to_vec(&invocation).unwrap();
-        let decoded: TransportInvocation = rmp_serde::from_slice(&bytes).unwrap();
+        let bytes = wire_encode(&invocation).unwrap();
+        let decoded: TransportInvocation = wire_decode(&bytes).unwrap();
         assert_eq!(decoded, invocation);
         assert!(matches!(
             decoded.request.tools.as_slice(),
@@ -637,5 +717,190 @@ mod tests {
             substituted_native_basis.validate_against(&invocation),
             Err(ContractError::NativeDigest)
         );
+    }
+
+    #[test]
+    fn v3_documents_carry_their_v3_ids() {
+        assert_eq!(
+            [
+                PROVIDER_REQUEST_SCHEMA_ID,
+                INVOCATION_SCHEMA_ID,
+                RESULT_SCHEMA_ID,
+                RECEIPT_SCHEMA_ID,
+                ENVELOPE_SCHEMA_ID
+            ],
+            [
+                "gamecult.model.provider_request.v3",
+                "gamecult.model.transport_invocation.v3",
+                "gamecult.model.transport_result.v3",
+                "gamecult.model.transport_receipt.v3",
+                "gamecult.model.transport_envelope.v3"
+            ]
+        );
+        let invocation = invocation();
+        let result = TransportResult::transported(&invocation, Vec::new(), receipt(&invocation));
+        let TransportDisposition::Transported { receipt: sent, .. } = &result.disposition else {
+            unreachable!()
+        };
+        assert_eq!(invocation.request.schema_id, PROVIDER_REQUEST_SCHEMA_ID);
+        assert_eq!(invocation.schema_id, INVOCATION_SCHEMA_ID);
+        assert_eq!(result.schema_id, RESULT_SCHEMA_ID);
+        assert_eq!(sent.schema_id, RECEIPT_SCHEMA_ID);
+
+        let v2 = |name: &str| format!("{}{name}.v2", concat!("gamecult.", "codex."));
+        let mut request = invocation.request.clone();
+        request.schema_id = v2("provider_request");
+        assert_eq!(request.validate(), Err(ContractError::Schema));
+        let mut stale = invocation.clone();
+        stale.schema_id = v2("transport_invocation");
+        assert_eq!(stale.validate(1_000, 2_000), Err(ContractError::Schema));
+        let mut stale = result.clone();
+        stale.schema_id = v2("transport_result");
+        assert_eq!(
+            stale.validate_against(&invocation),
+            Err(ContractError::Schema)
+        );
+        let mut stale = (**sent).clone();
+        stale.schema_id = v2("transport_receipt");
+        assert_eq!(
+            stale.validate_against(&invocation),
+            Err(ContractError::Schema)
+        );
+    }
+
+    /// `document` re-encoded as a named map with one more key at its top level.
+    fn with_extra_key<T: Serialize>(document: &T) -> Vec<u8> {
+        let bytes = wire_encode(document).unwrap();
+        let mut value = rmpv::decode::read_value(&mut bytes.as_slice()).unwrap();
+        let rmpv::Value::Map(entries) = &mut value else {
+            panic!("a v3 document is a named map");
+        };
+        entries.push((rmpv::Value::from("unexpected_field"), rmpv::Value::from(1)));
+        let mut out = Vec::new();
+        rmpv::encode::write_value(&mut out, &value).unwrap();
+        out
+    }
+
+    #[test]
+    fn an_unknown_field_is_refused_not_dropped() {
+        let invocation = invocation();
+        let result = TransportResult::transported(&invocation, Vec::new(), receipt(&invocation));
+        let TransportDisposition::Transported { receipt: sent, .. } = &result.disposition else {
+            unreachable!()
+        };
+        let envelope = crate::envelope::encrypt_invocation(
+            &invocation,
+            &security("epiphany-distinct-test-key"),
+        )
+        .unwrap();
+        assert!(wire_decode::<ProviderRequest>(&wire_encode(&invocation.request).unwrap()).is_ok());
+        assert!(wire_decode::<ProviderRequest>(&with_extra_key(&invocation.request)).is_err());
+        assert!(wire_decode::<TransportInvocation>(&with_extra_key(&invocation)).is_err());
+        assert!(wire_decode::<TransportResult>(&with_extra_key(&result)).is_err());
+        assert!(wire_decode::<TransportReceipt>(&with_extra_key(&**sent)).is_err());
+        assert!(
+            wire_decode::<crate::envelope::TransportEnvelope>(&wire_encode(&envelope).unwrap())
+                .is_ok()
+        );
+        assert!(
+            wire_decode::<crate::envelope::TransportEnvelope>(&with_extra_key(&envelope)).is_err()
+        );
+    }
+
+    #[test]
+    fn max_output_tokens_is_required() {
+        let mut request = request();
+        assert_eq!(request.validate(), Ok(()));
+        request.max_output_tokens = 0;
+        assert_eq!(
+            request.validate(),
+            Err(ContractError::Invalid("max_output_tokens"))
+        );
+    }
+
+    #[test]
+    fn outcomes_are_typed() {
+        let invocation = invocation();
+        for stop_reason in [
+            StopReason::EndTurn,
+            StopReason::ToolUse,
+            StopReason::MaxOutputTokens,
+            StopReason::StopSequence,
+            StopReason::Refusal,
+            StopReason::ContextWindow,
+        ] {
+            let mut sent = receipt(&invocation);
+            sent.outcome = TransportOutcome::Completed {
+                provider_response_id: None,
+                stop_reason,
+                usage: Usage {
+                    input_tokens: 1,
+                    cache_read_tokens: 2,
+                    cache_write_tokens: 3,
+                    output_tokens: 4,
+                    reasoning_tokens: None,
+                },
+            };
+            let decoded: TransportReceipt = wire_decode(&wire_encode(&sent).unwrap()).unwrap();
+            assert_eq!(decoded, sent);
+        }
+        for kind in [
+            FailureKind::ResultSize,
+            FailureKind::InvalidRequest,
+            FailureKind::Authentication,
+            FailureKind::RateLimited,
+            FailureKind::Unavailable,
+            FailureKind::Timeout,
+            FailureKind::Provider,
+        ] {
+            let mut sent = receipt(&invocation);
+            sent.outcome = TransportOutcome::Failed {
+                kind,
+                message: "failed".to_string(),
+            };
+            assert_eq!(sent.validate_against(&invocation), Ok(()));
+            let decoded: TransportReceipt = wire_decode(&wire_encode(&sent).unwrap()).unwrap();
+            assert_eq!(decoded, sent);
+        }
+        let mut blank = receipt(&invocation);
+        blank.outcome = TransportOutcome::Failed {
+            kind: FailureKind::Provider,
+            message: String::new(),
+        };
+        assert_eq!(
+            blank.validate_against(&invocation),
+            Err(ContractError::Invalid("receipt.failure_message"))
+        );
+    }
+
+    #[test]
+    fn validate_against_refuses_each_identity_field() {
+        let invocation = invocation();
+        let result = TransportResult::transported(&invocation, Vec::new(), receipt(&invocation));
+        assert_eq!(result.validate_against(&invocation), Ok(()));
+        let mut other_request = result.clone();
+        other_request.request_id = "request-2".to_string();
+        let mut other_caller = result.clone();
+        other_caller.caller_runtime_id = "ghostlight-dungeon-yggdrasil".to_string();
+        for changed in [other_request, other_caller] {
+            assert_eq!(
+                changed.validate_against(&invocation),
+                Err(ContractError::Identity)
+            );
+        }
+
+        let good = receipt(&invocation);
+        let mut other_request = good.clone();
+        other_request.request_id = "request-2".to_string();
+        let mut other_caller = good.clone();
+        other_caller.caller_runtime_id = "ghostlight-dungeon-yggdrasil".to_string();
+        let mut other_model = good.clone();
+        other_model.model = "another-model".to_string();
+        for changed in [other_request, other_caller, other_model] {
+            assert_eq!(
+                changed.validate_against(&invocation),
+                Err(ContractError::Identity)
+            );
+        }
     }
 }

@@ -12,8 +12,8 @@ use zeroize::Zeroizing;
 
 use crate::contract::{TransportInvocation, TransportResult};
 use crate::envelope::{
-    ServiceError, TransportEnvelope, TransportFrameError, frame_bytes_for_payload,
-    read_transport_frame, write_transport_frame,
+    ServiceError, TransportFrameError, decode_invocation_frame, encode_result_frame,
+    frame_bytes_for_payload, read_transport_frame, write_transport_frame,
 };
 use crate::service::{CallerAdmission, TransportAdmission, TransportService};
 
@@ -222,8 +222,7 @@ fn execute_inference_frame(
     backend: &dyn ProviderBackend,
     limits: &ServeLimits,
 ) -> Result<Vec<u8>, ServeError> {
-    let envelope: TransportEnvelope =
-        rmp_serde::from_slice(request).map_err(|_| ServeError::FrameEncoding)?;
+    let envelope = decode_invocation_frame(request).map_err(|_| ServeError::FrameEncoding)?;
     let admission = service
         .lock()
         .map_err(|_| ServeError::ServicePoisoned)?
@@ -238,7 +237,7 @@ fn execute_inference_frame(
                 .complete(*claim, result, limits.max_frame_bytes)?
         }
     };
-    rmp_serde::to_vec(&response).map_err(|_| ServeError::FrameEncoding)
+    encode_result_frame(&response).map_err(|_| ServeError::FrameEncoding)
 }
 
 fn frame_error(error: TransportFrameError) -> ServeError {
@@ -314,7 +313,7 @@ pub enum ServeError {
     Connection(#[source] std::io::Error),
     #[error("connector frame exceeded its bound")]
     FrameSize,
-    #[error("connector frame was not valid MessagePack")]
+    #[error("connector frame was not a connector operation message")]
     FrameEncoding,
     #[error("system clock is before the Unix epoch")]
     Clock,
@@ -328,8 +327,8 @@ mod tests {
     use super::*;
     use crate::client::ConnectorClient;
     use crate::contract::{
-        Refusal, TransportDisposition, TransportEvent, TransportEventPayload, TransportOutcome,
-        TransportResult,
+        FailureKind, Refusal, TransportDisposition, TransportEvent, TransportEventPayload,
+        TransportOutcome, TransportResult,
     };
     use crate::fixtures::{TestStore, caller, invocation_for, receipt, request};
 
@@ -506,7 +505,7 @@ mod tests {
         let backend = CountingBackend::new(true);
         let (_client, endpoint) = start(backend.clone(), &store);
         let security = crate::fixtures::security(KEY);
-        let request = rmp_serde::to_vec(
+        let request = crate::envelope::encode_invocation_frame(
             &crate::envelope::encrypt_invocation(&fresh("request-wire"), &security).unwrap(),
         )
         .unwrap();
@@ -531,14 +530,14 @@ mod tests {
         // requires the result to name the request by its own id.
         let send = |id: &str| {
             let invocation = fresh(id);
-            let request = rmp_serde::to_vec(
+            let request = crate::envelope::encode_invocation_frame(
                 &crate::envelope::encrypt_invocation(&invocation, &security).unwrap(),
             )
             .unwrap();
             let mut stream = TcpStream::connect(endpoint).unwrap();
             write_transport_frame(&mut stream, &request, FRAME).unwrap();
             let reply = read_transport_frame(&mut stream, FRAME).unwrap();
-            let envelope: TransportEnvelope = rmp_serde::from_slice(&reply).unwrap();
+            let envelope = crate::envelope::decode_result_frame(&reply).unwrap();
             crate::envelope::decrypt_result(&envelope, &security, &invocation).unwrap()
         };
         let served = send(&"i".repeat(crate::envelope::MAX_IDENTITY_BYTES));
@@ -684,7 +683,7 @@ mod tests {
     #[test]
     fn the_smallest_frame_also_carries_the_failure_that_stands_in_for_a_result() {
         let long = "x".repeat(crate::envelope::MAX_IDENTITY_BYTES);
-        let plaintext = rmp_serde::to_vec(&crate::service::result_size_failure(
+        let plaintext = crate::contract::wire_encode(&crate::service::result_size_failure(
             &long, &long, &long, [0xff; 32], [0xff; 32],
         ))
         .unwrap()
@@ -906,7 +905,7 @@ mod tests {
         let reply = client.execute(&invocation).unwrap();
         assert_eq!(
             reply.disposition,
-            TransportDisposition::Refused(Refusal::Policy)
+            TransportDisposition::Refused(Refusal::PayloadBound)
         );
         assert_eq!(backend.executions.load(Ordering::SeqCst), 0);
     }
@@ -949,7 +948,7 @@ mod tests {
         transport: &str,
     ) -> TransportResult {
         let mut receipt = receipt(invocation);
-        receipt.transport = transport.to_string();
+        receipt.provider = transport.to_string();
         TransportResult::transported(
             invocation,
             vec![TransportEvent {
@@ -963,7 +962,7 @@ mod tests {
     }
 
     fn encoded_len(result: &TransportResult) -> usize {
-        rmp_serde::to_vec(result).unwrap().len()
+        crate::contract::wire_encode(result).unwrap().len()
     }
 
     /// Two calls with one request id, through a live serve loop.
@@ -984,9 +983,9 @@ mod tests {
             &result.disposition,
             TransportDisposition::Transported { events, receipt }
                 if events.is_empty()
-                    && receipt.transport == "model-connector"
+                    && receipt.provider == "model-connector"
                     && receipt.outcome == TransportOutcome::Failed {
-                        failure_kind: "result_size".to_string(),
+                        kind: FailureKind::ResultSize,
                         message: "provider result exceeded its byte bound".to_string(),
                     }
         )
@@ -1153,5 +1152,93 @@ mod tests {
             ConnectorClient::new(endpoint, KEY, FRAME, Some(Duration::from_secs(5))).unwrap();
         client.execute(&fresh("request-key")).unwrap();
         assert_eq!(backend.executions.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_v2_frame_gets_no_answer() {
+        let store = TestStore::new();
+        let backend = CountingBackend::new(true);
+        let (client, endpoint) = start(backend.clone(), &store);
+        // The v2 envelope: positional, an integer-array ciphertext, a v2 id.
+        let v2 = rmp_serde::to_vec(&(
+            concat!("gamecult.", "codex.transport_envelope.v2"),
+            CALLER,
+            "request-v2",
+            "Invocation",
+            [0_u8; 12],
+            vec![1_u8; 64],
+        ))
+        .unwrap();
+        let mut stream = TcpStream::connect(endpoint).unwrap();
+        write_transport_frame(&mut stream, &v2, FRAME).unwrap();
+        assert!(matches!(
+            read_transport_frame(&mut stream, FRAME),
+            Err(TransportFrameError::Connection(_))
+        ));
+        assert_eq!(backend.executions.load(Ordering::SeqCst), 0);
+        // The loop survives the v2 peer and serves a v3 one.
+        client.execute(&fresh("request-after-v2")).unwrap();
+        assert_eq!(backend.executions.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_reply_echoes_the_request_id() {
+        use cultnet_rs::{CultNetMessage, CultNetWireContract, decode_cultnet_message_from_slice};
+        let store = TestStore::new();
+        let backend = CountingBackend::new(true);
+        let (_client, endpoint) = start(backend.clone(), &store);
+        let security = crate::fixtures::security(KEY);
+        let send = |invocation: &TransportInvocation| {
+            let request = crate::envelope::encode_invocation_frame(
+                &crate::envelope::encrypt_invocation(invocation, &security).unwrap(),
+            )
+            .unwrap();
+            let mut stream = TcpStream::connect(endpoint).unwrap();
+            write_transport_frame(&mut stream, &request, FRAME).unwrap();
+            let reply = read_transport_frame(&mut stream, FRAME).unwrap();
+            let CultNetMessage::OperationResponse {
+                message_id, status, ..
+            } = decode_cultnet_message_from_slice(&reply, CultNetWireContract::CultNetSchemaV0)
+                .unwrap()
+            else {
+                panic!("a reply is an operation response");
+            };
+            let envelope = crate::envelope::decode_result_frame(&reply).unwrap();
+            let result = crate::envelope::decrypt_result(&envelope, &security, invocation).unwrap();
+            (message_id, status, result)
+        };
+
+        let transported = fresh("request-echo-transported");
+        let (message_id, status, result) = send(&transported);
+        assert_eq!(
+            (
+                message_id.as_str(),
+                status.as_str(),
+                result.request_id.as_str()
+            ),
+            ("request-echo-transported", "ok", "request-echo-transported")
+        );
+        assert!(matches!(
+            result.disposition,
+            TransportDisposition::Transported { .. }
+        ));
+
+        let mut refused = fresh("request-echo-refused");
+        refused.request.model = "unlisted-model".to_string();
+        refused.provider_request_sha256 =
+            crate::contract::provider_request_sha256(&refused.request).unwrap();
+        let (message_id, status, result) = send(&refused);
+        assert_eq!(
+            (
+                message_id.as_str(),
+                status.as_str(),
+                result.request_id.as_str()
+            ),
+            ("request-echo-refused", "ok", "request-echo-refused")
+        );
+        assert_eq!(
+            result.disposition,
+            TransportDisposition::Refused(Refusal::ModelNotAllowed)
+        );
     }
 }

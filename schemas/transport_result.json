@@ -1,0 +1,342 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TransportResult",
+  "type": "object",
+  "properties": {
+    "caller_runtime_id": {
+      "type": "string"
+    },
+    "disposition": {
+      "$ref": "#/$defs/TransportDisposition"
+    },
+    "request_id": {
+      "type": "string"
+    },
+    "schema_id": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "schema_id",
+    "request_id",
+    "caller_runtime_id",
+    "disposition"
+  ],
+  "$defs": {
+    "FailureKind": {
+      "description": "What kind of failure a provider reported. `ResultSize` is the connector's own\nstand-in for a result whose sealed frame cannot be carried.",
+      "type": "string",
+      "enum": [
+        "result_size",
+        "invalid_request",
+        "authentication",
+        "rate_limited",
+        "unavailable",
+        "timeout",
+        "provider"
+      ]
+    },
+    "Refusal": {
+      "type": "string",
+      "enum": [
+        "Expired",
+        "IdentitySubstitution",
+        "ProviderDigestSubstitution",
+        "ModelNotAllowed",
+        "OutputBound",
+        "PayloadBound",
+        "Capacity",
+        "InFlight",
+        "Indeterminate",
+        "ReplayConflict",
+        "Malformed"
+      ]
+    },
+    "StopReason": {
+      "description": "Why a provider stopped producing output.",
+      "type": "string",
+      "enum": [
+        "end_turn",
+        "tool_use",
+        "max_output_tokens",
+        "stop_sequence",
+        "refusal",
+        "context_window"
+      ]
+    },
+    "TransportDisposition": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "Refused": {
+              "$ref": "#/$defs/Refusal"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "Refused"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "Transported": {
+              "type": "object",
+              "properties": {
+                "events": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/$defs/TransportEvent"
+                  }
+                },
+                "receipt": {
+                  "$ref": "#/$defs/TransportReceipt"
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "events",
+                "receipt"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "Transported"
+          ]
+        }
+      ]
+    },
+    "TransportEvent": {
+      "type": "object",
+      "properties": {
+        "payload": {
+          "$ref": "#/$defs/TransportEventPayload"
+        },
+        "sequence": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "sequence",
+        "payload"
+      ]
+    },
+    "TransportEventPayload": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "TextDelta": {
+              "type": "object",
+              "properties": {
+                "text": {
+                  "type": "string"
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "text"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "TextDelta"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "ToolCall": {
+              "type": "object",
+              "properties": {
+                "arguments": {
+                  "type": "string"
+                },
+                "call_id": {
+                  "type": "string"
+                },
+                "name": {
+                  "type": "string"
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "call_id",
+                "name",
+                "arguments"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "ToolCall"
+          ]
+        }
+      ]
+    },
+    "TransportOutcome": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "Completed": {
+              "type": "object",
+              "properties": {
+                "provider_response_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "stop_reason": {
+                  "$ref": "#/$defs/StopReason"
+                },
+                "usage": {
+                  "$ref": "#/$defs/Usage"
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "stop_reason",
+                "usage"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "Completed"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "Failed": {
+              "type": "object",
+              "properties": {
+                "kind": {
+                  "$ref": "#/$defs/FailureKind"
+                },
+                "message": {
+                  "type": "string"
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "kind",
+                "message"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "Failed"
+          ]
+        }
+      ]
+    },
+    "TransportReceipt": {
+      "type": "object",
+      "properties": {
+        "caller_runtime_id": {
+          "type": "string"
+        },
+        "model": {
+          "type": "string"
+        },
+        "native_request_sha256": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "format": "uint8",
+            "maximum": 255,
+            "minimum": 0
+          },
+          "maxItems": 32,
+          "minItems": 32
+        },
+        "outcome": {
+          "$ref": "#/$defs/TransportOutcome"
+        },
+        "provider": {
+          "type": "string"
+        },
+        "provider_request_sha256": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "format": "uint8",
+            "maximum": 255,
+            "minimum": 0
+          },
+          "maxItems": 32,
+          "minItems": 32
+        },
+        "request_id": {
+          "type": "string"
+        },
+        "schema_id": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "schema_id",
+        "request_id",
+        "caller_runtime_id",
+        "native_request_sha256",
+        "provider_request_sha256",
+        "model",
+        "provider",
+        "outcome"
+      ]
+    },
+    "Usage": {
+      "description": "Token accounting for one completed request. Cache reads and writes are\ncounted apart from plain input; `reasoning_tokens` is absent when the\nprovider does not report it.",
+      "type": "object",
+      "properties": {
+        "cache_read_tokens": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "cache_write_tokens": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "input_tokens": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "output_tokens": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "reasoning_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "input_tokens",
+        "cache_read_tokens",
+        "cache_write_tokens",
+        "output_tokens"
+      ]
+    }
+  }
+}
