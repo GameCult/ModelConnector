@@ -3466,7 +3466,8 @@ mod tests {
             STAND_IN_PROVIDER
         );
         assert_eq!(charged_of(&service, "request-1"), reservation());
-        assert_eq!(service.window_spend(CALLER, 0), reservation());
+        // request-1 is charged the reservation; request-2 still holds its own.
+        assert_eq!(service.window_spend(CALLER, 0), 2 * reservation());
         drop(two);
     }
 
@@ -3485,27 +3486,29 @@ mod tests {
     #[test]
     fn a_stepped_back_clock_admits_into_the_newest_window_not_an_older_live_one() {
         let window = 10_000;
-        // The premise: a live reservation fills more of a window than the
-        // ceiling leaves, so admitting into the old window would succeed.
-        assert!(reservation() > 2 * FIXTURE_USAGE_COST);
-        let ceiling = reservation() + 2 * FIXTURE_USAGE_COST;
+        // Two live reservations fill window 9 (the newest); one live
+        // reservation leaves window 2 (older, still held) room for another.
+        // Request ids share a length, so every reservation is the same size.
+        let ceiling = reservation() + reservation() + reservation() / 2;
         let store = TestStore::new();
         let mut service = open_limited(&store, ceiling, window);
-        // A request stays live in window 2 while window 9 fills.
-        let old = claim_at(&mut service, "old", 20_000);
-        assert_eq!(run_window(&mut service, "fill", 90_000), 3);
-        assert_eq!(service.window_spend(CALLER, 9), 3 * FIXTURE_USAGE_COST);
-        // The clock reads window 2 again. Window 2 has room (only the live
-        // reservation), window 9 does not: the caller's window is the newest.
+        let old = claim_at(&mut service, "request-a", 20_000);
+        let newest = [
+            claim_at(&mut service, "request-b", 90_000),
+            claim_at(&mut service, "request-c", 90_000),
+        ];
+        assert_eq!(service.window_spend(CALLER, 2), reservation());
+        assert_eq!(service.window_spend(CALLER, 9), 2 * reservation());
+        // The clock reads window 2 again. Window 2 would hold the request;
+        // the caller's window is the newest, which cannot.
         assert_eq!(
-            refusal_at(&mut service, "back", 20_500, MAX_COST),
+            refusal_at(&mut service, "request-d", 20_500, MAX_COST),
             Refusal::ClockBehindAdmissionWindow
         );
         assert_eq!(service.window_spend(CALLER, 2), reservation());
-        assert_eq!(service.window_spend(CALLER, 9), 3 * FIXTURE_USAGE_COST);
-        drop(old);
+        assert_eq!(service.window_spend(CALLER, 9), 2 * reservation());
+        drop((old, newest));
     }
-
     #[test]
     fn a_clock_behind_the_callers_window_is_refused_by_name_until_it_catches_up() {
         let window = 10_000;
