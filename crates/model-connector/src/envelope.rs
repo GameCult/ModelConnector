@@ -911,4 +911,64 @@ mod tests {
             Err(ServiceError::Encoding)
         );
     }
+
+    fn golden_frame() -> Vec<u8> {
+        std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/wire_v3/carriage_invocation.frame"),
+        )
+        .expect("carriage_invocation.frame is committed")
+    }
+
+    #[test]
+    fn the_committed_golden_frame_is_what_the_kit_reads_and_writes() {
+        let frame = golden_frame();
+        let envelope = decode_invocation_frame(&frame).unwrap();
+        assert_eq!(encode_invocation_frame(&envelope).unwrap(), frame);
+    }
+
+    fn top_level(frame: &[u8]) -> std::collections::BTreeMap<String, rmpv::Value> {
+        let rmpv::Value::Map(entries) = rmpv::decode::read_value(&mut &frame[..]).unwrap() else {
+            panic!("a CultNet frame is a map");
+        };
+        entries
+            .into_iter()
+            .map(|(key, value)| (key.as_str().unwrap().to_string(), value))
+            .collect()
+    }
+
+    #[test]
+    fn the_frames_name_the_connector_service_and_its_one_operation_on_the_wire() {
+        let envelope = sealed_for_carriage();
+        let text = |map: &std::collections::BTreeMap<String, rmpv::Value>, key: &str| {
+            map[key].as_str().unwrap().to_string()
+        };
+        let request = top_level(&encode_invocation_frame(&envelope).unwrap());
+        assert_eq!(
+            text(&request, "schemaVersion"),
+            "cultnet.operation_request.v0"
+        );
+        assert_eq!(text(&request, "serviceId"), "gamecult.model.connector");
+        assert_eq!(text(&request, "operation"), "invoke");
+        assert_eq!(
+            text(&request, "payloadSchema"),
+            "gamecult.model.transport_envelope.v3"
+        );
+        assert_eq!(text(&request, "payloadEncoding"), "messagepack-base64");
+        assert_eq!(text(&request, "messageId"), envelope.request_id);
+        let response = top_level(&encode_result_frame(&envelope).unwrap());
+        assert_eq!(
+            text(&response, "schemaVersion"),
+            "cultnet.operation_response.v0"
+        );
+        assert_eq!(text(&response, "serviceId"), "gamecult.model.connector");
+        assert_eq!(text(&response, "operation"), "invoke");
+        assert_eq!(text(&response, "status"), "ok");
+        assert_eq!(
+            text(&response, "payloadSchema"),
+            "gamecult.model.transport_envelope.v3"
+        );
+        assert_eq!(text(&response, "payloadEncoding"), "messagepack-base64");
+        assert_eq!(text(&response, "messageId"), envelope.request_id);
+    }
 }
