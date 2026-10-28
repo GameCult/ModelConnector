@@ -154,7 +154,7 @@ mod fixture_tests {
             let envelope: TransportEnvelope = rmp_serde::from_slice(&request).unwrap();
             assert_eq!(decrypt_invocation(&envelope, &security).unwrap(), expected);
             let response = encrypt_result(
-                &TransportResult::refused(&expected, Refusal::Policy),
+                &TransportResult::refused(&expected, Refusal::ModelNotAllowed),
                 &security,
             )
             .unwrap();
@@ -175,7 +175,7 @@ mod fixture_tests {
         .unwrap();
         assert_eq!(
             client.execute(&invocation).unwrap().disposition,
-            TransportDisposition::Refused(Refusal::Policy)
+            TransportDisposition::Refused(Refusal::ModelNotAllowed)
         );
         server.join().unwrap();
     }

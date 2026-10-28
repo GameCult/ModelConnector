@@ -7,7 +7,7 @@ use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 use crate::contract::{
-    ContractError, RECEIPT_SCHEMA_ID, RESULT_SCHEMA_ID, Refusal, TransportDisposition,
+    ContractError, FailureKind, RECEIPT_SCHEMA_ID, RESULT_SCHEMA_ID, Refusal, TransportDisposition,
     TransportInvocation, TransportKey, TransportOutcome, TransportReceipt, TransportResult,
     canonical_invocation_bytes, require_id,
 };
@@ -228,18 +228,16 @@ impl TransportService {
             };
         }
         if envelope.ciphertext.len() > caller.max_payload_bytes {
-            return self.reply_refusal(&invocation, Refusal::Policy, &security);
+            return self.reply_refusal(&invocation, Refusal::PayloadBound, &security);
         }
         if let Err(error) = invocation.validate(now_unix_ms, self.max_expiry_skew_ms) {
             return self.reply_refusal(&invocation, contract_refusal(&error), &security);
         }
-        if !caller.allowed_models.contains(&invocation.request.model)
-            || invocation
-                .request
-                .max_output_tokens
-                .is_some_and(|limit| limit > caller.max_output_tokens)
-        {
-            return self.reply_refusal(&invocation, Refusal::Policy, &security);
+        if !caller.allowed_models.contains(&invocation.request.model) {
+            return self.reply_refusal(&invocation, Refusal::ModelNotAllowed, &security);
+        }
+        if invocation.request.max_output_tokens > caller.max_output_tokens {
+            return self.reply_refusal(&invocation, Refusal::OutputBound, &security);
         }
 
         let identity = RequestIdentity {
@@ -428,8 +426,8 @@ fn fits_frame(envelope: &TransportEnvelope, max_frame_bytes: usize) -> Result<bo
         .map_err(|_| ServiceError::Encoding)
 }
 
-/// The transport named on the stand-in failure, fixed so its size is bounded.
-const STAND_IN_TRANSPORT: &str = "model-connector";
+/// The provider named on the stand-in failure, fixed so its size is bounded.
+const STAND_IN_PROVIDER: &str = "model-connector";
 
 /// The failed result that stands in for one whose sealed frame cannot be
 /// carried: the same shape a provider failure takes, with nothing a provider
@@ -454,9 +452,9 @@ pub(crate) fn result_size_failure(
                 native_request_sha256,
                 provider_request_sha256,
                 model: model.to_string(),
-                transport: STAND_IN_TRANSPORT.to_string(),
+                provider: STAND_IN_PROVIDER.to_string(),
                 outcome: TransportOutcome::Failed {
-                    failure_kind: "result_size".to_string(),
+                    kind: FailureKind::ResultSize,
                     message: "provider result exceeded its byte bound".to_string(),
                 },
             }),
@@ -775,25 +773,26 @@ mod tests {
     }
 
     #[test]
-    fn policy_refuses_unlisted_models_and_output_tokens_over_the_caller_cap() {
+    fn an_unlisted_model_is_refused_model_not_allowed() {
         let store = TestStore::new();
         let mut service = open_service(&store, 8);
-
         let (admission, invocation) = run(&mut service, "unlisted-model", |request| {
             request.model = "other-model".to_string();
         });
-        assert_eq!(refusal_of(admission, &invocation), Refusal::Policy);
+        assert_eq!(refusal_of(admission, &invocation), Refusal::ModelNotAllowed);
+        let (admission, _) = run(&mut service, "listed-model", |_| {});
+        assert!(matches!(admission, TransportAdmission::Execute(_)));
+    }
 
+    #[test]
+    fn output_tokens_over_the_caller_cap_are_refused_output_bound_inclusively() {
+        let store = TestStore::new();
+        let mut service = open_service(&store, 8);
         let (admission, invocation) = run(&mut service, "over-cap", |request| {
-            request.max_output_tokens = Some(32_769);
+            request.max_output_tokens = 32_769;
         });
-        assert_eq!(refusal_of(admission, &invocation), Refusal::Policy);
-
-        for (id, tokens) in [
-            ("at-cap", Some(32_768)),
-            ("under-cap", Some(100)),
-            ("unset", None),
-        ] {
+        assert_eq!(refusal_of(admission, &invocation), Refusal::OutputBound);
+        for (id, tokens) in [("at-cap", 32_768), ("under-cap", 100)] {
             let (admission, _) = run(&mut service, id, |request| {
                 request.max_output_tokens = tokens;
             });
@@ -824,7 +823,7 @@ mod tests {
         };
         assert!(matches!(admit(size), Ok(TransportAdmission::Execute(_))));
         let refused = admit(size - 1).unwrap();
-        assert_eq!(refusal_of(refused, &invocation), Refusal::Policy);
+        assert_eq!(refusal_of(refused, &invocation), Refusal::PayloadBound);
     }
 
     #[test]
@@ -1074,7 +1073,7 @@ mod tests {
         transport: &str,
     ) -> TransportResult {
         let mut receipt = receipt(invocation);
-        receipt.transport = transport.to_string();
+        receipt.provider = transport.to_string();
         TransportResult::transported(
             invocation,
             vec![TransportEvent {

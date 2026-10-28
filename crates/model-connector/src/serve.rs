@@ -328,8 +328,8 @@ mod tests {
     use super::*;
     use crate::client::ConnectorClient;
     use crate::contract::{
-        Refusal, TransportDisposition, TransportEvent, TransportEventPayload, TransportOutcome,
-        TransportResult,
+        FailureKind, Refusal, TransportDisposition, TransportEvent, TransportEventPayload,
+        TransportOutcome, TransportResult,
     };
     use crate::fixtures::{TestStore, caller, invocation_for, receipt, request};
 
@@ -906,7 +906,7 @@ mod tests {
         let reply = client.execute(&invocation).unwrap();
         assert_eq!(
             reply.disposition,
-            TransportDisposition::Refused(Refusal::Policy)
+            TransportDisposition::Refused(Refusal::PayloadBound)
         );
         assert_eq!(backend.executions.load(Ordering::SeqCst), 0);
     }
@@ -949,7 +949,7 @@ mod tests {
         transport: &str,
     ) -> TransportResult {
         let mut receipt = receipt(invocation);
-        receipt.transport = transport.to_string();
+        receipt.provider = transport.to_string();
         TransportResult::transported(
             invocation,
             vec![TransportEvent {
@@ -984,9 +984,9 @@ mod tests {
             &result.disposition,
             TransportDisposition::Transported { events, receipt }
                 if events.is_empty()
-                    && receipt.transport == "model-connector"
+                    && receipt.provider == "model-connector"
                     && receipt.outcome == TransportOutcome::Failed {
-                        failure_kind: "result_size".to_string(),
+                        kind: FailureKind::ResultSize,
                         message: "provider result exceeded its byte bound".to_string(),
                     }
         )

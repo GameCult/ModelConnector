@@ -43,6 +43,7 @@ pub(crate) fn request() -> ProviderRequest {
         "conversation-1",
         "gpt-5.4",
         "Return the typed result.",
+        4_096,
     );
     request.input.push(InputItem::UserText {
         text: "Projected state".to_string(),
@@ -67,13 +68,17 @@ pub(crate) fn receipt(invocation: &TransportInvocation) -> TransportReceipt {
         native_request_sha256: invocation.native_request_sha256,
         provider_request_sha256: invocation.provider_request_sha256,
         model: invocation.request.model.clone(),
-        transport: "fixture-sse".to_string(),
+        provider: "fixture-sse".to_string(),
         outcome: TransportOutcome::Completed {
             provider_response_id: Some("response-1".to_string()),
-            input_tokens: Some(10),
-            output_tokens: Some(3),
-            reasoning_output_tokens: Some(1),
-            cached_input_tokens: None,
+            stop_reason: StopReason::EndTurn,
+            usage: Usage {
+                input_tokens: 10,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+                output_tokens: 3,
+                reasoning_tokens: Some(1),
+            },
         },
     }
 }

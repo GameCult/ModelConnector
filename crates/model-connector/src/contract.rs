@@ -39,17 +39,13 @@ pub struct ProviderRequest {
     pub model: String,
     pub instructions: String,
     pub input: Vec<InputItem>,
-    pub reasoning_effort: Option<String>,
-    pub reasoning_summary: Option<String>,
-    pub service_tier: Option<String>,
-    pub output_format_name: Option<String>,
-    pub previous_response_id: Option<String>,
+    pub reasoning_effort: Option<ReasoningEffort>,
+    pub cache_retention: Option<CacheRetention>,
     pub tools: Vec<ToolDefinition>,
     pub tool_choice: ToolChoice,
     pub parallel_tool_calls: bool,
     pub output_schema_json: Option<String>,
-    pub max_output_tokens: Option<u32>,
-    pub prompt_cache_key: Option<String>,
+    pub max_output_tokens: u32,
 }
 
 impl ProviderRequest {
@@ -58,6 +54,7 @@ impl ProviderRequest {
         conversation_id: impl Into<String>,
         model: impl Into<String>,
         instructions: impl Into<String>,
+        max_output_tokens: u32,
     ) -> Self {
         Self {
             schema_id: PROVIDER_REQUEST_SCHEMA_ID.to_string(),
@@ -67,16 +64,12 @@ impl ProviderRequest {
             instructions: instructions.into(),
             input: Vec::new(),
             reasoning_effort: None,
-            reasoning_summary: None,
-            service_tier: None,
-            output_format_name: None,
-            previous_response_id: None,
+            cache_retention: None,
             tools: Vec::new(),
             tool_choice: ToolChoice::Auto,
             parallel_tool_calls: false,
             output_schema_json: None,
-            max_output_tokens: None,
-            prompt_cache_key: None,
+            max_output_tokens,
         }
     }
 
@@ -88,38 +81,12 @@ impl ProviderRequest {
         require_id(&self.conversation_id, "conversation_id")?;
         require_id(&self.model, "model")?;
         require_content(&self.instructions, "instructions")?;
-        if matches!(self.max_output_tokens, Some(0)) {
+        if self.max_output_tokens == 0 {
             return Err(ContractError::Invalid("max_output_tokens"));
-        }
-        if self
-            .prompt_cache_key
-            .as_deref()
-            .is_some_and(|value| value.trim().is_empty())
-        {
-            return Err(ContractError::Invalid("prompt_cache_key"));
-        }
-        for (value, field) in [
-            (self.reasoning_effort.as_deref(), "reasoning_effort"),
-            (self.reasoning_summary.as_deref(), "reasoning_summary"),
-            (self.service_tier.as_deref(), "service_tier"),
-            (self.output_format_name.as_deref(), "output_format_name"),
-            (self.previous_response_id.as_deref(), "previous_response_id"),
-        ] {
-            if let Some(value) = value {
-                require_id(value, field)?;
-            }
         }
         if let Some(schema) = &self.output_schema_json {
             require_content(schema, "output_schema_json")?;
             require_json_object(schema, "output_schema_json")?;
-            require_provider_name(
-                self.output_format_name
-                    .as_deref()
-                    .ok_or(ContractError::Invalid("output_format_name"))?,
-                "output_format_name",
-            )?;
-        } else if self.output_format_name.is_some() {
-            return Err(ContractError::Invalid("output_schema_json"));
         }
 
         if self.tools.is_empty() && self.tool_choice == ToolChoice::Required {
@@ -165,6 +132,60 @@ impl ProviderRequest {
 pub enum ToolChoice {
     Auto,
     Required,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningEffort {
+    Low,
+    Medium,
+    High,
+    Max,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CacheRetention {
+    Short,
+    Long,
+}
+
+/// Why a provider stopped producing output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StopReason {
+    EndTurn,
+    ToolUse,
+    MaxOutputTokens,
+    StopSequence,
+    Refusal,
+    ContextWindow,
+}
+
+/// What kind of failure a provider reported. `ResultSize` is the connector's own
+/// stand-in for a result whose sealed frame cannot be carried.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureKind {
+    ResultSize,
+    InvalidRequest,
+    Authentication,
+    RateLimited,
+    Unavailable,
+    Timeout,
+    Provider,
+}
+
+/// Token accounting for one completed request. Cache reads and writes are
+/// counted apart from plain input; `reasoning_tokens` is absent when the
+/// provider does not report it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Usage {
+    pub input_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub output_tokens: u64,
+    pub reasoning_tokens: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -355,7 +376,7 @@ pub struct TransportReceipt {
     pub native_request_sha256: [u8; 32],
     pub provider_request_sha256: [u8; 32],
     pub model: String,
-    pub transport: String,
+    pub provider: String,
     pub outcome: TransportOutcome,
 }
 
@@ -376,17 +397,13 @@ impl TransportReceipt {
         if self.native_request_sha256 != invocation.native_request_sha256 {
             return Err(ContractError::NativeDigest);
         }
-        require_id(&self.transport, "receipt.transport")?;
+        require_id(&self.provider, "receipt.provider")?;
         match &self.outcome {
             TransportOutcome::Completed {
                 provider_response_id: Some(value),
                 ..
             } => require_id(value, "receipt.provider_response_id")?,
-            TransportOutcome::Failed {
-                failure_kind,
-                message,
-            } => {
-                require_id(failure_kind, "receipt.failure_kind")?;
+            TransportOutcome::Failed { message, .. } => {
                 require_content(message, "receipt.failure_message")?;
             }
             TransportOutcome::Completed {
@@ -402,13 +419,11 @@ impl TransportReceipt {
 pub enum TransportOutcome {
     Completed {
         provider_response_id: Option<String>,
-        input_tokens: Option<u64>,
-        output_tokens: Option<u64>,
-        reasoning_output_tokens: Option<u64>,
-        cached_input_tokens: Option<u64>,
+        stop_reason: StopReason,
+        usage: Usage,
     },
     Failed {
-        failure_kind: String,
+        kind: FailureKind,
         message: String,
     },
 }
@@ -418,7 +433,9 @@ pub enum Refusal {
     Expired,
     IdentitySubstitution,
     ProviderDigestSubstitution,
-    Policy,
+    ModelNotAllowed,
+    OutputBound,
+    PayloadBound,
     Capacity,
     InFlight,
     Indeterminate,
@@ -537,14 +554,14 @@ mod tests {
     #[test]
     fn provider_contract_refuses_transport_side_fixup_pressure() {
         let mut request = request();
-        request.output_format_name = Some("epiphany.role.result".to_string());
         request.output_schema_json = Some(r#"{"type":"object"}"#.to_string());
+        assert_eq!(request.validate(), Ok(()));
+        request.output_schema_json = Some("[]".to_string());
         assert_eq!(
             request.validate(),
-            Err(ContractError::Invalid("output_format_name"))
+            Err(ContractError::Invalid("output_schema_json"))
         );
 
-        request.output_format_name = None;
         request.output_schema_json = None;
         request.input.push(InputItem::ToolResult {
             call_id: "x".repeat(65),
