@@ -33,8 +33,17 @@ pub struct TransportEnvelope {
     pub message_kind: EnvelopeKind,
     pub nonce: [u8; 12],
     #[serde(with = "serde_bytes")]
-    #[schemars(with = "Vec<u8>")]
+    #[schemars(schema_with = "binary_schema")]
     pub ciphertext: Vec<u8>,
+}
+
+/// The ciphertext is MessagePack `bin` on the wire, never an array of integers.
+fn binary_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": "string",
+        "format": "binary",
+        "description": "MessagePack bin: the raw ciphertext bytes, never an array of integers"
+    })
 }
 
 /// The CultNet service every frame of this connector addresses.
@@ -970,5 +979,160 @@ mod tests {
         );
         assert_eq!(text(&response, "payloadEncoding"), "messagepack-base64");
         assert_eq!(text(&response, "messageId"), envelope.request_id);
+    }
+
+    fn value_of(bytes: &[u8]) -> rmpv::Value {
+        rmpv::decode::read_value(&mut &bytes[..]).unwrap()
+    }
+
+    fn bytes_of(value: &rmpv::Value) -> Vec<u8> {
+        let mut out = Vec::new();
+        rmpv::encode::write_value(&mut out, value).unwrap();
+        out
+    }
+
+    fn with_entry(value: rmpv::Value, name: &str, entry: rmpv::Value) -> rmpv::Value {
+        let rmpv::Value::Map(mut entries) = value else {
+            panic!("a named document is a map");
+        };
+        let slot = entries
+            .iter_mut()
+            .find(|(key, _)| key.as_str() == Some(name))
+            .unwrap();
+        slot.1 = entry;
+        rmpv::Value::Map(entries)
+    }
+
+    fn reverse_maps(value: rmpv::Value) -> rmpv::Value {
+        match value {
+            rmpv::Value::Map(entries) => rmpv::Value::Map(
+                entries
+                    .into_iter()
+                    .rev()
+                    .map(|(key, entry)| (key, reverse_maps(entry)))
+                    .collect(),
+            ),
+            rmpv::Value::Array(items) => {
+                rmpv::Value::Array(items.into_iter().map(reverse_maps).collect())
+            }
+            other => other,
+        }
+    }
+
+    fn without_nils(value: rmpv::Value) -> rmpv::Value {
+        match value {
+            rmpv::Value::Map(entries) => rmpv::Value::Map(
+                entries
+                    .into_iter()
+                    .filter(|(_, entry)| !entry.is_nil())
+                    .map(|(key, entry)| (key, without_nils(entry)))
+                    .collect(),
+            ),
+            rmpv::Value::Array(items) => {
+                rmpv::Value::Array(items.into_iter().map(without_nils).collect())
+            }
+            other => other,
+        }
+    }
+
+    fn request_frame_carrying(payload: &[u8]) -> Vec<u8> {
+        request_message(|message| {
+            if let CultNetMessage::OperationRequest { payload: sent, .. } = message {
+                *sent = STANDARD.encode(payload);
+            }
+        })
+    }
+
+    fn response_frame_carrying(payload: &[u8]) -> Vec<u8> {
+        response_message(|message| {
+            if let CultNetMessage::OperationResponse { payload: sent, .. } = message {
+                *sent = STANDARD.encode(payload);
+            }
+        })
+    }
+
+    #[test]
+    fn the_carriage_refuses_every_dialect_the_wire_does_not_name() {
+        let envelope = sealed_for_carriage();
+        let named = value_of(&wire_encode(&envelope).unwrap());
+        let integer_ciphertext = rmpv::Value::Array(
+            envelope
+                .ciphertext
+                .iter()
+                .map(|byte| rmpv::Value::from(*byte))
+                .collect(),
+        );
+        let dialects = [
+            ("positional envelope", rmp_serde::to_vec(&envelope).unwrap()),
+            (
+                "integer-array ciphertext",
+                bytes_of(&with_entry(named.clone(), "ciphertext", integer_ciphertext)),
+            ),
+            (
+                "enum as its index",
+                bytes_of(&with_entry(named, "message_kind", 0.into())),
+            ),
+            (
+                "bytes after the document",
+                [wire_encode(&envelope).unwrap(), vec![0xc0]].concat(),
+            ),
+        ];
+        for (dialect, payload) in &dialects {
+            assert_eq!(
+                decode_invocation_frame(&request_frame_carrying(payload)),
+                Err(ServiceError::Encoding),
+                "{dialect} on a request"
+            );
+            assert_eq!(
+                decode_result_frame(&response_frame_carrying(payload)),
+                Err(ServiceError::Encoding),
+                "{dialect} on a response"
+            );
+        }
+        // The named form itself is read, so the refusals above are the dialect's.
+        let named_bytes = wire_encode(&envelope).unwrap();
+        assert_eq!(
+            decode_invocation_frame(&request_frame_carrying(&named_bytes)),
+            Ok(envelope)
+        );
+    }
+
+    #[test]
+    fn a_sealed_positional_invocation_is_refused_after_decryption() {
+        let key = security("epiphany-distinct-test-key");
+        let invocation = invocation();
+        let sealed = encrypt_message(
+            &invocation.caller_runtime_id,
+            invocation.request_id(),
+            EnvelopeKind::Invocation,
+            &rmp_serde::to_vec(&invocation).unwrap(),
+            &key,
+        )
+        .unwrap();
+        let arrived = decode_invocation_frame(&encode_invocation_frame(&sealed).unwrap()).unwrap();
+        assert_eq!(
+            decrypt_invocation(&arrived, &key),
+            Err(ServiceError::Encoding)
+        );
+        let sealed = encrypt_invocation(&invocation, &key).unwrap();
+        assert_eq!(decrypt_invocation(&sealed, &key), Ok(invocation));
+    }
+
+    #[test]
+    fn named_maps_in_any_key_order_and_without_absent_options_are_the_named_form() {
+        let envelope = sealed_for_carriage();
+        let reversed = bytes_of(&reverse_maps(value_of(&wire_encode(&envelope).unwrap())));
+        assert_ne!(reversed, wire_encode(&envelope).unwrap());
+        assert_eq!(wire_decode::<TransportEnvelope>(&reversed), Ok(envelope));
+        let invocation = invocation();
+        let named = value_of(&wire_encode(&invocation).unwrap());
+        for edited in [reverse_maps(named.clone()), without_nils(named)] {
+            let bytes = bytes_of(&edited);
+            assert_ne!(bytes, wire_encode(&invocation).unwrap());
+            assert_eq!(
+                wire_decode::<TransportInvocation>(&bytes),
+                Ok(invocation.clone())
+            );
+        }
     }
 }

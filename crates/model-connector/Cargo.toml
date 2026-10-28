@@ -18,6 +18,7 @@ cultnet-rs = { git = "https://github.com/GameCult/CultLib.git", rev = "a4eae9056
 cultcache-rs = { git = "https://github.com/GameCult/CultLib.git", rev = "a4eae9056152335662f1115f97bf35fb00ab6d23", package = "cultcache-rs", optional = true }
 rand_core = { version = "0.6", features = ["getrandom"] }
 rmp-serde = "1"
+rmpv = "1"
 schemars = "1"
 serde = { version = "1", features = ["derive"] }
 serde_bytes = "0.11"
@@ -25,6 +26,3 @@ serde_json = "1"
 sha2 = "0.10"
 thiserror = "2"
 zeroize = "1"
-
-[dev-dependencies]
-rmpv = "1"

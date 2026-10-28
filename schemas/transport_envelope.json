@@ -7,13 +7,9 @@
       "type": "string"
     },
     "ciphertext": {
-      "type": "array",
-      "items": {
-        "type": "integer",
-        "format": "uint8",
-        "maximum": 255,
-        "minimum": 0
-      }
+      "description": "MessagePack bin: the raw ciphertext bytes, never an array of integers",
+      "type": "string",
+      "format": "binary"
     },
     "message_kind": {
       "$ref": "#/$defs/EnvelopeKind"

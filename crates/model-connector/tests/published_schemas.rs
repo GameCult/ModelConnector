@@ -64,3 +64,37 @@ fn a_published_schema_refuses_an_unknown_field() {
     let required = schema["required"].as_array().unwrap();
     assert!(required.contains(&serde_json::json!("max_output_tokens")));
 }
+
+/// The schema and the wire agree on the ciphertext: the schema says binary, not
+/// an array of integers, and the encoder writes MessagePack `bin`.
+#[test]
+fn the_published_ciphertext_is_what_the_wire_sends() {
+    let schema = serde_json::to_value(schema_for!(TransportEnvelope)).unwrap();
+    let ciphertext = &schema["properties"]["ciphertext"];
+    assert_eq!(ciphertext["type"], "string");
+    assert_eq!(ciphertext["format"], "binary");
+    assert!(ciphertext.get("items").is_none());
+    let published = std::fs::read_to_string(schemas_dir().join("transport_envelope.json")).unwrap();
+    let published: serde_json::Value = serde_json::from_str(&published).unwrap();
+    assert_eq!(&published["properties"]["ciphertext"], ciphertext);
+
+    let envelope = TransportEnvelope {
+        schema_id: "gamecult.model.transport_envelope.v3".to_string(),
+        caller_runtime_id: "caller".to_string(),
+        request_id: "request".to_string(),
+        message_kind: EnvelopeKind::Invocation,
+        nonce: [1; 12],
+        ciphertext: vec![9; 40],
+    };
+    let sent =
+        rmpv::decode::read_value(&mut rmp_serde::to_vec_named(&envelope).unwrap().as_slice())
+            .unwrap();
+    let rmpv::Value::Map(entries) = sent else {
+        panic!("the envelope is a named map");
+    };
+    let (_, wire) = entries
+        .iter()
+        .find(|(key, _)| key.as_str() == Some("ciphertext"))
+        .unwrap();
+    assert!(matches!(wire, rmpv::Value::Binary(bytes) if bytes.len() == 40));
+}

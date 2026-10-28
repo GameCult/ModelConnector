@@ -462,8 +462,48 @@ pub(crate) fn wire_encode<T: Serialize + ?Sized>(document: &T) -> Result<Vec<u8>
     rmp_serde::to_vec_named(document).map_err(|_| ContractError::Encoding)
 }
 
-pub(crate) fn wire_decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, ContractError> {
-    rmp_serde::from_slice(bytes).map_err(|_| ContractError::Encoding)
+/// Decodes a document and refuses every dialect the wire does not name. The
+/// typed decoder alone also reads a positional array for a struct, an integer
+/// array where `bin` is declared and an enum as its index; so the bytes must
+/// equal what [`wire_encode`] writes for the decoded value, compared as
+/// MessagePack values: key order, integer width and an absent optional field
+/// do not matter, array against map, array against `bin` and index against name do.
+pub(crate) fn wire_decode<T: DeserializeOwned + Serialize>(
+    bytes: &[u8],
+) -> Result<T, ContractError> {
+    let document: T = rmp_serde::from_slice(bytes).map_err(|_| ContractError::Encoding)?;
+    if named_form(bytes)? != named_form(&wire_encode(&document)?)? {
+        return Err(ContractError::Encoding);
+    }
+    Ok(document)
+}
+
+fn named_form(bytes: &[u8]) -> Result<rmpv::Value, ContractError> {
+    let mut reader = bytes;
+    let value = rmpv::decode::read_value(&mut reader).map_err(|_| ContractError::Encoding)?;
+    if !reader.is_empty() {
+        return Err(ContractError::Encoding);
+    }
+    Ok(order_free(value))
+}
+
+/// A map compared as a set of its present entries: sorted by key, nil entries dropped.
+fn order_free(value: rmpv::Value) -> rmpv::Value {
+    match value {
+        rmpv::Value::Map(entries) => {
+            let mut kept: Vec<(rmpv::Value, rmpv::Value)> = entries
+                .into_iter()
+                .filter(|(_, entry)| !entry.is_nil())
+                .map(|(key, entry)| (key, order_free(entry)))
+                .collect();
+            kept.sort_by_key(|(key, _)| key.to_string());
+            rmpv::Value::Map(kept)
+        }
+        rmpv::Value::Array(items) => {
+            rmpv::Value::Array(items.into_iter().map(order_free).collect())
+        }
+        other => other,
+    }
 }
 
 pub fn canonical_provider_request_bytes(
