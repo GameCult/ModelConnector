@@ -226,14 +226,11 @@ fn bin_header_bytes(len: usize) -> usize {
     }
 }
 
-/// MessagePack `str` header width for a string of `len` bytes.
+/// MessagePack `str` header width for the base64 payload. The payload always
+/// exceeds 255 bytes: the envelope it encodes holds two ids of at least
+/// `MAX_IDENTITY_BYTES` in the worst case this bound measures.
 fn str_header_bytes(len: usize) -> usize {
-    match len {
-        0..=31 => 1,
-        32..=255 => 2,
-        256..=65_535 => 3,
-        _ => 5,
-    }
+    if len <= 65_535 { 3 } else { 5 }
 }
 
 /// The largest payload bound whose worst-case frame fits `max_frame_bytes`:
