@@ -3333,7 +3333,7 @@ mod tests {
             request.instructions = "x".repeat((xorshift(&mut s) % 3000) as usize);
             let overhead = xorshift(&mut s) % 5_000;
             let bound = wire_encode(&request).unwrap().len() as u64 + overhead;
-            let long_context = (xorshift(&mut s) % 2 == 0).then(|| LongContext {
+            let long_context = (xorshift(&mut s).is_multiple_of(2)).then(|| LongContext {
                 above_prompt_tokens: xorshift(&mut s) % (2 * bound + 1),
                 rates: random_rates(&mut s),
             });
@@ -3343,7 +3343,7 @@ mod tests {
                 overhead_tokens: overhead,
             };
             let reserved = reservation_micro_usd(&price, &request).unwrap().unwrap();
-            let prompt = if xorshift(&mut s) % 4 == 0 {
+            let prompt = if xorshift(&mut s).is_multiple_of(4) {
                 bound
             } else {
                 xorshift(&mut s) % (bound + 1)
@@ -3351,7 +3351,7 @@ mod tests {
             let a = xorshift(&mut s) % (prompt + 1);
             let b = xorshift(&mut s) % (prompt - a + 1);
             let max_output = u64::from(request.max_output_tokens);
-            let output = if xorshift(&mut s) % 4 == 0 {
+            let output = if xorshift(&mut s).is_multiple_of(4) {
                 max_output
             } else {
                 xorshift(&mut s) % (max_output + 1)
