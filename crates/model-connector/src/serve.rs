@@ -574,20 +574,21 @@ mod tests {
         let envelope =
             crate::envelope::encrypt_invocation(&invocation, &crate::fixtures::security(KEY))
                 .unwrap();
-        let TransportAdmission::Execute(claim) = service.begin(&envelope, now_ms(), FRAME).unwrap()
+        let TransportAdmission::Execute(claim) =
+            service.begin(&envelope, now_ms(), 1 << 20).unwrap()
         else {
             panic!("a fresh request must execute");
         };
         service
             .complete(
                 *claim,
-                sized_result(&invocation, 80_000, "fixture-sse"),
-                FRAME,
+                sized_result(&invocation, 150_000, "fixture-sse"),
+                1 << 20,
             )
             .unwrap();
         drop(service);
 
-        let narrow = 100_000;
+        let narrow = 140_000;
         let narrowed = ServeLimits {
             max_frame_bytes: narrow,
             ..limits()
@@ -595,7 +596,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let endpoint = listener.local_addr().unwrap();
         let path = store.path.clone();
-        let backend = SizedBackend::new(80_000);
+        let backend = SizedBackend::new(150_000);
         let served = backend.clone();
         thread::spawn(move || {
             serve(
