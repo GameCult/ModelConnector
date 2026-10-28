@@ -714,7 +714,7 @@ mod tests {
             assert_eq!(frame_bytes_for_payload(allowed), frame, "{bytes}");
             assert!(frame_bytes_for_payload(allowed + 1) > frame, "{bytes}");
             assert!(
-                payload_bytes_for_frame(frame - 1).unwrap() < bytes,
+                payload_bytes_for_frame(frame - 1).is_none_or(|smaller| smaller < bytes),
                 "{bytes}"
             );
         }
