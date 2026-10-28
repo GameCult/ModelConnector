@@ -3509,6 +3509,7 @@ mod tests {
         assert_eq!(service.window_spend(CALLER, 9), 2 * reservation());
         drop((old, newest));
     }
+
     #[test]
     fn a_clock_behind_the_callers_window_is_refused_by_name_until_it_catches_up() {
         let window = 10_000;
