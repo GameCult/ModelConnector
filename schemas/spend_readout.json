@@ -1,0 +1,111 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SpendReadout",
+  "type": "object",
+  "properties": {
+    "at_unix_ms": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "callers": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/CallerSpend"
+      }
+    },
+    "plan_quota": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/PlanQuota"
+      }
+    },
+    "plan_quota_observed_at_unix_ms": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "minimum": 0
+    },
+    "schema_id": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "schema_id",
+    "at_unix_ms",
+    "callers",
+    "plan_quota"
+  ],
+  "$defs": {
+    "CallerSpend": {
+      "description": "One caller's current spend window in micro-USD. `spent` is settled charges\nplus what a crash left counted at its full reservation; `reserved` is what\ncalls in flight hold, and both count against the ceiling.",
+      "type": "object",
+      "properties": {
+        "caller_id": {
+          "type": "string"
+        },
+        "ceiling_micro_usd": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "reserved_micro_usd": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "spent_micro_usd": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "window_ms": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "caller_id",
+        "window_ms",
+        "ceiling_micro_usd",
+        "spent_micro_usd",
+        "reserved_micro_usd"
+      ]
+    },
+    "PlanQuota": {
+      "description": "One window of the subscription plan, as the provider reported it.",
+      "type": "object",
+      "properties": {
+        "resets_at_unix_ms": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "status": {
+          "type": "string"
+        },
+        "utilization_permille": {
+          "description": "How much of the window is used, in thousandths.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "window": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "window",
+        "utilization_permille",
+        "resets_at_unix_ms",
+        "status"
+      ]
+    }
+  }
+}
