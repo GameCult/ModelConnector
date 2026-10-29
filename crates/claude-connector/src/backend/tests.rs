@@ -13,7 +13,7 @@ use model_connector::{
 use super::*;
 use crate::config::ClaudeCodeLimits;
 use crate::handle::{FsSessionStore, SessionStore};
-use crate::launch::ChildEnv;
+use crate::launch::{ChildEnv, TOKEN_VAR};
 
 const CANARY_TOKEN: &str = "canary-oauth-token-value";
 const MODEL: &str = "claude-haiku-5-5";
@@ -243,15 +243,45 @@ impl StderrSink for Sink {
     }
 }
 
-fn config(instance: &str, limits: ClaudeCodeLimits) -> ClaudeCodeConfig {
+/// The bytes of the stand-in `claude` the scripted rigs pin.
+const PINNED: &[u8] = b"the pinned claude bytes";
+
+fn pin_of(bytes: &[u8]) -> [u8; 32] {
+    Sha256::digest(bytes).into()
+}
+
+/// A directory holding a pinned `claude` file and an empty `prompts` directory.
+fn sandbox() -> TempDir {
+    let dir = TempDir::new();
+    std::fs::write(dir.path().join("claude"), PINNED).unwrap();
+    std::fs::create_dir_all(dir.path().join("prompts")).unwrap();
+    dir
+}
+
+fn config(dir: &Path, instance: &str, limits: ClaudeCodeLimits) -> ClaudeCodeConfig {
     ClaudeCodeConfig {
-        claude_binary: PathBuf::from("/opt/claude"),
-        claude_binary_sha256: [9; 32],
+        claude_binary: dir.join("claude"),
+        claude_binary_sha256: pin_of(PINNED),
         work_dir: PathBuf::from("/work"),
         config_dir: PathBuf::from("/cfg"),
+        prompt_dir: dir.join("prompts"),
+        token_credential: "claude-token".to_string(),
         instance: instance.to_string(),
         limits,
     }
+}
+
+/// A token source with a fixed answer.
+struct FixedToken(Option<&'static str>);
+
+impl TokenSource for FixedToken {
+    fn read(&self) -> Option<Zeroizing<String>> {
+        self.0.map(|token| Zeroizing::new(token.to_string()))
+    }
+}
+
+fn canary_token() -> Box<dyn TokenSource> {
+    Box::new(FixedToken(Some(CANARY_TOKEN)))
 }
 
 fn limits() -> ClaudeCodeLimits {
@@ -263,12 +293,8 @@ fn limits() -> ClaudeCodeLimits {
     }
 }
 
-fn with_canary_token(mut backend: ClaudeCodeBackend) -> ClaudeCodeBackend {
-    backend.env_lookup = Box::new(|name| (name == TOKEN_VAR).then(|| CANARY_TOKEN.to_string()));
-    backend
-}
-
 struct Rig {
+    dir: TempDir,
     backend: ClaudeCodeBackend,
     spawns: Arc<AtomicUsize>,
     seen: Arc<Mutex<Seen>>,
@@ -285,13 +311,16 @@ fn rig_for(instance: &str, scripts: Vec<Script>, sessions: &[&str], stderr: &[u8
         seen: seen.clone(),
         stderr: stderr.to_vec(),
     };
-    let backend = with_canary_token(ClaudeCodeBackend::with_ports(
-        config(instance, limits()),
+    let dir = sandbox();
+    let backend = ClaudeCodeBackend::with_ports(
+        config(dir.path(), instance, limits()),
         Box::new(port),
         Box::new(Sessions(sessions.iter().map(|s| s.to_string()).collect())),
         Box::new(sink.clone()),
-    ));
+        canary_token(),
+    );
     Rig {
+        dir,
         backend,
         spawns,
         seen,
@@ -443,7 +472,7 @@ fn argv_is_the_fixed_hygiene_set() {
         .expect("the prompt is passed as a file")
         .to_string();
     let expected: Vec<String> = [
-        "/opt/claude",
+        rig.dir.path().join("claude").to_str().unwrap(),
         "-p",
         "--output-format",
         "stream-json",
@@ -569,7 +598,7 @@ fn the_token_never_reaches_a_message_an_event_or_a_debug_form() {
     );
 
     let env = child_env(
-        &config(INSTANCE, limits()),
+        &config(rig.dir.path(), INSTANCE, limits()),
         &request(vec![user("x")]),
         Zeroizing::new(CANARY_TOKEN.to_string()),
     );
@@ -580,56 +609,141 @@ fn the_token_never_reaches_a_message_an_event_or_a_debug_form() {
 
 // ---- ready ----
 
+/// A backend over a scripted port that never has a script: `ready` runs nothing.
+fn ready_backend(config: ClaudeCodeConfig, tokens: Box<dyn TokenSource>) -> ClaudeCodeBackend {
+    ClaudeCodeBackend::with_ports(
+        config,
+        Box::new(ScriptedPort {
+            scripts: Mutex::new(VecDeque::new()),
+            spawns: Arc::new(AtomicUsize::new(0)),
+            seen: Arc::new(Mutex::new(Seen::default())),
+            stderr: Vec::new(),
+        }),
+        Box::new(Sessions(vec![])),
+        Box::new(Sink::default()),
+        tokens,
+    )
+}
+
 #[test]
 fn ready_checks_the_pinned_binary_digest() {
-    let dir = TempDir::new();
+    let dir = sandbox();
     let (work, cfg) = (dir.path().join("work"), dir.path().join("cfg"));
     std::fs::create_dir_all(&work).unwrap();
     std::fs::create_dir_all(&cfg).unwrap();
     let binary = dir.path().join("claude");
-    std::fs::write(&binary, b"the pinned bytes").unwrap();
-    let pin: [u8; 32] = Sha256::digest(b"the pinned bytes").into();
 
-    let ready = |sha: [u8; 32], binary: &Path, work: &Path, token: bool| {
-        let mut config = config(INSTANCE, limits());
+    let ready = |sha: [u8; 32], binary: &Path, work: &Path, prompts: &Path, token: bool| {
+        let mut config = config(dir.path(), INSTANCE, limits());
         config.claude_binary = binary.to_path_buf();
         config.claude_binary_sha256 = sha;
         config.work_dir = work.to_path_buf();
         config.config_dir = cfg.clone();
-        let rig = rig(vec![]);
-        let mut backend = ClaudeCodeBackend::with_ports(
-            config,
-            Box::new(ScriptedPort {
-                scripts: Mutex::new(VecDeque::new()),
-                spawns: rig.spawns.clone(),
-                seen: rig.seen.clone(),
-                stderr: Vec::new(),
-            }),
-            Box::new(Sessions(vec![])),
-            Box::new(Sink::default()),
-        );
-        backend.env_lookup =
-            Box::new(move |name| (token && name == TOKEN_VAR).then(|| "t".to_string()));
-        let answer = backend.ready();
-        assert_eq!(rig.spawns(), 0, "ready runs nothing");
-        answer
+        config.prompt_dir = prompts.to_path_buf();
+        let tokens = Box::new(FixedToken(token.then_some("t")));
+        ready_backend(config, tokens).ready()
     };
+    let prompts = dir.path().join("prompts");
+    let pin = pin_of(PINNED);
 
-    assert!(ready(pin, &binary, &work, true));
-    assert!(!ready([0; 32], &binary, &work, true), "other pin");
+    assert!(ready(pin, &binary, &work, &prompts, true));
+    assert!(!ready([0; 32], &binary, &work, &prompts, true), "other pin");
     assert!(
-        !ready(pin, &dir.path().join("absent"), &work, true),
+        !ready(pin, &dir.path().join("absent"), &work, &prompts, true),
         "no binary"
     );
     assert!(
-        !ready(pin, &binary, &dir.path().join("absent"), true),
+        !ready(pin, &binary, &dir.path().join("absent"), &prompts, true),
         "no work dir"
     );
-    assert!(!ready(pin, &binary, &work, false), "no token");
+    assert!(
+        !ready(pin, &binary, &work, &dir.path().join("absent"), true),
+        "no prompt dir"
+    );
+    assert!(!ready(pin, &binary, &work, &prompts, false), "no token");
     std::fs::write(&binary, b"other bytes").unwrap();
     assert!(
-        !ready(pin, &binary, &work, true),
+        !ready(pin, &binary, &work, &prompts, true),
         "bytes differ from the pin"
+    );
+}
+
+#[test]
+fn token_comes_from_the_credential_file_not_the_environment() {
+    static CANARY_PARENT: std::sync::Once = std::sync::Once::new();
+    CANARY_PARENT.call_once(|| {
+        // SAFETY: set once to a value no code path reads; the test proves none does.
+        unsafe { std::env::set_var(TOKEN_VAR, "canary-environment-token") };
+    });
+    let dir = sandbox();
+    let credentials = dir.path().join("credentials");
+    for sub in ["credentials", "work", "cfg"] {
+        std::fs::create_dir_all(dir.path().join(sub)).unwrap();
+    }
+    let seen = Arc::new(Mutex::new(Seen::default()));
+    let mut config = config(dir.path(), INSTANCE, limits());
+    config.work_dir = dir.path().join("work");
+    config.config_dir = dir.path().join("cfg");
+    let backend = ClaudeCodeBackend::with_ports(
+        config,
+        Box::new(ScriptedPort {
+            scripts: Mutex::new(vec![ok_script(SESSION, "x")].into()),
+            spawns: Arc::new(AtomicUsize::new(0)),
+            seen: seen.clone(),
+            stderr: Vec::new(),
+        }),
+        Box::new(Sessions(vec![])),
+        Box::new(Sink::default()),
+        Box::new(CredentialTokenSource::in_directory(
+            &credentials,
+            "claude-token",
+        )),
+    );
+    let mut door = Door::new();
+
+    // The variable is set and the file is absent: nothing to give the child.
+    assert!(!backend.ready());
+    let (claim, _) = door.begin(request(vec![user("hi")]));
+    let (kind, message, usage) = failure_of(&backend.execute(claim.call()));
+    assert_eq!(kind, FailureKind::Authentication);
+    assert_eq!(usage, Some(usage_zero()));
+    assert!(!message.contains("canary-environment-token"));
+    assert!(seen.lock().unwrap().argv.is_empty(), "no child was spawned");
+
+    // The file is read afresh at the call, its trailing newline trimmed, and
+    // the child's environment carries the file's value.
+    std::fs::write(
+        credentials.join("claude-token"),
+        format!("{CANARY_TOKEN}\n"),
+    )
+    .unwrap();
+    assert!(backend.ready());
+    let mut door = Door::new();
+    let (claim, _) = door.begin(request(vec![user("hi")]));
+    let result = backend.execute(claim.call());
+    assert!(matches!(
+        outcome(&result),
+        TransportOutcome::Completed { .. }
+    ));
+    let env = seen.lock().unwrap().env.clone();
+    assert!(env.contains(&(TOKEN_VAR.to_string(), CANARY_TOKEN.to_string())));
+
+    // An empty credential is no token.
+    std::fs::write(credentials.join("claude-token"), "\n").unwrap();
+    assert!(!backend.ready());
+}
+
+#[test]
+fn an_unreadable_credential_is_no_token() {
+    // A credential that is a directory, or a directory that is absent.
+    let dir = sandbox();
+    std::fs::create_dir_all(dir.path().join("claude-token")).unwrap();
+    let source = CredentialTokenSource::in_directory(dir.path(), "claude-token");
+    assert!(source.read().is_none());
+    assert!(
+        CredentialTokenSource::in_directory(dir.path().join("absent"), "x")
+            .read()
+            .is_none()
     );
 }
 
@@ -1224,7 +1338,7 @@ fn one_spawn_per_execute() {
 #[test]
 fn a_missing_token_fails_before_spawn() {
     let mut rig = rig(vec![ok_script(SESSION, "x")]);
-    rig.backend.env_lookup = Box::new(|_| None);
+    rig.backend.tokens = Box::new(FixedToken(None));
     let (kind, _, usage) = failure_of(&rig.run(request(vec![user("hi")])));
     assert_eq!(kind, FailureKind::Authentication);
     assert_eq!(usage, Some(usage_zero()));
@@ -1245,18 +1359,23 @@ fn a_port_that_cannot_spawn_is_a_provider_failure() {
             Err(io::Error::from(io::ErrorKind::NotFound))
         }
     }
-    let backend = with_canary_token(ClaudeCodeBackend::with_ports(
-        config(INSTANCE, limits()),
+    let dir = sandbox();
+    let backend = ClaudeCodeBackend::with_ports(
+        config(dir.path(), INSTANCE, limits()),
         Box::new(Refusing),
         Box::new(Sessions(vec![])),
         Box::new(Sink::default()),
-    ));
+        canary_token(),
+    );
     let mut door = Door::new();
     let (claim, _) = door.begin(request(vec![user("hi")]));
     let (kind, message, usage) = failure_of(&backend.execute(claim.call()));
     assert_eq!(kind, FailureKind::Provider);
     assert_eq!(usage, None);
-    assert!(!message.contains("/opt/claude"), "no path in a message");
+    assert!(
+        !message.contains(dir.path().to_str().unwrap()),
+        "no path in a message"
+    );
 }
 
 #[test]
@@ -1384,28 +1503,60 @@ fn usage_the_result_does_not_report_is_billed_the_reservation() {
 }
 
 #[test]
-fn a_refusal_at_the_door_is_billed_nothing() {
-    // Ruling spend-bills-on-identity-not-validity: a bound result is charged
-    // its true cost, and the provider bills nothing for a 401 or 403.
-    // The shape is a real claude 2.1.312 capture with a bogus token.
+fn door_set_is_exactly_401_403_429() {
+    // Ruling claude-code-plan-quota-fuse-2 with spend-bills-on-identity-not-
+    // validity: a refusal at the door is charged nothing, for exactly the
+    // statuses the provider cannot have billed (401, 403, 429) and only when
+    // the result says its usage is explicitly empty. Every other shape is
+    // billed the reservation. The 401 shape is a real claude 2.1.312 capture
+    // with a bogus token.
     let retry = r#"{"type":"system","subtype":"api_retry","error":"authentication_failed"}"#;
     let synthetic = r#"{"type":"assistant","api_error_status":401,"error":"authentication_failed","message":{"id":"e48001b7-cf4f-49b1-9810-db8fd7f73c73","model":"<synthetic>","stop_reason":"stop_sequence","content":[{"type":"text","text":"Failed to authenticate. API Error: 401 OAuth access token is invalid."}]}}"#;
-    for status in [401, 403] {
-        let result_line = format!(
-            r#"{{"type":"result","subtype":"success","is_error":true,"api_error_status":{status},"stop_reason":"stop_sequence","result":"Failed to authenticate.","modelUsage":{{}},"model_usage_since_last_result":{{}},"terminal_reason":"api_error"}}"#
-        );
-        let result = rig(vec![Script::lines(vec![
-            init_line(MODEL, SESSION),
-            retry.to_string(),
-            retry.to_string(),
-            synthetic.to_string(),
-            result_line,
-        ])])
-        .run(request(vec![user("hi")]));
-        let (kind, _, usage) = failure_of(&result);
-        assert_eq!(kind, FailureKind::Authentication, "{status}");
-        assert_eq!(usage, Some(usage_zero()), "{status}");
-        assert_eq!(parts(&result).1.cost_micro_usd, 0, "{status}");
+    let reservation = reservation();
+    let statuses: [Option<u16>; 9] = [
+        Some(400),
+        Some(401),
+        Some(402),
+        Some(403),
+        Some(404),
+        Some(429),
+        Some(500),
+        Some(529),
+        None,
+    ];
+    let shapes = [
+        (Some("{}"), "empty"),
+        (None, "absent"),
+        (Some("null"), "null"),
+    ];
+    for status in statuses {
+        for (since_last, shape) in shapes {
+            let status_field = status
+                .map(|status| format!(r#""api_error_status":{status},"#))
+                .unwrap_or_default();
+            let usage_field = since_last
+                .map(|usage| format!(r#","model_usage_since_last_result":{usage}"#))
+                .unwrap_or_default();
+            let result_line = format!(
+                r#"{{"type":"result","subtype":"success","is_error":true,{status_field}"stop_reason":"stop_sequence","result":"Failed.","modelUsage":{CUMULATIVE}{usage_field},"terminal_reason":"api_error"}}"#
+            );
+            let result = rig(vec![Script::lines(vec![
+                init_line(MODEL, SESSION),
+                retry.to_string(),
+                synthetic.to_string(),
+                result_line,
+            ])])
+            .run(request(vec![user("hi")]));
+            let (_, _, usage) = failure_of(&result);
+            let case = format!("{status:?} {shape}");
+            if matches!(status, Some(401 | 403 | 429)) && shape == "empty" {
+                assert_eq!(usage, Some(usage_zero()), "{case}");
+                assert_eq!(parts(&result).1.cost_micro_usd, 0, "{case}");
+            } else {
+                assert_eq!(usage, None, "{case}");
+                assert_eq!(parts(&result).1.cost_micro_usd, reservation, "{case}");
+            }
+        }
     }
 }
 
@@ -1456,6 +1607,49 @@ fn the_prompt_file_is_removed_when_the_call_fails() {
         let (path, _) = rig.seen().prompt_file.expect("a prompt file");
         assert!(!path.exists());
     }
+}
+
+#[test]
+fn prompt_file_lives_in_prompt_dir_exclusively() {
+    let rig = rig(vec![ok_script(SESSION, "x")]);
+    rig.run(request(vec![user("hi")]));
+    let (path, _) = rig.seen().prompt_file.expect("a prompt file");
+    assert_eq!(
+        path.parent(),
+        Some(rig.dir.path().join("prompts").as_path())
+    );
+
+    // A prompt directory that cannot take the file fails staging: the failure
+    // is the unbilled constructor's, and no child runs.
+    let rig = rig_for(INSTANCE, vec![ok_script(SESSION, "x")], &[SESSION], b"");
+    std::fs::remove_dir_all(rig.dir.path().join("prompts")).unwrap();
+    let (kind, _, usage) = failure_of(&rig.run(request(vec![user("hi")])));
+    assert_eq!((kind, usage), (FailureKind::Provider, None));
+    assert_eq!(rig.spawns(), 0);
+}
+
+#[test]
+fn pin_is_checked_before_every_spawn() {
+    let rig = rig(vec![ok_script(SESSION, "x"), ok_script(SESSION, "y")]);
+    let binary = rig.dir.path().join("claude");
+    assert!(rig.backend.binary_matches_pin());
+    rig.run(request(vec![user("hi")]));
+    assert_eq!(rig.spawns(), 1);
+
+    // The binary is swapped after readiness: the next call never spawns.
+    std::fs::write(&binary, b"swapped bytes").unwrap();
+    let (kind, message, usage) = failure_of(&rig.run(request(vec![user("hi")])));
+    assert_eq!((kind, usage), (FailureKind::Provider, None));
+    assert!(!message.contains(rig.dir.path().to_str().unwrap()));
+    assert_eq!(rig.spawns(), 1, "no child for a binary off its pin");
+    assert!(!rig.backend.binary_matches_pin());
+    let staged = std::fs::read_dir(rig.dir.path().join("prompts")).unwrap();
+    assert_eq!(staged.count(), 0, "no prompt was staged for it");
+
+    // Restoring the pinned bytes is enough: nothing remembers the verdict.
+    std::fs::write(&binary, PINNED).unwrap();
+    rig.run(request(vec![user("hi")]));
+    assert_eq!(rig.spawns(), 2);
 }
 
 #[test]
@@ -1540,12 +1734,21 @@ mod real {
         let binary = dir.path().join("claude");
         std::fs::write(&binary, format!("#!/bin/sh\n{body}\n")).unwrap();
         std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let mut config = config(INSTANCE, limits);
+        let prompts = dir.path().join("prompts");
+        std::fs::create_dir_all(&prompts).unwrap();
+        let mut config = config(dir.path(), INSTANCE, limits);
+        config.claude_binary_sha256 = pin_of(&std::fs::read(&binary).unwrap());
         config.claude_binary = binary;
         config.work_dir = work;
         config.config_dir = cfg;
         let sink = Sink::default();
-        let backend = with_canary_token(ClaudeCodeBackend::new(config, Box::new(sink.clone())));
+        let backend = ClaudeCodeBackend::with_ports(
+            config.clone(),
+            Box::new(crate::process::StdProcessPort::new(config.limits)),
+            Box::new(FsSessionStore::new(config.config_dir.clone())),
+            Box::new(sink.clone()),
+            canary_token(),
+        );
         Fake {
             _guard: guard,
             dir,
@@ -1655,7 +1858,7 @@ mod real {
             leader.display()
         );
         let fake = fake(&body, limits());
-        let config = config(INSTANCE, limits());
+        let config = config(fake.dir.path(), INSTANCE, limits());
         let env = child_env(
             &config,
             &request(vec![user("x")]),
@@ -1801,6 +2004,11 @@ mod real {
             "600"
         );
         let path = std::fs::read_to_string(probe.path().join("path")).unwrap();
+        assert_eq!(
+            Path::new(path.trim()).parent(),
+            Some(fake.dir.path().join("prompts").as_path()),
+            "staged in the configured prompt directory"
+        );
         assert!(!Path::new(path.trim()).exists(), "removed after the call");
     }
 
@@ -1833,6 +2041,25 @@ mod real {
         );
         let fake = fake(&body, limits());
         fake.run(request(vec![user("hi")]));
+        let sunk = String::from_utf8(fake.sink.0.lock().unwrap().clone()).unwrap();
+        assert!(sunk.trim_end().ends_with("END-OF-STDERR"), "{}", sunk.len());
+    }
+
+    #[test]
+    fn stderr_join_survives_a_megabyte_after_result() {
+        // Soul s2's probe: the result line first, then a megabyte of stderr
+        // before the child exits. The call must wait for the stderr reader to
+        // finish, or the tail handed to the sink is cut short.
+        let body = format!(
+            "{}\nhead -c 1000000 /dev/zero | tr '\\0' x >&2\necho END-OF-STDERR >&2",
+            printf_lines(&good_lines())
+        );
+        let fake = fake(&body, limits());
+        let result = fake.run(request(vec![user("hi")]));
+        assert!(matches!(
+            outcome(&result),
+            TransportOutcome::Completed { .. }
+        ));
         let sunk = String::from_utf8(fake.sink.0.lock().unwrap().clone()).unwrap();
         assert!(sunk.trim_end().ends_with("END-OF-STDERR"), "{}", sunk.len());
     }

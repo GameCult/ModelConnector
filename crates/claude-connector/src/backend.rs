@@ -1,5 +1,6 @@
 use std::fs::File;
 use std::io;
+use std::path::PathBuf;
 use std::time::Instant;
 
 use model_connector::{
@@ -11,12 +12,54 @@ use zeroize::Zeroizing;
 
 use crate::config::{ClaudeCodeConfig, PROVIDER};
 use crate::handle::{ClaudeCodeHandle, SessionStore, plan, prefix_digest, stdin_bytes};
-use crate::launch::{PromptFile, TOKEN_VAR, argv, child_env};
+use crate::launch::{PromptFile, argv, child_env};
 use crate::process::{ProcessPort, RunningChild, StdoutRead};
 use crate::stream::{Failure, Finished, Step, StreamState};
 
-/// How the backend reads its own environment.
-type EnvLookup = Box<dyn Fn(&str) -> Option<String> + Send + Sync>;
+/// Where the child's credential comes from, read afresh at every use. The
+/// connector's own environment is never a source (ruling
+/// claude-connector-token-credential).
+pub trait TokenSource: Send + Sync {
+    /// The token, or `None` when there is none or it is empty.
+    fn read(&self) -> Option<Zeroizing<String>>;
+}
+
+/// A token in a file named by a systemd credential: the file
+/// `$CREDENTIALS_DIRECTORY/<name>`, read on every call so a rotated credential
+/// is picked up by the next spawn.
+pub struct CredentialTokenSource {
+    directory: Option<PathBuf>,
+    name: String,
+}
+
+impl CredentialTokenSource {
+    /// The credential `name` under the directory systemd names in
+    /// `CREDENTIALS_DIRECTORY`; with no such variable the source has no token.
+    /// The variable names a directory, never a token.
+    pub fn from_environment(name: impl Into<String>) -> Self {
+        Self {
+            directory: std::env::var_os("CREDENTIALS_DIRECTORY").map(PathBuf::from),
+            name: name.into(),
+        }
+    }
+
+    pub fn in_directory(directory: impl Into<PathBuf>, name: impl Into<String>) -> Self {
+        Self {
+            directory: Some(directory.into()),
+            name: name.into(),
+        }
+    }
+}
+
+impl TokenSource for CredentialTokenSource {
+    fn read(&self) -> Option<Zeroizing<String>> {
+        let directory = self.directory.as_ref()?;
+        let mut token = Zeroizing::new(std::fs::read_to_string(directory.join(&self.name)).ok()?);
+        let trimmed = token.trim_end_matches(['\r', '\n']).len();
+        token.truncate(trimmed);
+        (!token.is_empty()).then_some(token)
+    }
+}
 
 /// Where the tail of a child's stderr goes. The backend never puts it in a
 /// result; the connector binary wires this to its log.
@@ -31,7 +74,7 @@ pub struct ClaudeCodeBackend {
     port: Box<dyn ProcessPort>,
     sessions: Box<dyn SessionStore>,
     sink: Box<dyn StderrSink>,
-    env_lookup: EnvLookup,
+    tokens: Box<dyn TokenSource>,
 }
 
 impl ClaudeCodeBackend {
@@ -42,7 +85,10 @@ impl ClaudeCodeBackend {
         let sessions = Box::new(crate::handle::FsSessionStore::new(
             config.config_dir.clone(),
         ));
-        Self::with_ports(config, port, sessions, sink)
+        let tokens = Box::new(CredentialTokenSource::from_environment(
+            config.token_credential.clone(),
+        ));
+        Self::with_ports(config, port, sessions, sink, tokens)
     }
 
     pub fn with_ports(
@@ -50,22 +96,19 @@ impl ClaudeCodeBackend {
         port: Box<dyn ProcessPort>,
         sessions: Box<dyn SessionStore>,
         sink: Box<dyn StderrSink>,
+        tokens: Box<dyn TokenSource>,
     ) -> Self {
         Self {
             config,
             port,
             sessions,
             sink,
-            env_lookup: Box::new(|name| std::env::var(name).ok()),
+            tokens,
         }
     }
 
-    fn token(&self) -> Option<Zeroizing<String>> {
-        (self.env_lookup)(TOKEN_VAR)
-            .filter(|value| !value.is_empty())
-            .map(Zeroizing::new)
-    }
-
+    /// The one pin check: `ready` and every spawn use it, and nothing caches
+    /// its answer.
     fn binary_matches_pin(&self) -> bool {
         let Ok(mut file) = File::open(&self.config.claude_binary) else {
             return false;
@@ -86,14 +129,20 @@ impl ClaudeCodeBackend {
                 );
             }
         };
-        let Some(token) = self.token() else {
+        let Some(token) = self.tokens.read() else {
             return failed(
                 FailureKind::Authentication,
                 "claude-code: the connector has no credential to give the child".to_string(),
                 Some(zero_usage()),
             );
         };
-        let Ok(prompt) = PromptFile::create(&request.instructions) else {
+        if !self.binary_matches_pin() {
+            return failure(Failure::unbilled(
+                FailureKind::Provider,
+                "claude-code: the claude binary does not match its pin",
+            ));
+        }
+        let Ok(prompt) = PromptFile::create(&self.config.prompt_dir, &request.instructions) else {
             return failure(Failure::unbilled(
                 FailureKind::Provider,
                 "claude-code: the system prompt could not be staged",
@@ -178,7 +227,8 @@ impl ProviderBackend for ClaudeCodeBackend {
     fn ready(&self) -> bool {
         self.config.work_dir.is_dir()
             && self.config.config_dir.is_dir()
-            && self.token().is_some()
+            && self.config.prompt_dir.is_dir()
+            && self.tokens.read().is_some()
             && self.binary_matches_pin()
     }
 

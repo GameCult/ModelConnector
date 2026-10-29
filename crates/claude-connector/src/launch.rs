@@ -14,8 +14,8 @@ use zeroize::Zeroizing;
 use crate::config::ClaudeCodeConfig;
 use crate::handle::Plan;
 
-/// The one credential variable, copied by name from the connector's own
-/// environment into the child and nowhere else.
+/// The one credential variable: the child's environment is the only
+/// environment the token ever enters.
 pub(crate) const TOKEN_VAR: &str = "CLAUDE_CODE_OAUTH_TOKEN";
 const CHILD_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
 
@@ -62,13 +62,18 @@ pub(crate) struct PromptFile(PathBuf);
 static PROMPT_FILES: AtomicU64 = AtomicU64::new(0);
 
 impl PromptFile {
-    pub(crate) fn create(instructions: &str) -> io::Result<Self> {
+    pub(crate) fn create(dir: &Path, instructions: &str) -> io::Result<Self> {
         let name = format!(
             "claude-connector-prompt-{}-{}",
             std::process::id(),
             PROMPT_FILES.fetch_add(1, Ordering::Relaxed)
         );
-        let path = std::env::temp_dir().join(name);
+        Self::create_at(dir.join(name), instructions)
+    }
+
+    /// Creates `path` and nothing that already exists there: a file, a link
+    /// (dangling or not) or a directory at the name fails, and is left alone.
+    fn create_at(path: PathBuf, instructions: &str) -> io::Result<Self> {
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
@@ -145,4 +150,58 @@ pub(crate) fn argv(
         ]);
     }
     argv
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    use super::*;
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "claude-connector-launch-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_prompt_is_created_private_and_removed_on_drop() {
+        let dir = scratch("private");
+        let prompt = PromptFile::create(&dir, "the prompt").unwrap();
+        let path = prompt.path().to_path_buf();
+        assert_eq!(path.parent(), Some(dir.as_path()));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "the prompt");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        drop(prompt);
+        assert!(!path.exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_name_already_taken_is_never_written_or_removed() {
+        let dir = scratch("taken");
+        let victim = dir.join("victim");
+        std::fs::write(&victim, "keep").unwrap();
+
+        let file = dir.join("file");
+        std::fs::write(&file, "mine").unwrap();
+        let link = dir.join("link");
+        symlink(&victim, &link).unwrap();
+        let dangling = dir.join("dangling");
+        symlink(dir.join("nowhere"), &dangling).unwrap();
+
+        for taken in [&file, &link, &dangling] {
+            assert!(PromptFile::create_at(taken.clone(), "the prompt").is_err());
+        }
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "mine");
+        assert!(!dir.join("nowhere").exists());
+        assert!(link.exists() && dangling.symlink_metadata().is_ok());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }

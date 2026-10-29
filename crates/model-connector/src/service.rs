@@ -119,7 +119,7 @@ impl CallerAdmission {
 }
 
 /// What one million tokens of each class cost, in micro-USD.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Rates {
     pub input: u64,
     pub cache_write_short: u64,
@@ -129,7 +129,7 @@ pub struct Rates {
 }
 
 /// The rates a prompt strictly above `above_prompt_tokens` is priced at.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LongContext {
     pub above_prompt_tokens: u64,
     pub rates: Rates,
@@ -138,7 +138,7 @@ pub struct LongContext {
 /// One model's price. Explicit zero rates are admitted (a local model is
 /// free); a missing price is not. `overhead_tokens` is added to the byte
 /// bound of a request when its worst case is reserved.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelPrice {
     pub rates: Rates,
     pub long_context: Option<LongContext>,

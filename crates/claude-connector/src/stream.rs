@@ -181,7 +181,7 @@ impl<'a> StreamState<'a> {
         let door_refusal = !success
             && matches!(
                 line.api_error_status.as_ref().and_then(Value::as_u64),
-                Some(401 | 403)
+                Some(401 | 403 | 429)
             );
         let usage = read_usage(line.model_usage_since_last_result, door_refusal);
         if !success {
@@ -258,7 +258,7 @@ fn fail(kind: FailureKind, message: &'static str) -> Step {
 /// What this turn consumed, summed over every model it used (harness side
 /// calls included), or `None` when the result does not say: the field absent,
 /// of another shape, or empty. An empty report is believed only for a refusal
-/// at the door (401 or 403), which the provider cannot have billed; elsewhere
+/// at the door (401, 403 or 429), which the provider cannot have billed; elsewhere
 /// the CLI also zeroes usage on crashes after real work. `None` is billed the
 /// reservation by the kit.
 fn read_usage(reported: Option<Value>, door_refusal: bool) -> Option<Usage> {

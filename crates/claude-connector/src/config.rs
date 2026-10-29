@@ -19,6 +19,12 @@ pub struct ClaudeCodeConfig {
     /// Passed to the child as `CLAUDE_CONFIG_DIR` and `HOME`; it holds the
     /// CLI's session store.
     pub config_dir: PathBuf,
+    /// A directory the connector owns (mode 0700), where each call's system
+    /// prompt is staged for the child.
+    pub prompt_dir: PathBuf,
+    /// The name of the systemd credential that holds the child's token, under
+    /// `$CREDENTIALS_DIRECTORY`.
+    pub token_credential: String,
     /// The connector instance id written into every handle.
     pub instance: String,
     pub limits: ClaudeCodeLimits,

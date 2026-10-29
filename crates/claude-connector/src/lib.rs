@@ -10,7 +10,7 @@ mod launch;
 mod process;
 mod stream;
 
-pub use backend::{ClaudeCodeBackend, StderrSink};
+pub use backend::{ClaudeCodeBackend, CredentialTokenSource, StderrSink, TokenSource};
 pub use config::{ClaudeCodeConfig, ClaudeCodeLimits};
 pub use handle::{FsSessionStore, SessionStore};
 pub use launch::ChildEnv;
