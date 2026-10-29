@@ -6,23 +6,40 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use cultcache_rs::{CultCache, DatabaseEntry, SingleFileMessagePackBackingStore};
 use model_connector::{
-    CallerAdmission, CallerConfig, MIN_PAYLOAD_BYTES, ModelPrice, ServeError, ServeLimits,
-    ServiceError, load_admissions, serve,
+    CallerAdmission, CallerConfig, MIN_PAYLOAD_BYTES, ModelPrice, ProviderBackend, ServeError,
+    ServeLimits, ServiceError, TransportService, load_admissions, serve_service,
 };
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::backend::readiness;
+#[cfg(target_os = "linux")]
+use crate::lease::{LeaseCaller, LeaseLimits, serve_leases, user_uid};
+#[cfg(target_os = "linux")]
+use crate::unit::SystemdUnits;
 use crate::{
     ClaudeCodeBackend, ClaudeCodeConfig, ClaudeCodeLimits, CredentialTokenSource, StderrSink,
 };
 
 const CONFIG_KEY: &str = "runtime";
 const MODEL_PREFIX: &str = "claude-";
+
+/// A unix account that may lease the subscription token for a Self run, the
+/// Self unit (`mind-self@<unit_instance>.service`) its process must run in,
+/// the caller whose spend window its leases reserve in, and what each lease
+/// reserves there.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeaseCallerConfig {
+    pub unix_user: String,
+    pub caller_id: String,
+    pub unit_instance: String,
+    pub reservation_micro_usd: u64,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, DatabaseEntry)]
 #[cultcache(type = "gamecult.model_connector.claude_connector_config.v1")]
@@ -72,6 +89,17 @@ pub struct ClaudeConnectorConfig {
     /// ids exactly as the CLI reports them in its init event.
     #[cultcache(key = 18)]
     pub prices: BTreeMap<String, ModelPrice>,
+    /// Where the Self-run lease socket is bound (a systemd RuntimeDirectory),
+    /// or none when this connector lends no token.
+    #[cultcache(key = 19)]
+    pub lease_socket: Option<PathBuf>,
+    /// The accounts allowed to lease, each bound to a configured caller.
+    /// Empty exactly when `lease_socket` is none.
+    #[cultcache(key = 20)]
+    pub lease_callers: Vec<LeaseCallerConfig>,
+    /// The furthest a lease's expiry may lie from now.
+    #[cultcache(key = 21)]
+    pub lease_max_ms: u64,
 }
 
 /// A refusal. It names the field or stage that failed and nothing the
@@ -205,7 +233,37 @@ impl ClaudeConnectorConfig {
         {
             return Err(ConfigError::Invalid("prices"));
         }
+        self.validate_leases(&caller.caller_runtime_id, caller.spend_ceiling_micro_usd)?;
         Ok(listen)
+    }
+
+    fn validate_leases(&self, caller_id: &str, spend_ceiling: u64) -> Result<(), ConfigError> {
+        let Some(socket) = &self.lease_socket else {
+            return if self.lease_callers.is_empty() {
+                Ok(())
+            } else {
+                Err(ConfigError::Invalid("lease_callers"))
+            };
+        };
+        if !socket.is_absolute() {
+            return Err(ConfigError::Invalid("lease_socket"));
+        }
+        if self.lease_max_ms == 0 {
+            return Err(ConfigError::Invalid("lease_max_ms"));
+        }
+        let mut users = BTreeSet::new();
+        if self.lease_callers.is_empty()
+            || !self.lease_callers.iter().all(|lease| {
+                is_trimmed_nonempty(&lease.unix_user)
+                    && lease.caller_id == caller_id
+                    && is_unit_instance(&lease.unit_instance)
+                    && (1..=spend_ceiling).contains(&lease.reservation_micro_usd)
+                    && users.insert(lease.unix_user.as_str())
+            })
+        {
+            return Err(ConfigError::Invalid("lease_callers"));
+        }
+        Ok(())
     }
 
     fn backend_config(&self) -> ClaudeCodeConfig {
@@ -234,6 +292,14 @@ impl ClaudeConnectorConfig {
             max_expiry_skew_ms: self.max_expiry_skew_ms,
         }
     }
+}
+
+/// The `<instance>` of a unit name, as plain as a systemd instance can be.
+fn is_unit_instance(text: &str) -> bool {
+    !text.is_empty()
+        && text
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
 }
 
 fn is_trimmed_nonempty(text: &str) -> bool {
@@ -394,7 +460,83 @@ fn readiness_of(config: &ClaudeConnectorConfig) -> Result<Vec<CallerAdmission>, 
         &CredentialTokenSource::from_environment(backend.token_credential.clone()),
     )
     .map_err(ConfigError::Unusable)?;
+    if config.lease_socket.is_some() {
+        lease_callers_of(config)?;
+    }
     Ok(admissions)
+}
+
+/// The accounts allowed to lease, resolved to the uids the kernel will report
+/// for their connections. An account the system does not have is not ready.
+#[cfg(target_os = "linux")]
+fn lease_callers_of(config: &ClaudeConnectorConfig) -> Result<Vec<LeaseCaller>, ConfigError> {
+    config
+        .lease_callers
+        .iter()
+        .map(|lease| {
+            user_uid(&lease.unix_user)
+                .map(|uid| LeaseCaller {
+                    uid,
+                    caller_id: lease.caller_id.clone(),
+                    unit_instance: lease.unit_instance.clone(),
+                    reservation_micro_usd: lease.reservation_micro_usd,
+                })
+                .ok_or(ConfigError::Unusable("lease_callers"))
+        })
+        .collect()
+}
+
+/// Peer credentials identify a lease caller only on Linux.
+#[cfg(not(target_os = "linux"))]
+fn lease_callers_of(_: &ClaudeConnectorConfig) -> Result<(), ConfigError> {
+    Err(ConfigError::Unusable("lease_socket"))
+}
+
+/// Binds the lease socket (mode 0660; the unit's RuntimeDirectory and group
+/// decide who can reach it, and the kernel's peer uid decides who may lease)
+/// and serves it beside the RUDP loop. The lease listener is half of the
+/// connector: if it stops, so does the process.
+#[cfg(target_os = "linux")]
+fn start_leases(
+    config: &ClaudeConnectorConfig,
+    socket: &Path,
+    service: Arc<Mutex<TransportService>>,
+) -> Result<(), ConfigError> {
+    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+    use std::os::unix::net::UnixListener;
+
+    let callers = lease_callers_of(config)?;
+    // A socket a previous run left is replaced; anything else at the path is not ours.
+    if std::fs::symlink_metadata(socket).is_ok_and(|found| found.file_type().is_socket()) {
+        let _ = std::fs::remove_file(socket);
+    }
+    let listener = UnixListener::bind(socket).map_err(|_| ConfigError::Listen)?;
+    std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o660))
+        .map_err(|_| ConfigError::Listen)?;
+    let limits = LeaseLimits {
+        socket_timeout: Duration::from_millis(config.socket_timeout_ms),
+        max_lease_ms: config.lease_max_ms,
+        max_connections: config.max_connections,
+    };
+    let tokens = Arc::new(CredentialTokenSource::from_environment(
+        config.token_credential.clone(),
+    ));
+    std::thread::Builder::new()
+        .name("claude-lease-listener".to_string())
+        .spawn(move || {
+            let _ = serve_leases(
+                &listener,
+                callers,
+                limits,
+                service,
+                tokens,
+                Arc::new(SystemdUnits::system()),
+            );
+            eprintln!("claude-connector: the lease listener stopped");
+            std::process::exit(1);
+        })
+        .map_err(|_| ConfigError::Serving("lease listener"))?;
+    Ok(())
 }
 
 /// Whether `serve` would start with this document and this environment.
@@ -413,14 +555,21 @@ pub fn serve_config(path: &Path) -> Result<(), ConfigError> {
         Box::new(LogSink(std::sync::Mutex::new(std::io::stderr()))),
     ));
     let listener = TcpListener::bind(listen).map_err(|_| ConfigError::Listen)?;
-    serve(
-        listener,
-        config.serve_limits(),
-        admissions,
-        config.prices.clone(),
-        &config.replay_store,
-        backend,
-    )?;
+    let service = Arc::new(Mutex::new(
+        TransportService::open(
+            &config.replay_store,
+            backend.provider(),
+            config.prices.clone(),
+            admissions,
+            config.max_expiry_skew_ms,
+        )
+        .map_err(|error| ConfigError::from(ServeError::Service(error)))?,
+    ));
+    #[cfg(target_os = "linux")]
+    if let Some(socket) = &config.lease_socket {
+        start_leases(&config, socket, service.clone())?;
+    }
+    serve_service(listener, config.serve_limits(), service, backend)?;
     Ok(())
 }
 

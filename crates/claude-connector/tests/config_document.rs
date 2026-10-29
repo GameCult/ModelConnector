@@ -8,7 +8,9 @@ use std::process::{Command, Output};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use claude_connector::{ClaudeConnectorConfig, ConfigError, load_config, write_config};
+use claude_connector::{
+    ClaudeConnectorConfig, ConfigError, LeaseCallerConfig, load_config, write_config,
+};
 use cultcache_rs::{
     CacheBackingStore, CultCache, CultCacheEnvelope, DatabaseEntry,
     SingleFileMessagePackBackingStore,
@@ -92,6 +94,14 @@ fn valid() -> ClaudeConnectorConfig {
             spend_window_ms: 3_600_000,
         }],
         prices: BTreeMap::from([(HAIKU.to_string(), price()), (OPUS.to_string(), price())]),
+        lease_socket: Some("/run/claude-connector/lease.sock".into()),
+        lease_callers: vec![LeaseCallerConfig {
+            unix_user: "mind-eureka-self".to_string(),
+            caller_id: "persona-a-caller".to_string(),
+            unit_instance: "eureka".to_string(),
+            reservation_micro_usd: 5_000_000,
+        }],
+        lease_max_ms: 3_600_000,
     }
 }
 
@@ -988,4 +998,211 @@ fn a_private_regular_file_is_not_a_prompt_dir() {
     std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o700)).unwrap();
     assert!(claude_connector::check_prompt_dir(&file).is_err());
     assert!(claude_connector::check_prompt_dir(&scratch.path("absent")).is_err());
+}
+
+#[test]
+fn leases_are_configured_together_or_not_at_all() {
+    let cases: Vec<(&str, Change)> = vec![
+        (
+            "lease_socket",
+            Box::new(|c| c.lease_socket = Some("lease.sock".into())),
+        ),
+        ("lease_callers", Box::new(|c| c.lease_callers.clear())),
+        ("lease_callers", Box::new(|c| c.lease_socket = None)),
+        (
+            "lease_callers",
+            Box::new(|c| c.lease_callers[0].caller_id = "another-caller".to_string()),
+        ),
+        (
+            "lease_callers",
+            Box::new(|c| c.lease_callers[0].unix_user = " ".to_string()),
+        ),
+        (
+            "lease_callers",
+            Box::new(|c| {
+                let again = c.lease_callers[0].clone();
+                c.lease_callers.push(again);
+            }),
+        ),
+        ("lease_max_ms", Box::new(|c| c.lease_max_ms = 0)),
+        (
+            "lease_callers",
+            Box::new(|c| c.lease_callers[0].reservation_micro_usd = 0),
+        ),
+        (
+            "lease_callers",
+            Box::new(|c| c.lease_callers[0].reservation_micro_usd = 50_000_001),
+        ),
+        (
+            "lease_callers",
+            Box::new(|c| c.lease_callers[0].unit_instance = String::new()),
+        ),
+        (
+            "lease_callers",
+            Box::new(|c| c.lease_callers[0].unit_instance = "a/b".to_string()),
+        ),
+    ];
+    for (field, change) in cases {
+        let mut config = valid();
+        change(&mut config);
+        assert_eq!(refused(&config), field);
+    }
+    // The whole ceiling is a reservation the caller can hold.
+    let mut whole = valid();
+    whole.lease_callers[0].reservation_micro_usd = 50_000_000;
+    whole.validate().unwrap();
+    let mut none = valid();
+    none.lease_socket = None;
+    none.lease_callers.clear();
+    none.validate().unwrap();
+}
+
+#[test]
+fn config_init_binds_each_lease_user_to_the_configured_caller() {
+    let scratch = Scratch::new();
+    let made = init(
+        &scratch,
+        &init_flags(
+            &scratch,
+            &[
+                "--lease-socket",
+                "/run/claude-connector/lease.sock",
+                "--lease-user",
+                "mind-eureka-self",
+                "--lease-max-ms",
+                "120000",
+                "--lease-unit-instance",
+                "eureka",
+                "--lease-reservation-micro-usd",
+                "5000000",
+            ],
+        ),
+    );
+    assert!(made.status.success(), "{}", shown(&made));
+    let config = load_config(&scratch.path("connector.cc")).unwrap();
+    assert_eq!(
+        config.lease_callers,
+        [LeaseCallerConfig {
+            unix_user: "mind-eureka-self".to_string(),
+            caller_id: "persona-a-caller".to_string(),
+            unit_instance: "eureka".to_string(),
+            reservation_micro_usd: 5_000_000,
+        }]
+    );
+    assert_eq!(config.lease_max_ms, 120_000);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn config_check_refuses_a_lease_account_the_system_does_not_have() {
+    let scratch = Scratch::new();
+    let (mut flags, credentials) = prepare(&scratch);
+    let socket = scratch.path("lease.sock");
+    flags.extend(
+        [
+            "--lease-socket",
+            socket.to_str().unwrap(),
+            "--lease-user",
+            "no-such-account-4f1c",
+            "--lease-unit-instance",
+            "eureka",
+            "--lease-reservation-micro-usd",
+            "5000000",
+        ]
+        .map(String::from),
+    );
+    let made = init(&scratch, &flags);
+    assert!(made.status.success(), "{}", shown(&made));
+    let config = scratch.path("connector.cc");
+    let checked = run(
+        &["config", "check", config.to_str().unwrap()],
+        &[("CREDENTIALS_DIRECTORY", &credentials)],
+    );
+    assert!(!checked.status.success());
+    assert!(
+        shown(&checked).contains("lease_callers"),
+        "{}",
+        shown(&checked)
+    );
+    assert!(!shown(&checked).contains("no-such-account"));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn serve_binds_the_lease_socket_and_answers_a_stranger_with_a_refusal() {
+    use std::io::{Read, Write};
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::UnixStream;
+    use std::process::Stdio;
+    use std::time::Instant;
+
+    use claude_connector::{
+        LeaseMessage, LeaseRefusalKind, LeaseRefused, LeaseRequest, decode_frame, encode_frame,
+    };
+
+    let scratch = Scratch::new();
+    let (mut flags, credentials) = prepare(&scratch);
+    let socket = scratch.path("lease.sock");
+    // The test runs as someone other than `nobody`, so it is a stranger.
+    flags.extend(
+        [
+            "--lease-socket",
+            socket.to_str().unwrap(),
+            "--lease-user",
+            "nobody",
+            "--lease-unit-instance",
+            "eureka",
+            "--lease-reservation-micro-usd",
+            "5000000",
+        ]
+        .map(String::from),
+    );
+    let made = init(&scratch, &flags);
+    assert!(made.status.success(), "{}", shown(&made));
+    let config = scratch.path("connector.cc");
+    let mut server = Command::new(env!("CARGO_BIN_EXE_claude-connector"))
+        .args(["serve", "--config", config.to_str().unwrap()])
+        .env_clear()
+        .env("CREDENTIALS_DIRECTORY", &credentials)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let started = Instant::now();
+    while !socket.exists() && started.elapsed() < Duration::from_secs(10) {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let outcome = std::panic::catch_unwind(|| {
+        assert_eq!(
+            std::fs::metadata(&socket).unwrap().permissions().mode() & 0o777,
+            0o660
+        );
+        let mut stream = UnixStream::connect(&socket).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        stream
+            .write_all(&encode_frame(&LeaseMessage::ClaudeLeaseRequest(
+                LeaseRequest {
+                    expires_at_unix_ms: u64::MAX / 2,
+                },
+            )))
+            .unwrap();
+        let mut reply = vec![0_u8; 4096];
+        let read = stream.read(&mut reply).unwrap();
+        assert!(matches!(
+            decode_frame(&reply[..read]),
+            Some(LeaseMessage::ClaudeLeaseRefusal(LeaseRefused {
+                kind: LeaseRefusalKind::UnknownCaller,
+                ..
+            }))
+        ));
+    });
+    // The server is still serving: it did not return when it started.
+    let running = server.try_wait().unwrap().is_none();
+    server.kill().unwrap();
+    server.wait().unwrap();
+    outcome.unwrap();
+    assert!(running);
 }

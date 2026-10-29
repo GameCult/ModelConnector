@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use claude_connector::{
-    ClaudeConnectorConfig, ConfigError, check_ready, load_config, write_config,
+    ClaudeConnectorConfig, ConfigError, LeaseCallerConfig, check_ready, load_config, write_config,
 };
 use model_connector::{CallerConfig, ModelPrice, Rates, frame_bytes_for_payload};
 
@@ -76,9 +76,10 @@ struct Flags {
     single: BTreeMap<&'static str, String>,
     models: Vec<String>,
     prices: Vec<String>,
+    lease_users: Vec<String>,
 }
 
-const SINGLE: [&str; 22] = [
+const SINGLE: [&str; 26] = [
     "--listen",
     "--replay-store",
     "--claude-binary",
@@ -101,6 +102,10 @@ const SINGLE: [&str; 22] = [
     "--max-payload-bytes",
     "--max-output-tokens",
     "--socket-timeout-ms",
+    "--lease-socket",
+    "--lease-max-ms",
+    "--lease-unit-instance",
+    "--lease-reservation-micro-usd",
 ];
 
 impl Flags {
@@ -109,6 +114,7 @@ impl Flags {
             single: BTreeMap::new(),
             models: Vec::new(),
             prices: Vec::new(),
+            lease_users: Vec::new(),
         };
         let mut args = args.iter();
         while let Some(&name) = args.next() {
@@ -118,6 +124,7 @@ impl Flags {
             match name {
                 "--allowed-model" => flags.models.push(value.to_string()),
                 "--price" => flags.prices.push(value.to_string()),
+                "--lease-user" => flags.lease_users.push(value.to_string()),
                 _ => {
                     let Some(known) = SINGLE.iter().find(|known| **known == name) else {
                         return Err(Failure::Flags);
@@ -206,6 +213,19 @@ fn init(path: &str, args: &[&str]) -> Result<(), Failure> {
             return Err(Failure::Malformed("--price"));
         }
     }
+    let caller_id = flags.text("--caller-id")?;
+    let lease_callers = flags
+        .lease_users
+        .iter()
+        .map(|unix_user| {
+            Ok(LeaseCallerConfig {
+                unix_user: unix_user.clone(),
+                caller_id: caller_id.clone(),
+                unit_instance: flags.text("--lease-unit-instance")?,
+                reservation_micro_usd: flags.number("--lease-reservation-micro-usd")?,
+            })
+        })
+        .collect::<Result<Vec<_>, Failure>>()?;
     let config = ClaudeConnectorConfig {
         listen: flags.text("--listen")?,
         replay_store: flags.path("--replay-store")?,
@@ -226,7 +246,7 @@ fn init(path: &str, args: &[&str]) -> Result<(), Failure> {
         socket_timeout_ms: flags.number_or("--socket-timeout-ms", 10_000)?,
         max_expiry_skew_ms: 300_000,
         callers: vec![CallerConfig {
-            caller_runtime_id: flags.text("--caller-id")?,
+            caller_runtime_id: caller_id.clone(),
             connection_key_file: flags.path("--connection-key-file")?,
             connection_key_epoch: flags.number("--connection-key-epoch")?,
             allowed_models: flags.models.clone(),
@@ -237,6 +257,9 @@ fn init(path: &str, args: &[&str]) -> Result<(), Failure> {
             spend_window_ms: flags.number("--spend-window-ms")?,
         }],
         prices,
+        lease_socket: flags.single.get("--lease-socket").map(PathBuf::from),
+        lease_callers,
+        lease_max_ms: flags.number_or("--lease-max-ms", 3_600_000)?,
     };
     write_config(path.as_ref(), &config)?;
     Ok(())

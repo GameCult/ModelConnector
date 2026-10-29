@@ -171,15 +171,7 @@ pub fn serve(
     backend: Arc<dyn ProviderBackend>,
 ) -> Result<(), ServeError> {
     limits.validate(&admissions)?;
-    if !listener
-        .local_addr()
-        .map_err(ServeError::Listen)?
-        .ip()
-        .is_loopback()
-    {
-        return Err(ServeError::InvalidConfig("listener address"));
-    }
-    backend.ready().map_err(ServeError::BackendUnready)?;
+    admit_listener(&listener, backend.as_ref())?;
     let service = Arc::new(Mutex::new(TransportService::open(
         replay_store,
         backend.provider(),
@@ -188,6 +180,34 @@ pub fn serve(
         limits.max_expiry_skew_ms,
     )?));
     accept_loop(|| listener.accept(), limits, service, backend)
+}
+
+/// `serve` over a service the caller opened and keeps a handle to, so another
+/// front of the same ledger (the Self-run credential lease) reserves in the
+/// same windows. The limits must already have been validated against the
+/// service's admissions.
+pub fn serve_service(
+    listener: TcpListener,
+    limits: ServeLimits,
+    service: Arc<Mutex<TransportService>>,
+    backend: Arc<dyn ProviderBackend>,
+) -> Result<(), ServeError> {
+    admit_listener(&listener, backend.as_ref())?;
+    accept_loop(|| listener.accept(), limits, service, backend)
+}
+
+/// What must be true before a serve loop touches the ledger: the listener is
+/// on loopback and the backend can take work.
+fn admit_listener(listener: &TcpListener, backend: &dyn ProviderBackend) -> Result<(), ServeError> {
+    if !listener
+        .local_addr()
+        .map_err(ServeError::Listen)?
+        .ip()
+        .is_loopback()
+    {
+        return Err(ServeError::InvalidConfig("listener address"));
+    }
+    backend.ready().map_err(ServeError::BackendUnready)
 }
 
 /// The accept loop over any source of connections, so a test can present a

@@ -317,6 +317,9 @@ fn prune_to_latest(
 struct LiveRequest {
     window: u64,
     reserved_micro_usd: u64,
+    /// A Self run's credential lease, not a provider call: it holds its
+    /// reservation in the window like a call does but takes no request slot.
+    lease: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -335,6 +338,12 @@ enum ReplayState {
     /// backend contract breach, kept so a replayed stand-in still says so.
     Completed {
         response: TransportEnvelope,
+        charged_micro_usd: u64,
+        overrun_micro_usd: u64,
+    },
+    /// A credential lease that settled: it has no answer to replay, only the
+    /// charge it left in its window and how far that passed the reservation.
+    LeaseSettled {
         charged_micro_usd: u64,
         overrun_micro_usd: u64,
     },
@@ -586,6 +595,9 @@ impl TransportService {
                 ReplayState::Active { reserved_micro_usd } => *reserved_micro_usd,
                 ReplayState::Completed {
                     charged_micro_usd, ..
+                }
+                | ReplayState::LeaseSettled {
+                    charged_micro_usd, ..
                 } => *charged_micro_usd,
             };
             add_spend(
@@ -787,6 +799,9 @@ impl TransportService {
                         .map_err(replay_store_error)?;
                     Ok(TransportAdmission::Reply(stand_in))
                 }
+                ReplayState::LeaseSettled { .. } => {
+                    self.reply_refusal(&invocation, Refusal::ReplayConflict, &security)
+                }
                 ReplayState::Active { .. } => {
                     let refusal = if self.live.contains_key(&identity) {
                         Refusal::InFlight
@@ -810,8 +825,10 @@ impl TransportService {
         };
         let active_for_caller = self
             .live
-            .keys()
-            .filter(|key| key.caller_runtime_id == invocation.caller_runtime_id)
+            .iter()
+            .filter(|(key, request)| {
+                !request.lease && key.caller_runtime_id == invocation.caller_runtime_id
+            })
             .count();
         if active_for_caller >= max_concurrent_requests {
             return self.reply_refusal(&invocation, Refusal::Capacity, &security);
@@ -873,6 +890,7 @@ impl TransportService {
             LiveRequest {
                 window,
                 reserved_micro_usd,
+                lease: false,
             },
         );
         Ok(TransportAdmission::Execute(Box::new(ExecutionClaim {
@@ -1233,6 +1251,9 @@ fn hex(digest: [u8; 32]) -> String {
 fn replay_store_error(error: impl std::fmt::Display) -> ServiceError {
     ServiceError::ReplayStore(error.to_string())
 }
+
+mod lease;
+pub use lease::{LeaseAdmission, LeaseGrant, LeaseRefusal, LeaseSettlement, LeaseUse, ModelUsage};
 
 fn contract_refusal(error: &ContractError) -> Refusal {
     match error {
@@ -2525,7 +2546,9 @@ mod tests {
             ReplayState::Completed {
                 charged_micro_usd, ..
             } => charged_micro_usd,
-            ReplayState::Active { .. } => panic!("{request_id} is not completed"),
+            ReplayState::Active { .. } | ReplayState::LeaseSettled { .. } => {
+                panic!("{request_id} is not completed")
+            }
         }
     }
 
