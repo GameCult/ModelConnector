@@ -152,7 +152,7 @@ pub(crate) fn encode_result_frame(envelope: &TransportEnvelope) -> Result<Vec<u8
     response_frame(Operation::Invoke, envelope)
 }
 
-#[cfg(any(feature = "daemon", test))]
+#[cfg(feature = "daemon")]
 pub(crate) fn encode_spend_readout_response_frame(
     envelope: &TransportEnvelope,
 ) -> Result<Vec<u8>, ServiceError> {
@@ -441,7 +441,7 @@ pub(crate) fn decrypt_spend_readout_request(
     decrypt_message(envelope, security).map(drop)
 }
 
-#[cfg(any(feature = "daemon", test))]
+#[cfg(feature = "daemon")]
 pub(crate) fn encrypt_spend_readout(
     caller_runtime_id: &str,
     request_id: &str,

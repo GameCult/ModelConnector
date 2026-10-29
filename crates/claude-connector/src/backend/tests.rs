@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use model_connector::{
     CallerAdmission, ModelPrice, PriceTable, Rates, ReasoningEffort, SpendCeiling, SpendWindowMs,
-    ToolDefinition, TransportAdmission, TransportDisposition, TransportInvocation, TransportKey,
-    TransportReceipt, TransportService, decrypt_result, encrypt_invocation,
+    StopReason, ToolDefinition, TransportAdmission, TransportDisposition, TransportInvocation,
+    TransportKey, TransportReceipt, TransportService, decrypt_result, encrypt_invocation,
 };
 
 use super::*;
@@ -1893,28 +1893,28 @@ fn a_schema_turn_without_structured_output_is_a_provider_failure_billed_as_repor
 #[test]
 fn only_the_structured_output_tool_is_allowed_and_only_when_a_schema_was_sent() {
     // Without a schema the same call is a tool in a tool-less turn.
-    let rig = rig(vec![structured_script()]);
-    let (kind, message, _) = failure_of(&rig.run(request(vec![user("hello")])));
+    let first = rig(vec![structured_script()]);
+    let (kind, message, _) = failure_of(&first.run(request(vec![user("hello")])));
     assert_eq!(kind, FailureKind::Provider);
     assert!(message.contains("tool"), "{message}");
 
     // With a schema, any other tool is still refused.
-    let rig = rig(vec![Script::lines(vec![
+    let second = rig(vec![Script::lines(vec![
         init_line(MODEL, SESSION),
         structured_call_line("Bash"),
         structured_result_line(),
     ])]);
-    let (kind, message, _) = failure_of(&rig.run(schema_request()));
+    let (kind, message, _) = failure_of(&second.run(schema_request()));
     assert_eq!(kind, FailureKind::Provider);
     assert!(message.contains("tool"), "{message}");
 
     // `tool_use` is a stop reason only for a schema turn.
-    let rig = rig(vec![Script::lines(vec![
+    let third = rig(vec![Script::lines(vec![
         init_line(MODEL, SESSION),
         text_line("msg_1", "hi"),
         result_line("tool_use", USAGE),
     ])]);
-    let (kind, message, _) = failure_of(&rig.run(request(vec![user("hello")])));
+    let (kind, message, _) = failure_of(&third.run(request(vec![user("hello")])));
     assert_eq!(kind, FailureKind::Provider);
     assert!(message.contains("stop reason"), "{message}");
 }
@@ -2243,7 +2243,7 @@ mod real {
         let result = fake.run(request(vec![user("hello")]));
         assert!(matches!(
             outcome(&result),
-            TransportOutcome::Completed {{ .. }}
+            TransportOutcome::Completed { .. }
         ));
         let read = |name: &str| std::fs::read_to_string(probe.path().join(name)).unwrap();
         assert_eq!(read("first"), CANARY_TOKEN, "the pipe holds the token");
