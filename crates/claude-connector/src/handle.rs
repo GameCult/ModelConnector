@@ -89,8 +89,6 @@ impl SessionStore for FsSessionStore {
 pub(crate) enum PlanError {
     #[error("claude-code: tools are not supported by this backend yet")]
     Tools,
-    #[error("claude-code: structured output is not supported by this backend yet")]
-    OutputSchema,
     #[error("claude-code: tool results are not supported by this backend yet")]
     ToolResult,
     #[error("claude-code: the request ends without user text")]
@@ -127,9 +125,6 @@ pub(crate) fn plan(
 ) -> Result<Plan, PlanError> {
     if !request.tools.is_empty() {
         return Err(PlanError::Tools);
-    }
-    if request.output_schema_json.is_some() {
-        return Err(PlanError::OutputSchema);
     }
     let input = &request.input;
     let run_start = input

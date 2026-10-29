@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use claude_connector::{ClaudeConnectorConfig, ConfigError, load_config, write_config};
 use cultcache_rs::{
@@ -277,13 +278,6 @@ fn config_refuses_aliases_unpriced_models_and_second_callers() {
             }),
         ),
         (
-            "no minor",
-            Box::new(|c| {
-                c.callers[0].allowed_models = vec!["claude-opus-5".to_string()];
-                c.prices.insert("claude-opus-5".to_string(), price());
-            }),
-        ),
-        (
             "uppercase family",
             Box::new(|c| {
                 c.callers[0].allowed_models = vec!["claude-Opus-5-1".to_string()];
@@ -343,7 +337,6 @@ fn config_refuses_aliases_unpriced_models_and_second_callers() {
         "allowed_models",
         "allowed_models",
         "allowed_models",
-        "allowed_models",
         "callers",
         "callers",
     ];
@@ -355,12 +348,23 @@ fn config_refuses_aliases_unpriced_models_and_second_callers() {
 }
 
 #[test]
-fn a_dated_canonical_id_is_allowed() {
-    let dated = "claude-opus-5-1-20260101".to_string();
-    let mut config = valid();
-    config.callers[0].allowed_models = vec![dated.clone()];
-    config.prices.insert(dated, price());
-    config.validate().unwrap();
+fn a_priced_id_of_any_loose_form_is_allowed_and_the_price_table_decides() {
+    // Real ids come with a minor, without one, and with a date either way.
+    for id in [
+        "claude-opus-5-1-20260101",
+        "claude-opus-5",
+        "claude-opus-5-20260101",
+        "claude-sonnet-4-5",
+    ] {
+        let mut config = valid();
+        config.callers[0].allowed_models = vec![id.to_string()];
+        config.prices.insert(id.to_string(), price());
+        config.validate().unwrap_or_else(|e| panic!("{id}: {e}"));
+
+        // The same id with no price is not on the known list.
+        config.prices.remove(id);
+        assert_eq!(refused(&config), "allowed_models", "{id}");
+    }
 }
 
 #[test]
@@ -543,13 +547,64 @@ fn no_refusal_echoes_a_value() {
 
 // ---- the binary ----
 
+/// How long any connector verb may take in these tests. `check` and `init`
+/// return at once and `serve` is meant to refuse; a `serve` that starts
+/// instead would run forever, so it fails a named test here, not the suite.
+const VERB_DEADLINE: Duration = Duration::from_secs(20);
+
 fn run(args: &[&str], envs: &[(&str, &Path)]) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_claude-connector"));
     command.args(args).env_clear();
     for (name, value) in envs {
         command.env(name, value);
     }
-    command.output().unwrap()
+    run_within(command, VERB_DEADLINE).unwrap_or_else(|| {
+        panic!(
+            "`{}` was still running after {VERB_DEADLINE:?}: it started",
+            args.join(" ")
+        )
+    })
+}
+
+/// The command's output, or `None` when it outlived `deadline` and was killed.
+fn run_within(mut command: Command, deadline: Duration) -> Option<Output> {
+    use std::process::Stdio;
+    use std::time::Instant;
+
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let started = Instant::now();
+    while child.try_wait().unwrap().is_none() {
+        if started.elapsed() > deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    Some(child.wait_with_output().unwrap())
+}
+
+#[cfg(unix)]
+#[test]
+fn a_process_past_its_deadline_is_killed_and_reported_as_none() {
+    let mut forever = Command::new("sleep");
+    forever.arg("60");
+    let started = std::time::Instant::now();
+    assert!(run_within(forever, Duration::from_millis(200)).is_none());
+    assert!(started.elapsed() < Duration::from_secs(10));
+    let mut quick = Command::new("true");
+    quick.env_clear();
+    assert!(
+        run_within(quick, Duration::from_secs(10))
+            .unwrap()
+            .status
+            .success()
+    );
 }
 
 fn shown(output: &Output) -> String {
@@ -756,8 +811,42 @@ fn check_refuses_exactly_what_serve_refuses_and_names_the_field() {
     assert!(init(&scratch, &flags).status.success());
     let (checked, served) = check_and_serve(&scratch.path("connector.cc"), None);
     assert!(!checked.status.success() && !served.status.success());
-    assert!(shown(&checked).contains("token_credential"));
+    assert!(shown(&checked).contains("credentials_directory"));
+    assert!(!shown(&checked).contains("token_credential"));
     assert_eq!(shown(&checked), shown(&served));
+
+    // A credential directory without the credential is the other fault, and
+    // the token is checked last: a broken pin is named first.
+    let scratch = Scratch::new();
+    let (flags, credentials) = prepare(&scratch);
+    assert!(init(&scratch, &flags).status.success());
+    std::fs::remove_file(credentials.join("claude-token")).unwrap();
+    std::fs::write(scratch.path("claude"), b"other bytes").unwrap();
+    let (checked, _) = check_and_serve(&scratch.path("connector.cc"), Some(&credentials));
+    assert!(
+        shown(&checked).contains("claude_binary_sha256"),
+        "{}",
+        shown(&checked)
+    );
+    std::fs::write(scratch.path("claude"), b"pinned claude").unwrap();
+    let (checked, _) = check_and_serve(&scratch.path("connector.cc"), Some(&credentials));
+    assert!(
+        shown(&checked).contains("token_credential"),
+        "{}",
+        shown(&checked)
+    );
+    assert!(!shown(&checked).contains("credentials_directory"));
+}
+
+#[test]
+fn usage_says_check_runs_in_the_units_environment() {
+    let output = run(&["nonsense"], &[]);
+    assert!(!output.status.success());
+    assert!(
+        shown(&output).contains("unit's environment"),
+        "{}",
+        shown(&output)
+    );
 }
 
 #[cfg(unix)]

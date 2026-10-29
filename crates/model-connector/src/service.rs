@@ -14,8 +14,10 @@ use crate::contract::{
 };
 use crate::envelope::{
     EnvelopeKind, MAX_IDENTITY_BYTES, ServiceError, TransportEnvelope, decrypt_invocation,
-    encode_result_frame, encrypt_result, validate_envelope,
+    decrypt_spend_readout_request, encode_result_frame, encode_spend_readout_response_frame,
+    encrypt_result, encrypt_spend_readout, validate_envelope,
 };
+use crate::readout::{CallerSpend, PlanQuotaSnapshot, SpendReadout};
 
 /// What a caller may spend in one window, in micro-USD. A distinct type from
 /// [`SpendWindowMs`] so the pair cannot be passed swapped:
@@ -280,15 +282,15 @@ fn admission_clock(
 /// it was admitted in, so nothing older is kept.
 fn prune_windows(
     window_spend: &mut HashMap<String, BTreeMap<u64, u64>>,
-    live: &HashMap<RequestIdentity, u64>,
+    live: &HashMap<RequestIdentity, LiveRequest>,
     caller_runtime_id: &str,
     floor: u64,
 ) {
     if let Some(windows) = window_spend.get_mut(caller_runtime_id) {
         windows.retain(|window, _| {
             *window >= floor
-                || live.iter().any(|(identity, live_window)| {
-                    live_window == window && identity.caller_runtime_id == caller_runtime_id
+                || live.iter().any(|(identity, request)| {
+                    request.window == *window && identity.caller_runtime_id == caller_runtime_id
                 })
         });
     }
@@ -298,7 +300,7 @@ fn prune_windows(
 /// places that do not know the clock (open, settle).
 fn prune_to_latest(
     window_spend: &mut HashMap<String, BTreeMap<u64, u64>>,
-    live: &HashMap<RequestIdentity, u64>,
+    live: &HashMap<RequestIdentity, LiveRequest>,
     caller_runtime_id: &str,
 ) {
     let latest = window_spend
@@ -307,6 +309,14 @@ fn prune_to_latest(
     if let Some(latest) = latest {
         prune_windows(window_spend, live, caller_runtime_id, latest);
     }
+}
+
+/// A request between claim and settlement: the window it was admitted in and
+/// the reservation it holds there.
+#[derive(Debug, Clone, Copy)]
+struct LiveRequest {
+    window: u64,
+    reserved_micro_usd: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -464,7 +474,7 @@ pub struct TransportService {
     callers: HashMap<String, CallerAdmission>,
     /// The requests between claim and settlement, each with the window it was
     /// admitted in.
-    live: HashMap<RequestIdentity, u64>,
+    live: HashMap<RequestIdentity, LiveRequest>,
     replay_store: CultCache,
     max_expiry_skew_ms: u64,
     provider: String,
@@ -609,6 +619,70 @@ impl TransportService {
             .and_then(|windows| windows.get(&window))
             .copied()
             .unwrap_or(0)
+    }
+
+    /// Answers one sealed spend readout request: for each admitted caller, what
+    /// its current window holds against its ceiling, with the backend's plan
+    /// quota beside it. Read-only: nothing is reserved, recorded or pruned.
+    /// Any admitted caller reads every caller's row; the spend is the
+    /// operator's and the callers are all hers. `max_frame_bytes` bounds the
+    /// reply like it bounds `complete`'s.
+    pub fn spend_readout(
+        &self,
+        envelope: &TransportEnvelope,
+        now_unix_ms: u64,
+        plan: PlanQuotaSnapshot,
+        max_frame_bytes: usize,
+    ) -> Result<TransportEnvelope, ServiceError> {
+        validate_envelope(envelope, EnvelopeKind::SpendReadoutRequest)?;
+        let asker = self
+            .callers
+            .get(&envelope.caller_runtime_id)
+            .ok_or(ServiceError::CallerNotAdmitted)?;
+        decrypt_spend_readout_request(envelope, &asker.security)?;
+        let mut callers: Vec<CallerSpend> = self
+            .callers
+            .values()
+            .map(|caller| {
+                // The window admission would use right now.
+                let window = admission_clock(
+                    &self.window_spend,
+                    &caller.caller_runtime_id,
+                    now_unix_ms,
+                    caller.spend_window_ms,
+                ) / caller.spend_window_ms;
+                let held = self.window_spend(&caller.caller_runtime_id, window);
+                let reserved: u64 = self
+                    .live
+                    .iter()
+                    .filter(|(identity, request)| {
+                        request.window == window
+                            && identity.caller_runtime_id == caller.caller_runtime_id
+                    })
+                    .fold(0, |sum, (_, request)| {
+                        sum.saturating_add(request.reserved_micro_usd)
+                    });
+                CallerSpend {
+                    caller_id: caller.caller_runtime_id.clone(),
+                    window_ms: caller.spend_window_ms,
+                    ceiling_micro_usd: caller.spend_ceiling_micro_usd,
+                    spent_micro_usd: held.saturating_sub(reserved),
+                    reserved_micro_usd: reserved,
+                }
+            })
+            .collect();
+        callers.sort_by(|a, b| a.caller_id.cmp(&b.caller_id));
+        let readout = SpendReadout::new(now_unix_ms, callers, plan);
+        let sealed = encrypt_spend_readout(
+            &envelope.caller_runtime_id,
+            &envelope.request_id,
+            &readout,
+            &asker.security,
+        )?;
+        if !readout_fits_frame(&sealed, max_frame_bytes)? {
+            return Err(ServiceError::FrameBound);
+        }
+        Ok(sealed)
     }
 
     /// Admits one request. `max_frame_bytes` is the frame every reply must
@@ -794,7 +868,13 @@ impl TransportService {
             0,
             reserved_micro_usd,
         );
-        self.live.insert(identity, window);
+        self.live.insert(
+            identity,
+            LiveRequest {
+                window,
+                reserved_micro_usd,
+            },
+        );
         Ok(TransportAdmission::Execute(Box::new(ExecutionClaim {
             call: ProviderCall {
                 receipt: TransportReceipt {
@@ -1003,6 +1083,14 @@ impl TransportService {
 
 fn fits_frame(envelope: &TransportEnvelope, max_frame_bytes: usize) -> Result<bool, ServiceError> {
     encode_result_frame(envelope).map(|bytes| bytes.len() <= max_frame_bytes)
+}
+
+/// `fits_frame` for the frame a spend readout answer travels in.
+fn readout_fits_frame(
+    envelope: &TransportEnvelope,
+    max_frame_bytes: usize,
+) -> Result<bool, ServiceError> {
+    encode_spend_readout_response_frame(envelope).map(|bytes| bytes.len() <= max_frame_bytes)
 }
 
 /// The provider named on the stand-in failure, fixed so its size is bounded.
@@ -1756,6 +1844,17 @@ mod tests {
         let size = encode_result_frame(&envelope).unwrap().len();
         assert_eq!(fits_frame(&envelope, size), Ok(true));
         assert_eq!(fits_frame(&envelope, size - 1), Ok(false));
+    }
+
+    #[test]
+    fn a_readout_frame_check_is_inclusive_of_the_serialized_envelope() {
+        let readout = SpendReadout::new(1, Vec::new(), PlanQuotaSnapshot::default());
+        let envelope = encrypt_spend_readout(CALLER, "sized", &readout, &security(KEY)).unwrap();
+        let size = encode_spend_readout_response_frame(&envelope)
+            .unwrap()
+            .len();
+        assert_eq!(readout_fits_frame(&envelope, size), Ok(true));
+        assert_eq!(readout_fits_frame(&envelope, size - 1), Ok(false));
     }
 
     fn claim_for(
@@ -3615,5 +3714,152 @@ mod tests {
             sized(Refusal::ClockBehindAdmissionWindow)
                 <= sized(Refusal::ProviderDigestSubstitution)
         );
+    }
+
+    // ---- spend readout ----
+
+    fn readout_as(
+        service: &TransportService,
+        caller: &str,
+        key: &str,
+        now: u64,
+        frame: usize,
+    ) -> Result<SpendReadout, ServiceError> {
+        let sealed = encrypt_spend_readout_request(caller, "readout-1", &security(key)).unwrap();
+        let answer = service.spend_readout(&sealed, now, PlanQuotaSnapshot::default(), frame)?;
+        assert_eq!(answer.request_id, "readout-1");
+        Ok(decrypt_spend_readout(&answer, &security(key)).unwrap())
+    }
+
+    fn row<'a>(readout: &'a SpendReadout, caller: &str) -> &'a CallerSpend {
+        readout
+            .callers
+            .iter()
+            .find(|row| row.caller_id == caller)
+            .expect("the caller has a row")
+    }
+
+    #[test]
+    fn spend_readout_reports_window() {
+        let store = TestStore::new();
+        let mut service = open_service(&store, 4);
+        let claim = claim_at(&mut service, "request-1", 1_000);
+
+        // In flight: the reservation is held, nothing is spent.
+        let readout = readout_as(&service, CALLER, KEY, 1_500, FRAME).unwrap();
+        assert_eq!(readout.at_unix_ms, 1_500);
+        let mine = row(&readout, CALLER);
+        assert_eq!(mine.window_ms, WINDOW_MS);
+        assert_eq!(mine.ceiling_micro_usd, CEILING);
+        assert_eq!(
+            (mine.spent_micro_usd, mine.reserved_micro_usd),
+            (0, reservation())
+        );
+
+        // Settled: the charge replaces the reservation.
+        let result = text_result(claim.call(), "done");
+        service.complete(*claim, result, FRAME).unwrap();
+        let readout = readout_as(&service, CALLER, KEY, 1_500, FRAME).unwrap();
+        let mine = row(&readout, CALLER);
+        assert_eq!(
+            (mine.spent_micro_usd, mine.reserved_micro_usd),
+            (FIXTURE_USAGE_COST, 0)
+        );
+
+        // Every admitted caller has a row, in id order; the idle one is empty.
+        let ids: Vec<&str> = readout
+            .callers
+            .iter()
+            .map(|r| r.caller_id.as_str())
+            .collect();
+        assert_eq!(ids, ["epiphany-yggdrasil", "ghostlight-yggdrasil"]);
+        let idle = row(&readout, "ghostlight-yggdrasil");
+        assert_eq!((idle.spent_micro_usd, idle.reserved_micro_usd), (0, 0));
+    }
+
+    #[test]
+    fn a_claim_a_crash_left_reads_as_spent_not_reserved() {
+        let store = TestStore::new();
+        let mut service = open_service(&store, 4);
+        let _claim = claim_at(&mut service, "request-1", 1_000);
+        drop(service);
+        let service = open_service(&store, 4);
+        let readout = readout_as(&service, CALLER, KEY, 1_500, FRAME).unwrap();
+        let mine = row(&readout, CALLER);
+        assert_eq!(
+            (mine.spent_micro_usd, mine.reserved_micro_usd),
+            (reservation(), 0)
+        );
+    }
+
+    #[test]
+    fn a_readout_reads_the_ledger_and_changes_nothing_in_it() {
+        let store = TestStore::new();
+        let mut service = open_service(&store, 4);
+        let claim = claim_at(&mut service, "request-1", 1_000);
+        // Two windows later: the caller's current window is empty, and
+        // looking must not prune the window the live claim settles into.
+        let later = 2 * WINDOW_MS + 5;
+        let readout = readout_as(&service, CALLER, KEY, later, FRAME).unwrap();
+        let mine = row(&readout, CALLER);
+        assert_eq!((mine.spent_micro_usd, mine.reserved_micro_usd), (0, 0));
+        assert_eq!(service.window_spend(CALLER, 0), reservation());
+        let result = text_result(claim.call(), "done");
+        service.complete(*claim, result, FRAME).unwrap();
+        assert_eq!(service.window_spend(CALLER, 0), FIXTURE_USAGE_COST);
+    }
+
+    #[test]
+    fn a_readout_is_refused_to_a_stranger_a_wrong_key_and_an_invocation() {
+        let store = TestStore::new();
+        let service = open_service(&store, 4);
+        let sealed = |caller: &str, key: &str| {
+            encrypt_spend_readout_request(caller, "readout-1", &security(key)).unwrap()
+        };
+        assert_eq!(
+            service
+                .spend_readout(
+                    &sealed("nobody", KEY),
+                    1,
+                    PlanQuotaSnapshot::default(),
+                    FRAME
+                )
+                .unwrap_err(),
+            ServiceError::CallerNotAdmitted
+        );
+        assert_eq!(
+            service
+                .spend_readout(
+                    &sealed(CALLER, "another-key"),
+                    1,
+                    PlanQuotaSnapshot::default(),
+                    FRAME
+                )
+                .unwrap_err(),
+            ServiceError::Encryption
+        );
+        let invocation = invocation_at("request-1", 1_000, MAX_COST);
+        assert_eq!(
+            service
+                .spend_readout(
+                    &raw_envelope(&invocation),
+                    1,
+                    PlanQuotaSnapshot::default(),
+                    FRAME
+                )
+                .unwrap_err(),
+            ServiceError::Envelope
+        );
+    }
+
+    #[test]
+    fn a_readout_that_cannot_fit_the_frame_is_a_frame_bound_failure() {
+        let store = TestStore::new();
+        let service = open_service(&store, 4);
+        assert_eq!(
+            readout_as(&service, CALLER, KEY, 1_000, 64).unwrap_err(),
+            ServiceError::FrameBound
+        );
+        assert!(readout_as(&service, CALLER, KEY, 1_000, FRAME).is_ok());
     }
 }

@@ -28,6 +28,7 @@ fn published_schemas_are_the_types() {
         ("transport_result", render::<TransportResult>()),
         ("transport_receipt", render::<TransportReceipt>()),
         ("transport_envelope", render::<TransportEnvelope>()),
+        ("spend_readout", render::<SpendReadout>()),
     ];
     let dir = schemas_dir();
     if std::env::var_os(REGENERATE).is_some() {
@@ -53,7 +54,7 @@ fn published_schemas_are_the_types() {
     expected.sort();
     assert_eq!(
         on_disk, expected,
-        "schemas/ holds exactly the five documents"
+        "schemas/ holds exactly the six documents"
     );
 }
 

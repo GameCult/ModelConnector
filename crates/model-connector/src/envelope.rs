@@ -17,11 +17,14 @@ use crate::contract::{
     ContractError, ENVELOPE_SCHEMA_ID, TransportInvocation, TransportKey, TransportResult,
     canonical_invocation_bytes, require_id, wire_decode, wire_encode,
 };
+use crate::readout::SpendReadout;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub enum EnvelopeKind {
     Invocation,
     Result,
+    SpendReadoutRequest,
+    SpendReadoutResult,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -49,8 +52,10 @@ pub(crate) fn binary_schema(_: &mut schemars::SchemaGenerator) -> schemars::Sche
 
 /// The CultNet service every frame of this connector addresses.
 pub const CONNECTOR_SERVICE_ID: &str = "gamecult.model.connector";
-/// The one operation of that service: run one sealed invocation.
+/// The operation that runs one sealed invocation.
 pub const INVOKE_OPERATION: &str = "invoke";
+/// The operation that reads the spend ledger and the plan's quota.
+pub const SPEND_READOUT_OPERATION: &str = "spend_readout";
 
 const PAYLOAD_ENCODING: &str = "messagepack-base64";
 const OK_STATUS: &str = "ok";
@@ -69,16 +74,39 @@ fn seal_payload(envelope: &TransportEnvelope) -> Result<String, ServiceError> {
     Ok(STANDARD.encode(wire_encode(envelope)?))
 }
 
-/// The CultNet frame an invocation travels in: a `cultnet.operation_request.v0`
-/// for [`CONNECTOR_SERVICE_ID`] and [`INVOKE_OPERATION`], its `message_id` the
+/// The two operations of the connector service.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Operation {
+    Invoke,
+    SpendReadout,
+}
+
+impl Operation {
+    fn name(self) -> &'static str {
+        match self {
+            Operation::Invoke => INVOKE_OPERATION,
+            Operation::SpendReadout => SPEND_READOUT_OPERATION,
+        }
+    }
+
+    fn from_name(name: &str) -> Option<Self> {
+        [Operation::Invoke, Operation::SpendReadout]
+            .into_iter()
+            .find(|operation| operation.name() == name)
+    }
+}
+
+/// The CultNet frame a request travels in: a `cultnet.operation_request.v0`
+/// for [`CONNECTOR_SERVICE_ID`] and the named operation, its `message_id` the
 /// request id and its payload the base64 of the named sealed envelope.
-pub(crate) fn encode_invocation_frame(
+fn request_frame(
+    operation: Operation,
     envelope: &TransportEnvelope,
 ) -> Result<Vec<u8>, ServiceError> {
     carriage_bytes(&CultNetMessage::OperationRequest {
         message_id: envelope.request_id.clone(),
         service_id: CONNECTOR_SERVICE_ID.to_string(),
-        operation: INVOKE_OPERATION.to_string(),
+        operation: operation.name().to_string(),
         payload_schema: ENVELOPE_SCHEMA_ID.to_string(),
         payload_encoding: PAYLOAD_ENCODING.to_string(),
         payload: seal_payload(envelope)?,
@@ -87,14 +115,17 @@ pub(crate) fn encode_invocation_frame(
     })
 }
 
-/// The CultNet frame a result travels in: a `cultnet.operation_response.v0`
-/// with status `ok`, otherwise shaped like the invocation's.
+/// The CultNet frame a response travels in: a `cultnet.operation_response.v0`
+/// with status `ok`, otherwise shaped like the request's.
 #[cfg(any(feature = "daemon", test))]
-pub(crate) fn encode_result_frame(envelope: &TransportEnvelope) -> Result<Vec<u8>, ServiceError> {
+fn response_frame(
+    operation: Operation,
+    envelope: &TransportEnvelope,
+) -> Result<Vec<u8>, ServiceError> {
     carriage_bytes(&CultNetMessage::OperationResponse {
         message_id: envelope.request_id.clone(),
         service_id: CONNECTOR_SERVICE_ID.to_string(),
-        operation: INVOKE_OPERATION.to_string(),
+        operation: operation.name().to_string(),
         status: OK_STATUS.to_string(),
         payload_schema: ENVELOPE_SCHEMA_ID.to_string(),
         payload_encoding: PAYLOAD_ENCODING.to_string(),
@@ -104,20 +135,43 @@ pub(crate) fn encode_result_frame(envelope: &TransportEnvelope) -> Result<Vec<u8
     })
 }
 
+pub(crate) fn encode_invocation_frame(
+    envelope: &TransportEnvelope,
+) -> Result<Vec<u8>, ServiceError> {
+    request_frame(Operation::Invoke, envelope)
+}
+
+pub(crate) fn encode_spend_readout_request_frame(
+    envelope: &TransportEnvelope,
+) -> Result<Vec<u8>, ServiceError> {
+    request_frame(Operation::SpendReadout, envelope)
+}
+
+#[cfg(any(feature = "daemon", test))]
+pub(crate) fn encode_result_frame(envelope: &TransportEnvelope) -> Result<Vec<u8>, ServiceError> {
+    response_frame(Operation::Invoke, envelope)
+}
+
+#[cfg(feature = "daemon")]
+pub(crate) fn encode_spend_readout_response_frame(
+    envelope: &TransportEnvelope,
+) -> Result<Vec<u8>, ServiceError> {
+    response_frame(Operation::SpendReadout, envelope)
+}
+
 /// Opens the carriage of one frame. Everything the carriage says is checked
-/// here, before any decryption: the service, the operation, the payload schema,
-/// and that the message id is the sealed envelope's request id.
+/// here, before any decryption: the service, that the operation is one this
+/// service has, the payload schema, and that the message id is the sealed
+/// envelope's request id.
 fn open_carriage(
     message_id: &str,
     service_id: &str,
     operation: &str,
     payload_schema: &str,
     payload: &str,
-) -> Result<TransportEnvelope, ServiceError> {
-    if service_id != CONNECTOR_SERVICE_ID
-        || operation != INVOKE_OPERATION
-        || payload_schema != ENVELOPE_SCHEMA_ID
-    {
+) -> Result<(Operation, TransportEnvelope), ServiceError> {
+    let operation = Operation::from_name(operation).ok_or(ServiceError::Carriage)?;
+    if service_id != CONNECTOR_SERVICE_ID || payload_schema != ENVELOPE_SCHEMA_ID {
         return Err(ServiceError::Carriage);
     }
     let bytes = STANDARD
@@ -127,7 +181,7 @@ fn open_carriage(
     if envelope.request_id != message_id {
         return Err(ServiceError::OuterIdentity);
     }
-    Ok(envelope)
+    Ok((operation, envelope))
 }
 
 fn read_carriage(bytes: &[u8]) -> Result<CultNetMessage, ServiceError> {
@@ -135,8 +189,15 @@ fn read_carriage(bytes: &[u8]) -> Result<CultNetMessage, ServiceError> {
         .map_err(|_| ServiceError::Carriage)
 }
 
+/// A request frame, by the operation it names.
 #[cfg(any(feature = "daemon", test))]
-pub(crate) fn decode_invocation_frame(bytes: &[u8]) -> Result<TransportEnvelope, ServiceError> {
+pub(crate) enum RequestFrame {
+    Invoke(TransportEnvelope),
+    SpendReadout(TransportEnvelope),
+}
+
+#[cfg(any(feature = "daemon", test))]
+pub(crate) fn decode_request_frame(bytes: &[u8]) -> Result<RequestFrame, ServiceError> {
     match read_carriage(bytes)? {
         CultNetMessage::OperationRequest {
             message_id,
@@ -145,18 +206,34 @@ pub(crate) fn decode_invocation_frame(bytes: &[u8]) -> Result<TransportEnvelope,
             payload_schema,
             payload,
             ..
-        } => open_carriage(
-            &message_id,
-            &service_id,
-            &operation,
-            &payload_schema,
-            &payload,
-        ),
+        } => {
+            match open_carriage(
+                &message_id,
+                &service_id,
+                &operation,
+                &payload_schema,
+                &payload,
+            )? {
+                (Operation::Invoke, envelope) => Ok(RequestFrame::Invoke(envelope)),
+                (Operation::SpendReadout, envelope) => Ok(RequestFrame::SpendReadout(envelope)),
+            }
+        }
         _ => Err(ServiceError::Carriage),
     }
 }
 
-pub(crate) fn decode_result_frame(bytes: &[u8]) -> Result<TransportEnvelope, ServiceError> {
+#[cfg(test)]
+pub(crate) fn decode_invocation_frame(bytes: &[u8]) -> Result<TransportEnvelope, ServiceError> {
+    match decode_request_frame(bytes)? {
+        RequestFrame::Invoke(envelope) => Ok(envelope),
+        RequestFrame::SpendReadout(_) => Err(ServiceError::Carriage),
+    }
+}
+
+fn decode_response_frame(
+    bytes: &[u8],
+    expected: Operation,
+) -> Result<TransportEnvelope, ServiceError> {
     match read_carriage(bytes)? {
         CultNetMessage::OperationResponse {
             message_id,
@@ -166,15 +243,30 @@ pub(crate) fn decode_result_frame(bytes: &[u8]) -> Result<TransportEnvelope, Ser
             payload_schema,
             payload,
             ..
-        } if status == OK_STATUS => open_carriage(
-            &message_id,
-            &service_id,
-            &operation,
-            &payload_schema,
-            &payload,
-        ),
+        } if status == OK_STATUS => {
+            match open_carriage(
+                &message_id,
+                &service_id,
+                &operation,
+                &payload_schema,
+                &payload,
+            )? {
+                (found, envelope) if found == expected => Ok(envelope),
+                _ => Err(ServiceError::Carriage),
+            }
+        }
         _ => Err(ServiceError::Carriage),
     }
+}
+
+pub(crate) fn decode_result_frame(bytes: &[u8]) -> Result<TransportEnvelope, ServiceError> {
+    decode_response_frame(bytes, Operation::Invoke)
+}
+
+pub(crate) fn decode_spend_readout_response_frame(
+    bytes: &[u8],
+) -> Result<TransportEnvelope, ServiceError> {
+    decode_response_frame(bytes, Operation::SpendReadout)
 }
 
 /// The most bytes one frame holding a sealed envelope of `ciphertext_len`
@@ -322,6 +414,59 @@ pub fn decrypt_result(
     }
     result.validate_against(invocation)?;
     Ok(result)
+}
+
+/// A spend readout request carries no content: the sealed envelope's
+/// authenticated identity and kind are the whole request.
+pub(crate) fn encrypt_spend_readout_request(
+    caller_runtime_id: &str,
+    request_id: &str,
+    security: &TransportKey,
+) -> Result<TransportEnvelope, ServiceError> {
+    encrypt_message(
+        caller_runtime_id,
+        request_id,
+        EnvelopeKind::SpendReadoutRequest,
+        &[],
+        security,
+    )
+}
+
+#[cfg(any(feature = "daemon", test))]
+pub(crate) fn decrypt_spend_readout_request(
+    envelope: &TransportEnvelope,
+    security: &TransportKey,
+) -> Result<(), ServiceError> {
+    validate_envelope(envelope, EnvelopeKind::SpendReadoutRequest)?;
+    decrypt_message(envelope, security).map(drop)
+}
+
+#[cfg(feature = "daemon")]
+pub(crate) fn encrypt_spend_readout(
+    caller_runtime_id: &str,
+    request_id: &str,
+    readout: &SpendReadout,
+    security: &TransportKey,
+) -> Result<TransportEnvelope, ServiceError> {
+    let plaintext = wire_encode(readout).map_err(|_| ServiceError::Encoding)?;
+    encrypt_message(
+        caller_runtime_id,
+        request_id,
+        EnvelopeKind::SpendReadoutResult,
+        &plaintext,
+        security,
+    )
+}
+
+pub(crate) fn decrypt_spend_readout(
+    envelope: &TransportEnvelope,
+    security: &TransportKey,
+) -> Result<SpendReadout, ServiceError> {
+    validate_envelope(envelope, EnvelopeKind::SpendReadoutResult)?;
+    let plaintext = decrypt_message(envelope, security)?;
+    let readout: SpendReadout = wire_decode(&plaintext).map_err(|_| ServiceError::Encoding)?;
+    readout.validate()?;
+    Ok(readout)
 }
 
 #[derive(Debug)]
@@ -1137,5 +1282,54 @@ mod tests {
                 Ok(invocation.clone())
             );
         }
+    }
+
+    #[test]
+    fn a_readout_request_is_not_an_invocation_and_names_its_own_operation() {
+        let key = TransportKey::from_connection_secret("readout-test-key").unwrap();
+        let sealed = encrypt_spend_readout_request("caller-1", "readout-1", &key).unwrap();
+        let frame = encode_spend_readout_request_frame(&sealed).unwrap();
+        assert!(matches!(
+            decode_request_frame(&frame),
+            Ok(RequestFrame::SpendReadout(found)) if found == sealed
+        ));
+        assert_eq!(decode_invocation_frame(&frame), Err(ServiceError::Carriage));
+        // Sealed as one kind, the authenticated data refuses it as another.
+        assert!(decrypt_spend_readout_request(&sealed, &key).is_ok());
+        assert_eq!(
+            decrypt_spend_readout(&sealed, &key).unwrap_err(),
+            ServiceError::Envelope
+        );
+        let mut relabelled = sealed.clone();
+        relabelled.message_kind = EnvelopeKind::SpendReadoutResult;
+        assert_eq!(
+            decrypt_spend_readout(&relabelled, &key).unwrap_err(),
+            ServiceError::Encryption
+        );
+    }
+
+    #[cfg(feature = "daemon")]
+    #[test]
+    fn a_response_is_read_as_its_own_operation_only() {
+        use crate::readout::PlanQuotaSnapshot;
+        let key = TransportKey::from_connection_secret("readout-test-key").unwrap();
+        let readout = SpendReadout::new(1, Vec::new(), PlanQuotaSnapshot::default());
+        let sealed = encrypt_spend_readout("caller-1", "readout-1", &readout, &key).unwrap();
+        let readout_frame = encode_spend_readout_response_frame(&sealed).unwrap();
+        let invoke_frame = encode_result_frame(&sealed).unwrap();
+        assert_eq!(
+            decode_spend_readout_response_frame(&readout_frame).unwrap(),
+            sealed
+        );
+        assert_eq!(decode_result_frame(&invoke_frame).unwrap(), sealed);
+        assert_eq!(
+            decode_result_frame(&readout_frame),
+            Err(ServiceError::Carriage)
+        );
+        assert_eq!(
+            decode_spend_readout_response_frame(&invoke_frame),
+            Err(ServiceError::Carriage)
+        );
+        assert_eq!(decrypt_spend_readout(&sealed, &key).unwrap(), readout);
     }
 }

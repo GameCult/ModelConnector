@@ -21,8 +21,11 @@ Crate `crates/model-connector`:
 - `src/envelope.rs` - the AES-256-GCM `TransportEnvelope` (binary ciphertext), its
   identity-binding AAD, the length-prefixed framing, and the CultNet carriage: each frame is a
   `cultnet.operation_request.v0` / `operation_response.v0` for service
-  `gamecult.model.connector`, operation `invoke`, its `message_id` the request id and its
-  payload the base64 of the sealed envelope.
+  `gamecult.model.connector`, operation `invoke` (or `spend_readout`), its `message_id` the
+  request id and its payload the base64 of the sealed envelope. `spend_readout` answers a
+  `SpendReadout` (`gamecult.model.spend_readout.v1`): each caller's spent and reserved
+  micro-USD against its ceiling in its current window, and the backend's plan quota;
+  `ConnectorClient::spend_readout` asks.
 - `schemas/` - one JSON Schema per v3 document, generated from the types.
 - `src/client.rs` - `ConnectorClient`, the one-request caller side.
 - `src/service.rs` (feature `daemon`) - `TransportService`: caller admission, durable
@@ -37,13 +40,15 @@ Crate `crates/claude-connector` (library only; the binary that wires it to `serv
 - `ClaudeCodeBackend` implements `ProviderBackend` for provider `claude-code` by driving the
   unmodified `claude` binary, one child per call, in print stream-json mode with no tools, no MCP
   servers, no settings sources and the system prompt replaced. Tool-less turns only: a request
-  with tools, an output schema or a final tool result is refused before any spawn.
+  with tools or a final tool result is refused before any spawn. A request's output schema goes
+  to the CLI as `--json-schema` and the result's structured output is the one assistant text.
 - Reasoning state is a session handle (`ClaudeCodeHandle`); a handle that cannot be proven to
   match the request re-seeds from the caller's transcript, and every resume forks.
 - `ProcessPort` is the one OS seam (`StdProcessPort`, unix, kills the child's whole process
   group); `SessionStore` and `StderrSink` are the other ports. `ClaudeCodeConfig` is what the
-  binary hands in; the credential is read by name from the connector's own environment
-  (`CLAUDE_CODE_OAUTH_TOKEN`) and copied only into the child.
+  binary hands in; the credential is read from a systemd credential and reaches the child on a
+  pipe (`CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR`), never in an environment. `QuotaCell` keeps the
+  plan windows the CLI's `rate_limit_event`s report, for the spend readout.
 
 Frame arithmetic is public in `src/envelope.rs`, measured on the carriage frame: `frame_bytes_for_payload(n)` is the frame a
 caller payload bound of `n` needs, `payload_bytes_for_frame(frame)` is the largest payload bound

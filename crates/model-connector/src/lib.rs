@@ -1,6 +1,7 @@
 mod client;
 mod contract;
 mod envelope;
+mod readout;
 
 #[cfg(test)]
 mod fixtures;
@@ -13,6 +14,7 @@ mod service;
 pub use client::*;
 pub use contract::*;
 pub use envelope::*;
+pub use readout::*;
 
 #[cfg(feature = "daemon")]
 pub use serve::*;
