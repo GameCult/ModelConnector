@@ -138,6 +138,8 @@ dependencies = [
 name = "claude-connector"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "cultcache-rs",
  "libc",
  "model-connector",
  "rmp-serde",

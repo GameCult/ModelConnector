@@ -23,10 +23,11 @@ use crate::service::{
 /// The only provider seam of the connector kit. A connector binary implements
 /// it over one model provider; the kit names no provider.
 pub trait ProviderBackend: Send + Sync {
-    /// Whether the provider can take work. `serve` consults it once, before it
-    /// opens the replay store or accepts a connection; the request path does
-    /// not consult it.
-    fn ready(&self) -> bool;
+    /// Whether the provider can take work; `Err` names the backend field that
+    /// is not ready, never a value. `serve` consults it once, before it opens
+    /// the replay store or accepts a connection; the request path does not
+    /// consult it.
+    fn ready(&self) -> Result<(), &'static str>;
     /// The tag of the provider this backend fronts. The service owns it from
     /// `serve` on: it names the provider on every receipt and decides which
     /// reasoning state is foreign.
@@ -59,7 +60,7 @@ impl ServeLimits {
     /// largest whose sealed frame, at its worst-case encoding, fits the frame.
     /// An admitted payload therefore always fits, and `complete` is given the
     /// same frame bound to fit every result in.
-    fn validate(&self, admissions: &[CallerAdmission]) -> Result<(), ServeError> {
+    pub fn validate(&self, admissions: &[CallerAdmission]) -> Result<(), ServeError> {
         if self.max_frame_bytes == 0
             || self.max_frame_bytes > u32::MAX as usize
             || self.max_connections == 0
@@ -171,9 +172,7 @@ pub fn serve(
     {
         return Err(ServeError::InvalidConfig("listener address"));
     }
-    if !backend.ready() {
-        return Err(ServeError::BackendUnready);
-    }
+    backend.ready().map_err(ServeError::BackendUnready)?;
     let service = Arc::new(Mutex::new(TransportService::open(
         replay_store,
         backend.provider(),
@@ -322,8 +321,8 @@ pub enum ServeError {
     ConnectionKey(#[source] std::io::Error),
     #[error(transparent)]
     Service(#[from] ServiceError),
-    #[error("provider backend is not ready")]
-    BackendUnready,
+    #[error("provider backend is not ready: {0}")]
+    BackendUnready(&'static str),
     #[error("connector service lock was poisoned")]
     ServicePoisoned,
     #[error("connector listener failed")]
@@ -379,9 +378,9 @@ mod tests {
     }
 
     impl ProviderBackend for CountingBackend {
-        fn ready(&self) -> bool {
+        fn ready(&self) -> Result<(), &'static str> {
             self.ready_calls.fetch_add(1, Ordering::SeqCst);
-            self.ready
+            self.ready.then_some(()).ok_or("fixture")
         }
 
         fn provider(&self) -> &str {
@@ -710,7 +709,10 @@ mod tests {
             &store.path,
             backend.clone(),
         );
-        assert!(matches!(result, Some(Err(ServeError::BackendUnready))));
+        assert!(matches!(
+            result,
+            Some(Err(ServeError::BackendUnready("fixture")))
+        ));
         assert_eq!(backend.executions.load(Ordering::SeqCst), 0);
         assert!(
             !store.path.exists(),
@@ -1016,8 +1018,8 @@ mod tests {
     }
 
     impl ProviderBackend for SizedBackend {
-        fn ready(&self) -> bool {
-            true
+        fn ready(&self) -> Result<(), &'static str> {
+            Ok(())
         }
 
         fn provider(&self) -> &str {

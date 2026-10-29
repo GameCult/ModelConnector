@@ -7,7 +7,13 @@ license.workspace = true
 repository.workspace = true
 publish = false
 
+[[bin]]
+name = "claude-connector"
+path = "src/main.rs"
+
 [dependencies]
+anyhow = "1"
+cultcache-rs = { git = "https://github.com/GameCult/CultLib.git", rev = "a4eae9056152335662f1115f97bf35fb00ab6d23", package = "cultcache-rs" }
 model-connector = { path = "../model-connector", features = ["daemon"] }
 rmp-serde = "1"
 serde = { version = "1", features = ["derive"] }
