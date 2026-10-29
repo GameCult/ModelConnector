@@ -4,8 +4,8 @@ The connector kit for GameCult minds: one typed, encrypted, replay-safe contract
 between a caller that needs a model turn and a daemon that holds the provider
 credential, so no project wires its own provider calls.
 
-Status: the `model-connector` crate is live. No connector binary exists yet
-(the Claude connector is first, then an OpenAI-compatible one).
+Status: the `model-connector` crate and the `claude-connector` backend crate are live. No
+connector binary exists yet (the Claude connector binary is first, then an OpenAI-compatible one).
 
 ## Entry points
 
@@ -31,6 +31,19 @@ Crate `crates/model-connector`:
 - `src/serve.rs` (feature `daemon`) - `serve()`, the loopback accept loop, over the
   `ProviderBackend` trait. A connector binary implements `ProviderBackend` for its
   provider and calls `serve`; the kit names no provider.
+
+Crate `crates/claude-connector` (library only; the binary that wires it to `serve` is not written):
+
+- `ClaudeCodeBackend` implements `ProviderBackend` for provider `claude-code` by driving the
+  unmodified `claude` binary, one child per call, in print stream-json mode with no tools, no MCP
+  servers, no settings sources and the system prompt replaced. Tool-less turns only: a request
+  with tools, an output schema or a final tool result is refused before any spawn.
+- Reasoning state is a session handle (`ClaudeCodeHandle`); a handle that cannot be proven to
+  match the request re-seeds from the caller's transcript, and every resume forks.
+- `ProcessPort` is the one OS seam (`StdProcessPort`, unix, kills the child's whole process
+  group); `SessionStore` and `StderrSink` are the other ports. `ClaudeCodeConfig` is what the
+  binary hands in; the credential is read by name from the connector's own environment
+  (`CLAUDE_CODE_OAUTH_TOKEN`) and copied only into the child.
 
 Frame arithmetic is public in `src/envelope.rs`, measured on the carriage frame: `frame_bytes_for_payload(n)` is the frame a
 caller payload bound of `n` needs, `payload_bytes_for_frame(frame)` is the largest payload bound

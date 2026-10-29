@@ -1,0 +1,295 @@
+//! Reading the CLI's stream-json output. The format is foreign and moves with
+//! the CLI, so every struct here ignores fields it does not name.
+
+use std::collections::BTreeMap;
+
+use model_connector::{FailureKind, StopReason, Usage};
+use serde::Deserialize;
+use serde_json::Value;
+
+/// A call that cannot complete, with the stage that failed. `usage` is `None`
+/// unless a result event reported it.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Failure {
+    pub kind: FailureKind,
+    pub message: &'static str,
+    pub usage: Option<Usage>,
+}
+
+impl Failure {
+    pub(crate) fn unbilled(kind: FailureKind, message: &'static str) -> Self {
+        Self {
+            kind,
+            message,
+            usage: None,
+        }
+    }
+}
+
+/// What the stream said, once its result event arrived.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Finished {
+    pub session_id: String,
+    /// The non-empty text blocks, in order.
+    pub texts: Vec<String>,
+    /// The id of the last assistant message.
+    pub message_id: Option<String>,
+    pub stop_reason: StopReason,
+    pub usage: Usage,
+}
+
+pub(crate) enum Step {
+    More,
+    Done(Box<Result<Finished, Failure>>),
+}
+
+#[derive(Deserialize)]
+struct Line {
+    #[serde(rename = "type")]
+    kind: String,
+    subtype: Option<String>,
+    session_id: Option<String>,
+    model: Option<String>,
+    message: Option<Message>,
+    rate_limit_info: Option<RateLimitInfo>,
+    is_error: Option<bool>,
+    stop_reason: Option<String>,
+    api_error_status: Option<Value>,
+    result: Option<Value>,
+    errors: Option<Value>,
+    /// What this turn alone consumed. `modelUsage` is deliberately not read:
+    /// on a resumed session it carries every earlier turn too.
+    model_usage_since_last_result: Option<Value>,
+}
+
+#[derive(Deserialize)]
+struct Message {
+    id: Option<String>,
+    content: Option<Vec<Block>>,
+}
+
+#[derive(Deserialize)]
+struct Block {
+    #[serde(rename = "type")]
+    kind: String,
+    text: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RateLimitInfo {
+    status: Option<String>,
+}
+
+/// One model's entry. The four counts are required: an entry that lacks one
+/// is a shape this reader does not know, and unknown usage is never zero.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ModelUsage {
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_read_input_tokens: u64,
+    cache_creation_input_tokens: u64,
+    thinking_tokens: Option<u64>,
+}
+
+/// One call's stream, line by line.
+pub(crate) struct StreamState<'a> {
+    model: &'a str,
+    session_id: Option<String>,
+    texts: Vec<String>,
+    message_id: Option<String>,
+    plan_rejected: bool,
+}
+
+impl<'a> StreamState<'a> {
+    pub(crate) fn new(model: &'a str) -> Self {
+        Self {
+            model,
+            session_id: None,
+            texts: Vec::new(),
+            message_id: None,
+            plan_rejected: false,
+        }
+    }
+
+    pub(crate) fn feed(&mut self, raw: &[u8]) -> Step {
+        let Ok(line) = serde_json::from_slice::<Line>(raw) else {
+            return fail(
+                FailureKind::Provider,
+                "claude-code: a stream line did not parse",
+            );
+        };
+        match line.kind.as_str() {
+            "system" => match line.subtype.as_deref() {
+                Some("init") => {
+                    if line.model.as_deref() != Some(self.model) {
+                        return fail(
+                            FailureKind::Provider,
+                            "claude-code: the session model differs from the request",
+                        );
+                    }
+                    self.session_id = line.session_id;
+                    Step::More
+                }
+                Some("compact_boundary") => fail(
+                    FailureKind::Provider,
+                    "claude-code: the session was compacted",
+                ),
+                _ => Step::More,
+            },
+            "assistant" => self.assistant(line.message),
+            "rate_limit_event" => {
+                self.plan_rejected |= line
+                    .rate_limit_info
+                    .and_then(|info| info.status)
+                    .is_some_and(|status| status == "rejected");
+                Step::More
+            }
+            "result" => Step::Done(Box::new(self.result(line))),
+            _ => Step::More,
+        }
+    }
+
+    fn assistant(&mut self, message: Option<Message>) -> Step {
+        let Some(message) = message else {
+            return Step::More;
+        };
+        if message.id.is_some() {
+            self.message_id = message.id;
+        }
+        for block in message.content.unwrap_or_default() {
+            match block.kind.as_str() {
+                "text" => {
+                    if let Some(text) = block.text.filter(|text| !text.is_empty()) {
+                        self.texts.push(text);
+                    }
+                }
+                "tool_use" => {
+                    return fail(
+                        FailureKind::Provider,
+                        "claude-code: the model called a tool in a tool-less turn",
+                    );
+                }
+                _ => {}
+            }
+        }
+        Step::More
+    }
+
+    fn result(&mut self, line: Line) -> Result<Finished, Failure> {
+        let success = line.subtype.as_deref() == Some("success") && line.is_error == Some(false);
+        let door_refusal = !success
+            && matches!(
+                line.api_error_status.as_ref().and_then(Value::as_u64),
+                Some(401 | 403)
+            );
+        let usage = read_usage(line.model_usage_since_last_result, door_refusal);
+        if !success {
+            return Err(Failure {
+                kind: self.error_kind(&line.api_error_status, &line.result, &line.errors),
+                message: "claude-code: the result reported an error",
+                usage,
+            });
+        }
+        let Some(usage) = usage else {
+            return Err(Failure {
+                kind: FailureKind::Provider,
+                message: "claude-code: the result did not report usable usage",
+                usage: None,
+            });
+        };
+        let stop_reason = match line.stop_reason.as_deref() {
+            Some("end_turn") => StopReason::EndTurn,
+            Some("max_tokens") => StopReason::MaxOutputTokens,
+            Some("stop_sequence") => StopReason::StopSequence,
+            Some("refusal") => StopReason::Refusal,
+            Some("model_context_window_exceeded") => StopReason::ContextWindow,
+            _ => {
+                return Err(Failure {
+                    kind: FailureKind::Provider,
+                    message: "claude-code: the result has an unknown stop reason",
+                    usage: Some(usage),
+                });
+            }
+        };
+        let Some(session_id) = self.session_id.take() else {
+            return Err(Failure {
+                kind: FailureKind::Provider,
+                message: "claude-code: the stream never announced its session",
+                usage: Some(usage),
+            });
+        };
+        Ok(Finished {
+            session_id,
+            texts: std::mem::take(&mut self.texts),
+            message_id: self.message_id.take(),
+            stop_reason,
+            usage,
+        })
+    }
+
+    fn error_kind(
+        &self,
+        status: &Option<Value>,
+        result: &Option<Value>,
+        errors: &Option<Value>,
+    ) -> FailureKind {
+        let status = status.as_ref().and_then(Value::as_u64);
+        let names_rate_limit = [result, errors].into_iter().flatten().any(|value| {
+            let text = value.to_string().to_lowercase();
+            text.contains("rate limit") || text.contains("rate_limit")
+        });
+        match status {
+            _ if self.plan_rejected || names_rate_limit || status == Some(429) => {
+                FailureKind::RateLimited
+            }
+            Some(401 | 403) => FailureKind::Authentication,
+            Some(400) => FailureKind::InvalidRequest,
+            Some(500..=599) => FailureKind::Unavailable,
+            _ => FailureKind::Provider,
+        }
+    }
+}
+
+fn fail(kind: FailureKind, message: &'static str) -> Step {
+    Step::Done(Box::new(Err(Failure::unbilled(kind, message))))
+}
+
+/// What this turn consumed, summed over every model it used (harness side
+/// calls included), or `None` when the result does not say: the field absent,
+/// of another shape, or empty. An empty report is believed only for a refusal
+/// at the door (401 or 403), which the provider cannot have billed; elsewhere
+/// the CLI also zeroes usage on crashes after real work. `None` is billed the
+/// reservation by the kit.
+fn read_usage(reported: Option<Value>, door_refusal: bool) -> Option<Usage> {
+    let models: BTreeMap<String, ModelUsage> = serde_json::from_value(reported?).ok()?;
+    if models.is_empty() {
+        return door_refusal.then(|| sum_usage(std::iter::empty()));
+    }
+    Some(sum_usage(models.into_values()))
+}
+
+fn sum_usage(models: impl Iterator<Item = ModelUsage>) -> Usage {
+    let mut usage = Usage {
+        input_tokens: 0,
+        cache_read_tokens: 0,
+        cache_write_tokens: 0,
+        output_tokens: 0,
+        reasoning_tokens: None,
+    };
+    for model in models {
+        usage.input_tokens = usage.input_tokens.saturating_add(model.input_tokens);
+        usage.cache_read_tokens = usage
+            .cache_read_tokens
+            .saturating_add(model.cache_read_input_tokens);
+        usage.cache_write_tokens = usage
+            .cache_write_tokens
+            .saturating_add(model.cache_creation_input_tokens);
+        usage.output_tokens = usage.output_tokens.saturating_add(model.output_tokens);
+        if let Some(thinking) = model.thinking_tokens {
+            usage.reasoning_tokens =
+                Some(usage.reasoning_tokens.unwrap_or(0).saturating_add(thinking));
+        }
+    }
+    usage
+}
