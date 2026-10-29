@@ -67,21 +67,30 @@ mod unix {
     /// hundred bytes, so anything near the pipe's capacity is not one.
     const MAX_TOKEN_BYTES: usize = 4096;
 
-    /// Puts the pipe's read end at [`TOKEN_FD`] in the child. Runs between
-    /// fork and exec, so it calls nothing but `dup2` and `fcntl`.
-    fn place_token_fd(source: RawFd) -> io::Result<()> {
+    fn cvt(result: libc::c_int) -> io::Result<libc::c_int> {
+        if result < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(result)
+        }
+    }
+
+    /// Makes `source` also descriptor `target`, open across exec. Runs between
+    /// fork and exec in the child, so it calls nothing but `dup2` and `fcntl`.
+    fn place_fd(source: RawFd, target: RawFd) -> io::Result<()> {
         // SAFETY: dup2 and fcntl take integers only and are async-signal-safe.
         unsafe {
-            if source == TOKEN_FD {
+            if source == target {
                 // dup2 onto itself changes nothing, so the close-on-exec flag
                 // the pipe was created with must be cleared by hand.
-                let flags = libc::fcntl(TOKEN_FD, libc::F_GETFD);
-                if flags < 0 || libc::fcntl(TOKEN_FD, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0
-                {
-                    return Err(io::Error::last_os_error());
-                }
-            } else if libc::dup2(source, TOKEN_FD) < 0 {
-                return Err(io::Error::last_os_error());
+                let flags = cvt(libc::fcntl(target, libc::F_GETFD))?;
+                cvt(libc::fcntl(
+                    target,
+                    libc::F_SETFD,
+                    flags & !libc::FD_CLOEXEC,
+                ))?;
+            } else {
+                cvt(libc::dup2(source, target))?;
             }
         }
         Ok(())
@@ -126,13 +135,13 @@ mod unix {
                 .process_group(0);
             // The write end closes here, so the child sees the token and then
             // the end of the pipe. Both ends are close-on-exec; only the copy
-            // `place_token_fd` makes reaches the child.
+            // `place_fd` makes reaches the child.
             let (reader, mut writer) = std::io::pipe()?;
             writer.write_all(token.as_bytes())?;
             drop(writer);
             let source = reader.as_raw_fd();
             // SAFETY: the closure calls only async-signal-safe functions.
-            unsafe { command.pre_exec(move || place_token_fd(source)) };
+            unsafe { command.pre_exec(move || place_fd(source, TOKEN_FD)) };
             let mut child = command.spawn()?;
             drop(reader);
             let (stdin_pipe, stdout, stderr) =
@@ -269,6 +278,72 @@ mod unix {
         fn drop(&mut self) {
             self.kill();
             self.wait();
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn cloexec(fd: RawFd) -> bool {
+            // SAFETY: fcntl on an integer descriptor.
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            assert!(flags >= 0, "descriptor {fd} is not open");
+            flags & libc::FD_CLOEXEC != 0
+        }
+
+        /// A descriptor at or above 300 on the same pipe, so a test never
+        /// touches a low number another thread may be using.
+        fn high_dup(source: RawFd, close_on_exec: bool) -> RawFd {
+            let command = if close_on_exec {
+                libc::F_DUPFD_CLOEXEC
+            } else {
+                libc::F_DUPFD
+            };
+            // SAFETY: fcntl on an integer descriptor.
+            let fd = unsafe { libc::fcntl(source, command, 300) };
+            assert!(fd >= 300);
+            fd
+        }
+
+        fn close(fd: RawFd) {
+            // SAFETY: closing a descriptor the test owns.
+            unsafe { libc::close(fd) };
+        }
+
+        #[test]
+        fn placing_a_descriptor_on_itself_clears_close_on_exec() {
+            let (reader, _writer) = std::io::pipe().unwrap();
+            let fd = high_dup(reader.as_raw_fd(), true);
+            assert!(cloexec(fd));
+            place_fd(fd, fd).unwrap();
+            assert!(!cloexec(fd), "it must survive exec");
+            // One that already survives is left alone, not refused.
+            place_fd(fd, fd).unwrap();
+            assert!(!cloexec(fd));
+            close(fd);
+        }
+
+        #[test]
+        fn placing_a_descriptor_elsewhere_copies_it_open_across_exec() {
+            let (reader, _writer) = std::io::pipe().unwrap();
+            let source = high_dup(reader.as_raw_fd(), true);
+            let target = high_dup(reader.as_raw_fd(), true);
+            assert!(cloexec(target));
+            place_fd(source, target).unwrap();
+            assert!(!cloexec(target), "the copy survives exec");
+            assert!(cloexec(source), "the source does not");
+            close(source);
+            close(target);
+        }
+
+        #[test]
+        fn a_descriptor_that_is_not_open_is_refused_either_way() {
+            let (reader, _writer) = std::io::pipe().unwrap();
+            let closed = high_dup(reader.as_raw_fd(), true);
+            close(closed);
+            assert!(place_fd(closed, closed).is_err());
+            assert!(place_fd(closed, closed + 1).is_err());
         }
     }
 }

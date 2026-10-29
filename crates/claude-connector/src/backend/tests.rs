@@ -1956,7 +1956,7 @@ fn rate_limit_event_updates_quota_cell() {
 
 #[test]
 fn a_rejected_turn_still_reports_its_windows_and_a_bad_window_costs_only_itself() {
-    let event = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","unifiedWindows":{"five_hour":{"utilization":0.9996,"resetsAt":1793307000,"status":"rejected"},"seven_day":{"resetsAt":1793656800,"status":"allowed"},"odd":{"utilization":"high","resetsAt":1,"status":"allowed"},"negative":{"utilization":-0.5,"resetsAt":1,"status":"allowed"}}}}"#;
+    let event = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","unifiedWindows":{"five_hour":{"utilization":0.9996,"resetsAt":1793307000,"status":"rejected"},"seven_day":{"resetsAt":1793656800,"status":"allowed"},"idle":{"utilization":0,"resetsAt":1793307000,"status":"allowed"},"odd":{"utilization":"high","resetsAt":1,"status":"allowed"},"negative":{"utilization":-0.5,"resetsAt":1,"status":"allowed"}}}}"#;
     let rig = rig(vec![Script::lines(vec![
         init_line(MODEL, SESSION),
         event.to_string(),
@@ -1968,7 +1968,11 @@ fn a_rejected_turn_still_reports_its_windows_and_a_bad_window_costs_only_itself(
     rejected.status = "rejected".to_string();
     // Unknown is never zero: a window missing a field or of another type is
     // skipped, not read as empty.
-    assert_eq!(quota_of(&rig).windows, vec![rejected]);
+    // A window at exactly zero use is a reading, and is kept.
+    assert_eq!(
+        quota_of(&rig).windows,
+        vec![rejected, window("idle", 0, 1_793_307_000_000)]
+    );
 }
 
 #[test]
@@ -2261,7 +2265,7 @@ mod real {
     }
 
     #[test]
-    fn a_token_too_large_for_a_pipe_is_refused_not_hung() {
+    fn a_token_too_large_for_a_pipe_is_refused_at_its_bound_not_hung() {
         let fake = fake("exit 0", limits());
         let config = config(fake.dir.path(), INSTANCE, limits());
         let env = child_env(&config, &request(vec![user("x")]));
@@ -2273,9 +2277,13 @@ mod real {
                 .to_string_lossy()
                 .into_owned(),
         ];
-        let huge = "t".repeat(1 << 20);
-        let refused = port.spawn(&argv, &env, fake.dir.path(), Vec::new(), &huge);
-        assert!(refused.is_err());
+        let spawn = |token: &str| port.spawn(&argv, &env, fake.dir.path(), Vec::new(), token);
+        let at_bound = spawn(&"t".repeat(4096)).expect("4096 bytes fit the bound");
+        drop(at_bound);
+        assert_eq!(
+            spawn(&"t".repeat(4097)).err().map(|e| e.kind()),
+            Some(io::ErrorKind::InvalidInput)
+        );
     }
 
     #[test]

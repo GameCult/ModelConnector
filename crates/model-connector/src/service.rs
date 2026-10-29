@@ -3837,10 +3837,19 @@ mod tests {
     fn a_readout_that_cannot_fit_the_frame_is_a_frame_bound_failure() {
         let store = TestStore::new();
         let service = open_service(&store, 4);
+        let asked = encrypt_spend_readout_request(CALLER, "readout-1", &security(KEY)).unwrap();
+        let answer = service
+            .spend_readout(&asked, 1_000, PlanQuotaSnapshot::default(), FRAME)
+            .unwrap();
+        let exact = encode_spend_readout_response_frame(&answer).unwrap().len();
+        assert!(readout_as(&service, CALLER, KEY, 1_000, exact).is_ok());
+        assert_eq!(
+            readout_as(&service, CALLER, KEY, 1_000, exact - 1).unwrap_err(),
+            ServiceError::FrameBound
+        );
         assert_eq!(
             readout_as(&service, CALLER, KEY, 1_000, 64).unwrap_err(),
             ServiceError::FrameBound
         );
-        assert!(readout_as(&service, CALLER, KEY, 1_000, FRAME).is_ok());
     }
 }

@@ -256,4 +256,56 @@ mod fixture_tests {
             "the client must not even connect"
         );
     }
+
+    #[cfg(feature = "daemon")]
+    #[test]
+    fn a_readout_is_accepted_only_for_the_identity_that_asked() {
+        use crate::readout::PlanQuotaSnapshot;
+        // (caller the answer is sealed for, request id override, accepted)
+        let cases = [
+            ("caller-1", None, true),
+            ("caller-2", None, false),
+            ("caller-1", Some("some-other-request"), false),
+        ];
+        for (answer_caller, answer_request, accepted) in cases {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let endpoint = listener.local_addr().unwrap();
+            let key = security("readout-client-key");
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_transport_frame(&mut stream, 64 * 1024).unwrap();
+                let RequestFrame::SpendReadout(asked) = decode_request_frame(&request).unwrap()
+                else {
+                    panic!("the client sent something other than a readout request");
+                };
+                let request_id = answer_request.unwrap_or(&asked.request_id);
+                let readout = SpendReadout::new(1, Vec::new(), PlanQuotaSnapshot::default());
+                let sealed =
+                    encrypt_spend_readout(answer_caller, request_id, &readout, &key).unwrap();
+                write_transport_frame(
+                    &mut stream,
+                    &encode_spend_readout_response_frame(&sealed).unwrap(),
+                    64 * 1024,
+                )
+                .unwrap();
+            });
+            let client = ConnectorClient::new(
+                endpoint,
+                "readout-client-key",
+                64 * 1024,
+                Some(Duration::from_secs(1)),
+            )
+            .unwrap();
+            let answer = client.spend_readout("caller-1");
+            if accepted {
+                assert_eq!(answer.unwrap().at_unix_ms, 1);
+            } else {
+                assert!(matches!(
+                    answer,
+                    Err(ConnectorClientError::Transport(ServiceError::OuterIdentity))
+                ));
+            }
+            server.join().unwrap();
+        }
+    }
 }

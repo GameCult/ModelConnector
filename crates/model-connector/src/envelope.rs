@@ -1307,4 +1307,29 @@ mod tests {
             ServiceError::Encryption
         );
     }
+
+    #[cfg(feature = "daemon")]
+    #[test]
+    fn a_response_is_read_as_its_own_operation_only() {
+        use crate::readout::PlanQuotaSnapshot;
+        let key = TransportKey::from_connection_secret("readout-test-key").unwrap();
+        let readout = SpendReadout::new(1, Vec::new(), PlanQuotaSnapshot::default());
+        let sealed = encrypt_spend_readout("caller-1", "readout-1", &readout, &key).unwrap();
+        let readout_frame = encode_spend_readout_response_frame(&sealed).unwrap();
+        let invoke_frame = encode_result_frame(&sealed).unwrap();
+        assert_eq!(
+            decode_spend_readout_response_frame(&readout_frame).unwrap(),
+            sealed
+        );
+        assert_eq!(decode_result_frame(&invoke_frame).unwrap(), sealed);
+        assert_eq!(
+            decode_result_frame(&readout_frame),
+            Err(ServiceError::Carriage)
+        );
+        assert_eq!(
+            decode_spend_readout_response_frame(&invoke_frame),
+            Err(ServiceError::Carriage)
+        );
+        assert_eq!(decrypt_spend_readout(&sealed, &key).unwrap(), readout);
+    }
 }
