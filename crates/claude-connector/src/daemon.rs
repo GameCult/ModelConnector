@@ -267,17 +267,20 @@ fn is_canonical_model(model: &str) -> bool {
 /// lets a call cost nothing against the caller's ceiling.
 fn is_fully_priced(price: &ModelPrice) -> bool {
     let long = price.long_context.map(|long| long.rates);
-    [Some(price.rates), long].into_iter().flatten().all(|rates| {
-        [
-            rates.input,
-            rates.cache_write_short,
-            rates.cache_write_long,
-            rates.cache_read,
-            rates.output,
-        ]
-        .iter()
-        .all(|rate| *rate > 0)
-    })
+    [Some(price.rates), long]
+        .into_iter()
+        .flatten()
+        .all(|rates| {
+            [
+                rates.input,
+                rates.cache_write_short,
+                rates.cache_write_long,
+                rates.cache_read,
+                rates.output,
+            ]
+            .iter()
+            .all(|rate| *rate > 0)
+        })
 }
 
 /// One file name under `$CREDENTIALS_DIRECTORY`, never a path.
@@ -438,8 +441,11 @@ mod tests {
         let sink = LogSink(Mutex::new(log.clone()));
         sink.stderr_tail(b"canary-stderr-text, 22 bytes");
         let written = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
-        assert_eq!(written, "claude-connector: child stderr, 28 bytes
-");
+        assert_eq!(
+            written,
+            "claude-connector: child stderr, 28 bytes
+"
+        );
         assert!(!written.contains("canary"));
     }
 
@@ -491,8 +497,8 @@ mod tests {
         fn a_link_to_a_good_directory_is_refused() {
             let dir = Dir::new("link-target");
             dir.mode(0o700);
-            let link = std::env::temp_dir()
-                .join(format!("claude-prompt-dir-{}-link", std::process::id()));
+            let link =
+                std::env::temp_dir().join(format!("claude-prompt-dir-{}-link", std::process::id()));
             let _ = std::fs::remove_file(&link);
             symlink(&dir.0, &link).unwrap();
             let refused = check_prompt_dir(&link).is_err();

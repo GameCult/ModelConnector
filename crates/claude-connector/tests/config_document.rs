@@ -301,7 +301,8 @@ fn config_refuses_aliases_unpriced_models_and_second_callers() {
             "trailing part",
             Box::new(|c| {
                 c.callers[0].allowed_models = vec!["claude-opus-5-1-20260101-x".to_string()];
-                c.prices.insert("claude-opus-5-1-20260101-x".to_string(), price());
+                c.prices
+                    .insert("claude-opus-5-1-20260101-x".to_string(), price());
             }),
         ),
         (
@@ -364,7 +365,8 @@ fn a_dated_canonical_id_is_allowed() {
 
 #[test]
 fn a_price_with_a_zero_billed_component_is_refused() {
-    let zeroed: Vec<(&str, fn(&mut Rates))> = vec![
+    type Zero = fn(&mut Rates);
+    let zeroed: Vec<(&str, Zero)> = vec![
         ("input", |r| r.input = 0),
         ("cache_write_short", |r| r.cache_write_short = 0),
         ("cache_write_long", |r| r.cache_write_long = 0),
@@ -644,7 +646,10 @@ fn prepare(scratch: &Scratch) -> (Vec<String>, PathBuf) {
         .map(|byte| format!("{byte:02x}"))
         .collect();
     let mut flags = init_flags(scratch, &[]);
-    let at = flags.iter().position(|flag| flag == "--claude-sha256").unwrap();
+    let at = flags
+        .iter()
+        .position(|flag| flag == "--claude-sha256")
+        .unwrap();
     flags[at + 1] = sha;
     (flags, scratch.path("credentials"))
 }
@@ -734,7 +739,11 @@ fn check_refuses_exactly_what_serve_refuses_and_names_the_field() {
         let (checked, served) = check_and_serve(&scratch.path("connector.cc"), Some(&credentials));
         assert!(!checked.status.success(), "{name} check passed");
         assert!(!served.status.success(), "{name} serve started");
-        assert!(shown(&checked).contains(field), "{name}: {}", shown(&checked));
+        assert!(
+            shown(&checked).contains(field),
+            "{name}: {}",
+            shown(&checked)
+        );
         assert_eq!(shown(&checked), shown(&served), "{name}");
         for secret in [CANARY, "caller-secret", "other bytes"] {
             assert!(!shown(&checked).contains(secret), "{name}");
@@ -759,14 +768,20 @@ fn serve_names_a_corrupt_replay_store_without_its_path() {
     let store = scratch.path(&format!("{CANARY}-store/replay.cc"));
     std::fs::create_dir_all(store.parent().unwrap()).unwrap();
     std::fs::write(&store, b"not a cultcache store").unwrap();
-    let at = flags.iter().position(|flag| flag == "--replay-store").unwrap();
+    let at = flags
+        .iter()
+        .position(|flag| flag == "--replay-store")
+        .unwrap();
     flags[at + 1] = store.to_string_lossy().into_owned();
     assert!(init(&scratch, &flags).status.success());
     let (_, served) = check_and_serve(&scratch.path("connector.cc"), Some(&credentials));
     assert!(!served.status.success());
     let text = shown(&served);
     assert!(text.contains("replay_store"), "{text}");
-    assert!(!text.contains(CANARY) && !text.contains("replay.cc"), "{text}");
+    assert!(
+        !text.contains(CANARY) && !text.contains("replay.cc"),
+        "{text}"
+    );
 }
 
 #[test]

@@ -709,7 +709,10 @@ mod tests {
             &store.path,
             backend.clone(),
         );
-        assert!(matches!(result, Some(Err(ServeError::BackendUnready("fixture")))));
+        assert!(matches!(
+            result,
+            Some(Err(ServeError::BackendUnready("fixture")))
+        ));
         assert_eq!(backend.executions.load(Ordering::SeqCst), 0);
         assert!(
             !store.path.exists(),

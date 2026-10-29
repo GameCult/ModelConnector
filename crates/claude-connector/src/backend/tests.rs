@@ -1391,7 +1391,11 @@ fn a_port_that_cannot_spawn_is_a_provider_failure() {
     let result = backend.execute(claim.call());
     let (kind, message, usage) = failure_of(&result);
     assert_eq!(kind, FailureKind::Provider);
-    assert_eq!(usage, Some(usage_zero()), "a child that never ran bills nothing");
+    assert_eq!(
+        usage,
+        Some(usage_zero()),
+        "a child that never ran bills nothing"
+    );
     assert_eq!(parts(&result).1.cost_micro_usd, 0);
     assert!(
         !message.contains(dir.path().to_str().unwrap()),
@@ -1664,7 +1668,11 @@ fn pin_is_checked_before_every_spawn() {
     let result = rig.run(request(vec![user("hi")]));
     let (kind, message, usage) = failure_of(&result);
     assert_eq!((kind, usage), (FailureKind::Provider, Some(usage_zero())));
-    assert_eq!(parts(&result).1.cost_micro_usd, 0, "billed nothing, not the reservation");
+    assert_eq!(
+        parts(&result).1.cost_micro_usd,
+        0,
+        "billed nothing, not the reservation"
+    );
     assert!(!message.contains(rig.dir.path().to_str().unwrap()));
     assert_eq!(rig.spawns(), 1, "no child for a binary off its pin");
     assert!(!rig.backend.binary_matches_pin());
