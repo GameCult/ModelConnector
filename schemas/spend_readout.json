@@ -106,7 +106,6 @@ the old reading says nothing about the new window.",
       "additionalProperties": false,
       "required": [
         "window",
-        "utilization_permille",
         "resets_at_unix_ms",
         "status",
         "observed_at_unix_ms"
