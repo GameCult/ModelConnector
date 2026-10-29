@@ -75,6 +75,8 @@ struct Line {
     is_error: Option<bool>,
     stop_reason: Option<String>,
     api_error_status: Option<Value>,
+    /// Milliseconds spent in API calls; zero means no call was made.
+    duration_api_ms: Option<u64>,
     result: Option<Value>,
     errors: Option<Value>,
     /// The answer to a `--json-schema` request, an object.
@@ -116,6 +118,9 @@ pub(crate) struct StreamState<'a> {
     /// Whether the request carried an output schema, so the answer is the
     /// result's structured output.
     structured: bool,
+    /// Whether that schema's top type admits an object (absent counts): the
+    /// structured output must be an object, never a bare scalar or array.
+    schema_top_is_object: bool,
     quota: &'a QuotaCell,
     session_id: Option<String>,
     texts: Vec<String>,
@@ -124,10 +129,15 @@ pub(crate) struct StreamState<'a> {
 }
 
 impl<'a> StreamState<'a> {
-    pub(crate) fn new(model: &'a str, structured: bool, quota: &'a QuotaCell) -> Self {
+    /// `schema` is the request's output schema text, when it carried one.
+    pub(crate) fn new(model: &'a str, schema: Option<&str>, quota: &'a QuotaCell) -> Self {
+        let top = schema
+            .and_then(|text| serde_json::from_str::<Value>(text).ok())
+            .and_then(|schema| schema.get("type").cloned());
         Self {
             model,
-            structured,
+            structured: schema.is_some(),
+            schema_top_is_object: top.is_none_or(|top| top.as_str() == Some("object")),
             quota,
             session_id: None,
             texts: Vec::new(),
@@ -211,7 +221,16 @@ impl<'a> StreamState<'a> {
                 line.api_error_status.as_ref().and_then(Value::as_u64),
                 Some(401 | 403 | 429)
             );
-        let usage = read_usage(line.model_usage_since_last_result, door_refusal);
+        // The CLI found no credential and never called the API: an error with
+        // no status and no API time at all.
+        let no_call = !success
+            && line.duration_api_ms == Some(0)
+            && line.api_error_status.as_ref().is_none_or(Value::is_null);
+        let usage = read_usage(
+            line.model_usage_since_last_result,
+            door_refusal || no_call,
+            no_call,
+        );
         if !success {
             return Err(Failure {
                 kind: self.error_kind(&line.api_error_status, &line.result, &line.errors),
@@ -230,10 +249,13 @@ impl<'a> StreamState<'a> {
         if self.structured {
             // The answer is the structured output alone; any prose around the
             // tool call is not part of it.
-            let Some(output) = line.structured_output.filter(|value| !value.is_null()) else {
+            let Some(output) = line
+                .structured_output
+                .filter(|value| value.is_object() && self.schema_top_is_object)
+            else {
                 return Err(Failure {
                     kind: FailureKind::Provider,
-                    message: "claude-code: a schema was sent and the result carried no structured output",
+                    message: "claude-code: a schema was sent and the result carried no structured output object",
                     usage: Some(usage),
                 });
             };
@@ -314,9 +336,11 @@ fn plan_windows(info: &Value) -> Vec<PlanQuota> {
             Some(PlanQuota {
                 window: window.clone(),
                 // `as` saturates a float at the integer's bounds.
-                utilization_permille: (utilization * 1000.0).round() as u32,
+                utilization_permille: Some((utilization * 1000.0).round() as u32),
                 resets_at_unix_ms: resets_at.saturating_mul(1000),
                 status: status.to_string(),
+                // Stamped by the cell that keeps it.
+                observed_at_unix_ms: 0,
             })
         })
         .collect()
@@ -328,14 +352,22 @@ fn fail(kind: FailureKind, message: &'static str) -> Step {
 
 /// What this turn consumed, summed over every model it used (harness side
 /// calls included), or `None` when the result does not say: the field absent,
-/// of another shape, or empty. An empty report is believed only for a refusal
-/// at the door (401, 403 or 429), which the provider cannot have billed; elsewhere
-/// the CLI also zeroes usage on crashes after real work. `None` is billed the
-/// reservation by the kit.
-fn read_usage(reported: Option<Value>, door_refusal: bool) -> Option<Usage> {
-    let models: BTreeMap<String, ModelUsage> = serde_json::from_value(reported?).ok()?;
+/// of another shape, or empty. An empty report is believed only where the
+/// provider cannot have billed (`empty_is_zero`: a refusal at the door, 401,
+/// 403 or 429, or a call never made); elsewhere the CLI also zeroes usage on
+/// crashes after real work. A call never made (`absent_is_zero`) may also
+/// omit the field. `None` is billed the reservation by the kit.
+fn read_usage(
+    reported: Option<Value>,
+    empty_is_zero: bool,
+    absent_is_zero: bool,
+) -> Option<Usage> {
+    let Some(reported) = reported else {
+        return absent_is_zero.then(|| sum_usage(std::iter::empty()));
+    };
+    let models: BTreeMap<String, ModelUsage> = serde_json::from_value(reported).ok()?;
     if models.is_empty() {
-        return door_refusal.then(|| sum_usage(std::iter::empty()));
+        return empty_is_zero.then(|| sum_usage(std::iter::empty()));
     }
     Some(sum_usage(models.into_values()))
 }

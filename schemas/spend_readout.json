@@ -20,14 +20,6 @@
         "$ref": "#/$defs/PlanQuota"
       }
     },
-    "plan_quota_observed_at_unix_ms": {
-      "type": [
-        "integer",
-        "null"
-      ],
-      "format": "uint64",
-      "minimum": 0
-    },
     "schema_id": {
       "type": "string"
     }
@@ -81,6 +73,13 @@
       "description": "One window of the subscription plan, as the provider reported it.",
       "type": "object",
       "properties": {
+        "observed_at_unix_ms": {
+          "description": "When this window was last reported. Its age in a readout is the
+readout's `at_unix_ms` minus this.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
         "resets_at_unix_ms": {
           "type": "integer",
           "format": "uint64",
@@ -90,8 +89,13 @@
           "type": "string"
         },
         "utilization_permille": {
-          "description": "How much of the window is used, in thousandths.",
-          "type": "integer",
+          "description": "How much of the window was used when it was observed, in thousandths;
+`None` once the window has reset (`status` is then `expired`), because
+the old reading says nothing about the new window.",
+          "type": [
+            "integer",
+            "null"
+          ],
           "format": "uint32",
           "minimum": 0
         },
@@ -104,7 +108,8 @@
         "window",
         "utilization_permille",
         "resets_at_unix_ms",
-        "status"
+        "status",
+        "observed_at_unix_ms"
       ]
     }
   }

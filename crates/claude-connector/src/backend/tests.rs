@@ -95,7 +95,7 @@ fn structured_tool_result_line() -> String {
 }
 
 fn plan_rate_limit_line() -> String {
-    r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","resetsAt":1793307000,"rateLimitType":"five_hour","overageStatus":"rejected","isUsingOverage":false,"unifiedWindows":{"five_hour":{"utilization":0.08,"resetsAt":1793307000,"status":"allowed"},"seven_day":{"utilization":0.3,"resetsAt":1793656800,"status":"allowed"}}}}"#.to_string()
+    r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","resetsAt":4102444800,"rateLimitType":"five_hour","overageStatus":"rejected","isUsingOverage":false,"unifiedWindows":{"five_hour":{"utilization":0.08,"resetsAt":4102444800,"status":"allowed"},"seven_day":{"utilization":0.3,"resetsAt":4102531200,"status":"allowed"}}}}"#.to_string()
 }
 
 fn structured_result_line() -> String {
@@ -1923,12 +1923,22 @@ fn quota_of(rig: &Rig) -> model_connector::PlanQuotaSnapshot {
     rig.backend.plan_quota()
 }
 
+/// The windows with their observation stamps zeroed, for comparing readings.
+fn readings(rig: &Rig) -> Vec<model_connector::PlanQuota> {
+    let mut windows = quota_of(rig).windows;
+    for window in &mut windows {
+        window.observed_at_unix_ms = 0;
+    }
+    windows
+}
+
 fn window(name: &str, permille: u32, resets_at_unix_ms: u64) -> model_connector::PlanQuota {
     model_connector::PlanQuota {
         window: name.to_string(),
-        utilization_permille: permille,
+        utilization_permille: Some(permille),
         resets_at_unix_ms,
         status: "allowed".to_string(),
+        observed_at_unix_ms: 0,
     }
 }
 
@@ -1943,20 +1953,26 @@ fn rate_limit_event_updates_quota_cell() {
     rig.run(schema_request());
     let snapshot = quota_of(&rig);
     assert_eq!(
-        snapshot.windows,
+        readings(&rig),
         vec![
-            window("five_hour", 80, 1_793_307_000_000),
-            window("seven_day", 300, 1_793_656_800_000),
+            window("five_hour", 80, 4_102_444_800_000),
+            window("seven_day", 300, 4_102_531_200_000),
         ]
     );
-    assert!(snapshot.observed_at_unix_ms.unwrap() >= before);
+    let after = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    for each in &snapshot.windows {
+        assert!((before..=after).contains(&each.observed_at_unix_ms));
+    }
     // The cell is the one the backend hands out.
     assert_eq!(rig.backend.quota().snapshot(), snapshot);
 }
 
 #[test]
 fn a_rejected_turn_still_reports_its_windows_and_a_bad_window_costs_only_itself() {
-    let event = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","unifiedWindows":{"five_hour":{"utilization":0.9996,"resetsAt":1793307000,"status":"rejected"},"seven_day":{"resetsAt":1793656800,"status":"allowed"},"idle":{"utilization":0,"resetsAt":1793307000,"status":"allowed"},"odd":{"utilization":"high","resetsAt":1,"status":"allowed"},"negative":{"utilization":-0.5,"resetsAt":1,"status":"allowed"}}}}"#;
+    let event = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","unifiedWindows":{"five_hour":{"utilization":0.9996,"resetsAt":4102444800,"status":"rejected"},"seven_day":{"resetsAt":4102531200,"status":"allowed"},"idle":{"utilization":0,"resetsAt":4102444800,"status":"allowed"},"odd":{"utilization":"high","resetsAt":1,"status":"allowed"},"negative":{"utilization":-0.5,"resetsAt":1,"status":"allowed"}}}}"#;
     let rig = rig(vec![Script::lines(vec![
         init_line(MODEL, SESSION),
         event.to_string(),
@@ -1964,20 +1980,20 @@ fn a_rejected_turn_still_reports_its_windows_and_a_bad_window_costs_only_itself(
     ])]);
     let (kind, _, _) = failure_of(&rig.run(request(vec![user("hello")])));
     assert_eq!(kind, FailureKind::RateLimited);
-    let mut rejected = window("five_hour", 1000, 1_793_307_000_000);
+    let mut rejected = window("five_hour", 1000, 4_102_444_800_000);
     rejected.status = "rejected".to_string();
     // Unknown is never zero: a window missing a field or of another type is
     // skipped, not read as empty.
     // A window at exactly zero use is a reading, and is kept.
     assert_eq!(
-        quota_of(&rig).windows,
-        vec![rejected, window("idle", 0, 1_793_307_000_000)]
+        readings(&rig),
+        vec![rejected, window("idle", 0, 4_102_444_800_000)]
     );
 }
 
 #[test]
 fn a_later_event_replaces_only_the_windows_it_names() {
-    let only_five = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","unifiedWindows":{"five_hour":{"utilization":0.5,"resetsAt":1793310000,"status":"allowed"}}}}"#;
+    let only_five = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","unifiedWindows":{"five_hour":{"utilization":0.5,"resetsAt":4102448400,"status":"allowed"}}}}"#;
     let rig = rig(vec![
         structured_script(),
         Script::lines(vec![
@@ -1990,10 +2006,10 @@ fn a_later_event_replaces_only_the_windows_it_names() {
     rig.run(schema_request());
     rig.run(request(vec![user("again")]));
     assert_eq!(
-        quota_of(&rig).windows,
+        readings(&rig),
         vec![
-            window("five_hour", 500, 1_793_310_000_000),
-            window("seven_day", 300, 1_793_656_800_000),
+            window("five_hour", 500, 4_102_448_400_000),
+            window("seven_day", 300, 4_102_531_200_000),
         ]
     );
 }
@@ -2414,4 +2430,128 @@ mod real {
             TransportOutcome::Completed { .. }
         ));
     }
+}
+
+// ---- a call that never reached the provider ----
+
+/// The shape claude 2.1.312 gave with no usable credential: an error result
+/// with no status, no API time and no usage rows. `extra` replaces the
+/// per-turn usage field.
+fn not_logged_in_line(status: &str, api_ms: u64, extra: &str) -> String {
+    format!(
+        r#"{{"type":"result","subtype":"success","is_error":true,{status}"duration_ms":118,"duration_api_ms":{api_ms},"stop_reason":"stop_sequence","result":"Not logged in","total_cost_usd":0,"modelUsage":{{}}{extra}}}"#
+    )
+}
+
+#[test]
+fn a_result_that_made_no_api_call_bills_nothing() {
+    let reservation = reservation();
+    let empty = r#","model_usage_since_last_result":{}"#;
+    let cases = [
+        // (status field, api ms, usage field, billed nothing)
+        (r#""api_error_status":null,"#, 0, empty, true),
+        ("", 0, empty, true),
+        ("", 0, "", true),
+        // An API call was made, or the status names a server fault, or the
+        // CLI reported rows: the reservation stands.
+        ("", 2300, empty, false),
+        (r#""api_error_status":500,"#, 0, empty, false),
+        (r#""api_error_status":null,"#, 0, r#","model_usage_since_last_result":"?""#, false),
+    ];
+    for (status, api_ms, extra, free) in cases {
+        let line = not_logged_in_line(status, api_ms, extra);
+        let result = rig(vec![Script::lines(vec![
+            init_line(MODEL, SESSION),
+            line.clone(),
+        ])])
+        .run(request(vec![user("hi")]));
+        let (_, _, usage) = failure_of(&result);
+        if free {
+            assert_eq!(usage, Some(usage_zero()), "{line}");
+            assert_eq!(parts(&result).1.cost_micro_usd, 0, "{line}");
+        } else {
+            assert_eq!(usage, None, "{line}");
+            assert_eq!(parts(&result).1.cost_micro_usd, reservation, "{line}");
+        }
+    }
+}
+
+#[test]
+fn a_no_call_result_that_reports_rows_is_billed_those_rows() {
+    let line = not_logged_in_line(
+        "",
+        0,
+        &format!(r#","model_usage_since_last_result":{USAGE}"#),
+    );
+    let result = rig(vec![Script::lines(vec![init_line(MODEL, SESSION), line])])
+        .run(request(vec![user("hi")]));
+    let (_, _, billed) = failure_of(&result);
+    assert_eq!(billed, Some(usage(2, 7, 1043, 4, Some(3))));
+}
+
+// ---- the structured output is an object ----
+
+#[test]
+fn a_structured_output_that_is_not_an_object_fails_as_provider_with_usage() {
+    for output in ["\"text\"", "[1]", "42", "true", "null"] {
+        let result = rig(vec![Script::lines(vec![
+            init_line(MODEL, SESSION),
+            structured_call_line("StructuredOutput"),
+            result_line_with(
+                "tool_use",
+                USAGE,
+                &format!(r#","structured_output":{output}"#),
+            ),
+        ])])
+        .run(schema_request());
+        let (kind, message, usage) = failure_of(&result);
+        assert_eq!(kind, FailureKind::Provider, "{output}");
+        assert!(message.contains("structured output"), "{message}");
+        assert!(usage.is_some(), "{output}: the turn ran and is billed");
+    }
+}
+
+#[test]
+fn an_object_answer_to_a_schema_whose_top_type_is_not_object_fails() {
+    for (schema, accepted) in [
+        (r#"{"type":"array"}"#, false),
+        (r#"{"type":"string"}"#, false),
+        (r#"{"type":["object","null"]}"#, false),
+        (r#"{"type":"object"}"#, true),
+        (r#"{"properties":{}}"#, true),
+    ] {
+        let mut asked = request(vec![user("hello")]);
+        asked.output_schema_json = Some(schema.to_string());
+        let result = rig(vec![structured_script()]).run(asked);
+        assert_eq!(
+            matches!(outcome(&result), TransportOutcome::Completed { .. }),
+            accepted,
+            "{schema}"
+        );
+    }
+}
+
+// ---- a schema turn does not hand out a session to resume ----
+
+#[test]
+fn a_turn_after_a_schema_turn_is_seeded_not_resumed() {
+    let rig = rig(vec![structured_script(), ok_script(SESSION, "next")]);
+    let first = rig.run(schema_request());
+    assert!(
+        !parts(&first)
+            .0
+            .iter()
+            .any(|e| matches!(e.payload, TransportEventPayload::ReasoningState { .. })),
+        "a schema turn leaves no handle"
+    );
+    rig.run(request(vec![
+        user("hello"),
+        InputItem::AssistantText {
+            text: STRUCTURED.to_string(),
+        },
+        user("and now plainly"),
+    ]));
+    let argv = rig.seen().argv;
+    assert!(!argv.iter().any(|a| a == "--resume"), "{argv:?}");
+    assert!(!argv.iter().any(|a| a == "--json-schema"));
 }

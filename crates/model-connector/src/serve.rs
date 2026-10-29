@@ -544,11 +544,11 @@ mod tests {
         let plan = PlanQuotaSnapshot {
             windows: vec![crate::readout::PlanQuota {
                 window: "five_hour".into(),
-                utilization_permille: 80,
+                utilization_permille: Some(80),
                 resets_at_unix_ms: 1_793_307_000_000,
                 status: "allowed".into(),
+                observed_at_unix_ms: 1_793_300_000_000,
             }],
-            observed_at_unix_ms: Some(1_793_300_000_000),
         };
         let backend = Arc::new(PlanBackend {
             inner: inner.clone(),
@@ -562,10 +562,6 @@ mod tests {
         let readout = client.spend_readout(CALLER).unwrap();
         assert!(readout.at_unix_ms >= before && readout.at_unix_ms <= now_ms());
         assert_eq!(readout.plan_quota, plan.windows);
-        assert_eq!(
-            readout.plan_quota_observed_at_unix_ms,
-            plan.observed_at_unix_ms
-        );
         let [row] = readout.callers.as_slice() else {
             panic!("one admitted caller");
         };
@@ -596,7 +592,6 @@ mod tests {
         let (client, _) = start(CountingBackend::new(true), &store);
         let readout = client.spend_readout(CALLER).unwrap();
         assert!(readout.plan_quota.is_empty());
-        assert_eq!(readout.plan_quota_observed_at_unix_ms, None);
     }
 
     #[test]

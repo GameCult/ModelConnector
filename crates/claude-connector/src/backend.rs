@@ -187,7 +187,7 @@ impl ClaudeCodeBackend {
             child.as_mut(),
             deadline,
             &request.model,
-            request.output_schema_json.is_some(),
+            request.output_schema_json.as_deref(),
             &self.quota,
         );
         child.kill();
@@ -220,14 +220,20 @@ impl ClaudeCodeBackend {
                 text: finished.texts.concat(),
             });
         }
-        let handle = ClaudeCodeHandle::Ended {
-            session_id: finished.session_id,
-            instance: self.config.instance.clone(),
-            prefix_sha256: prefix_digest(&request.instructions, &request.model, &prefix),
-        };
-        payloads.push(TransportEventPayload::ReasoningState {
-            state: handle.encode(),
-        });
+        // A schema turn leaves the CLI's StructuredOutput tool exchange in its
+        // session, and a later turn without the schema runs with no tools: it
+        // must not resume that session. So a schema turn hands out no handle,
+        // and whatever follows it is seeded from the caller's transcript.
+        if request.output_schema_json.is_none() {
+            let handle = ClaudeCodeHandle::Ended {
+                session_id: finished.session_id,
+                instance: self.config.instance.clone(),
+                prefix_sha256: prefix_digest(&request.instructions, &request.model, &prefix),
+            };
+            payloads.push(TransportEventPayload::ReasoningState {
+                state: handle.encode(),
+            });
+        }
 
         let events = payloads
             .into_iter()

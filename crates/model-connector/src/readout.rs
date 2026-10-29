@@ -14,18 +14,22 @@ pub const SPEND_READOUT_SCHEMA_ID: &str = "gamecult.model.spend_readout.v1";
 #[serde(deny_unknown_fields)]
 pub struct PlanQuota {
     pub window: String,
-    /// How much of the window is used, in thousandths.
-    pub utilization_permille: u32,
+    /// How much of the window was used when it was observed, in thousandths;
+    /// `None` once the window has reset (`status` is then `expired`), because
+    /// the old reading says nothing about the new window.
+    pub utilization_permille: Option<u32>,
     pub resets_at_unix_ms: u64,
     pub status: String,
+    /// When this window was last reported. Its age in a readout is the
+    /// readout's `at_unix_ms` minus this.
+    pub observed_at_unix_ms: u64,
 }
 
-/// What a backend last saw of the plan's windows and when it saw them. A
-/// backend with no plan to report returns the default.
+/// What a backend last saw of the plan's windows, each stamped with its own
+/// observation time. A backend with no plan to report returns the default.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PlanQuotaSnapshot {
     pub windows: Vec<PlanQuota>,
-    pub observed_at_unix_ms: Option<u64>,
 }
 
 /// One caller's current spend window in micro-USD. `spent` is settled charges
@@ -48,7 +52,6 @@ pub struct SpendReadout {
     pub at_unix_ms: u64,
     pub callers: Vec<CallerSpend>,
     pub plan_quota: Vec<PlanQuota>,
-    pub plan_quota_observed_at_unix_ms: Option<u64>,
 }
 
 impl SpendReadout {
@@ -58,7 +61,6 @@ impl SpendReadout {
             at_unix_ms,
             callers,
             plan_quota: plan.windows,
-            plan_quota_observed_at_unix_ms: plan.observed_at_unix_ms,
         }
     }
 
@@ -88,11 +90,11 @@ mod tests {
             PlanQuotaSnapshot {
                 windows: vec![PlanQuota {
                     window: "five_hour".into(),
-                    utilization_permille: 80,
+                    utilization_permille: Some(80),
                     resets_at_unix_ms: 1_793_307_000_000,
                     status: "allowed".into(),
+                    observed_at_unix_ms: 999,
                 }],
-                observed_at_unix_ms: Some(999),
             },
         )
     }
@@ -111,8 +113,7 @@ mod tests {
                 "schema_id",
                 "at_unix_ms",
                 "callers",
-                "plan_quota",
-                "plan_quota_observed_at_unix_ms"
+                "plan_quota"
             ]
         );
         assert_eq!(wire_decode::<SpendReadout>(&bytes).unwrap(), readout());
@@ -123,7 +124,6 @@ mod tests {
         let bare = SpendReadout::new(1, Vec::new(), PlanQuotaSnapshot::default());
         let decoded: SpendReadout = wire_decode(&wire_encode(&bare).unwrap()).unwrap();
         assert!(decoded.plan_quota.is_empty());
-        assert_eq!(decoded.plan_quota_observed_at_unix_ms, None);
     }
 
     #[test]
