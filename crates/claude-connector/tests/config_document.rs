@@ -8,8 +8,11 @@ use std::process::{Command, Output};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use claude_connector::{ClaudeConnectorConfig, ConfigError, load_config, write_config};
-use cultcache_rs::{CultCache, DatabaseEntry, SingleFileMessagePackBackingStore};
-use model_connector::{CallerConfig, ModelPrice, Rates};
+use cultcache_rs::{
+    CacheBackingStore, CultCache, CultCacheEnvelope, DatabaseEntry,
+    SingleFileMessagePackBackingStore,
+};
+use model_connector::{CallerConfig, MIN_PAYLOAD_BYTES, ModelPrice, Rates};
 
 const CANARY: &str = "canary-9f3b7c1d";
 const OPUS: &str = "claude-opus-5";
@@ -144,6 +147,85 @@ fn a_second_record_or_the_wrong_type_is_refused() {
         load_config(&scratch.path("absent.cc")),
         Err(ConfigError::Store)
     ));
+}
+
+fn store_raw(path: &Path, key: &str, ty: &str, schema: Option<&str>, payload: Vec<u8>) {
+    let mut store = SingleFileMessagePackBackingStore::new(path);
+    store
+        .push(&CultCacheEnvelope {
+            key: key.to_string(),
+            r#type: ty.to_string(),
+            payload,
+            stored_at: "2026-10-29T00:00:00Z".to_string(),
+            schema_id: schema.map(str::to_string),
+        })
+        .unwrap();
+}
+
+#[test]
+fn the_envelope_must_be_exactly_the_documents_key_type_schema_and_encoding() {
+    let scratch = Scratch::new();
+    let canonical = rmp_serde::to_vec(&valid()).unwrap();
+    let ty = ClaudeConnectorConfig::TYPE;
+    let mut trailing = canonical.clone();
+    trailing.push(0xc0);
+
+    let cases = vec![
+        ("wrong key", "other", ty, Some(ty), canonical.clone()),
+        (
+            "wrong type",
+            "runtime",
+            "gamecult.other.v1",
+            Some(ty),
+            canonical.clone(),
+        ),
+        (
+            "wrong schema",
+            "runtime",
+            ty,
+            Some("gamecult.other.v1"),
+            canonical.clone(),
+        ),
+        ("not canonical", "runtime", ty, Some(ty), trailing),
+    ];
+    for (name, key, ty, schema, payload) in cases {
+        let path = scratch.path(&format!("{}.cc", name.replace(' ', "-")));
+        store_raw(&path, key, ty, schema, payload);
+        assert!(
+            matches!(load_config(&path), Err(ConfigError::Store)),
+            "{name}"
+        );
+    }
+
+    // The same bytes with every part right load.
+    let path = scratch.path("right.cc");
+    store_raw(&path, "runtime", ty, Some(ty), canonical);
+    assert_eq!(load_config(&path).unwrap(), valid());
+}
+
+#[test]
+fn bounds_sit_exactly_where_the_connector_needs_them() {
+    let mut config = valid();
+    config.max_total_bytes = config.max_line_bytes;
+    config.validate().unwrap();
+    config.callers[0].max_payload_bytes = MIN_PAYLOAD_BYTES;
+    config.validate().unwrap();
+    config.callers[0].max_payload_bytes = MIN_PAYLOAD_BYTES - 1;
+    assert_eq!(refused(&config), "caller bounds");
+
+    for set in [
+        (|c: &mut ClaudeConnectorConfig| c.max_connections = 0) as fn(&mut ClaudeConnectorConfig),
+        |c| c.socket_timeout_ms = 0,
+        |c| c.max_expiry_skew_ms = 0,
+        |c| c.max_frame_bytes = 0,
+    ] {
+        let mut config = valid();
+        set(&mut config);
+        assert_eq!(refused(&config), "serve limits");
+    }
+    let mut config = valid();
+    config.prices.insert("claude-".to_string(), price());
+    assert_eq!(refused(&config), "prices");
 }
 
 #[test]
@@ -473,6 +555,7 @@ fn the_binary_refuses_without_echoing_what_it_was_given() {
     let replaced: Vec<(&str, &str)> = vec![
         ("--listen", CANARY),
         ("--claude-sha256", CANARY),
+        ("--claude-sha256", "abcd"),
         ("--price", CANARY),
         ("--instance", &spaced),
         ("--connection-key-epoch", CANARY),
@@ -568,4 +651,16 @@ fn serve_refuses_an_unsafe_prompt_dir_and_prints_no_credential() {
             "{text}"
         );
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_private_regular_file_is_not_a_prompt_dir() {
+    use std::os::unix::fs::PermissionsExt;
+    let scratch = Scratch::new();
+    let file = scratch.path("file");
+    std::fs::write(&file, "x").unwrap();
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(claude_connector::check_prompt_dir(&file).is_err());
+    assert!(claude_connector::check_prompt_dir(&scratch.path("absent")).is_err());
 }
