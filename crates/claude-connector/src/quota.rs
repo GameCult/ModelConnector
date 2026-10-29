@@ -76,7 +76,7 @@ fn unix_ms() -> u64 {
 mod tests {
     use super::*;
 
-    const RESET: u64 = 1_793_307_000_000;
+    const RESET: u64 = 4_102_444_800_000;
 
     fn quota(window: &str, permille: u32, observed_at: u64) -> PlanQuota {
         PlanQuota {

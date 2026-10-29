@@ -47,6 +47,24 @@ pub struct SpendCeiling(pub u64);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SpendWindowMs(pub u64);
 
+/// The rule that admitted callers are distinct: no two share a connection key
+/// (a key names its caller), and no two share a caller id. `TransportService`
+/// opens only under it, and a readiness check that must agree with opening
+/// asks the same function.
+pub fn distinct_admissions(admissions: &[CallerAdmission]) -> Result<(), ServiceError> {
+    let mut keys = HashSet::new();
+    let mut ids = HashSet::new();
+    for admission in admissions {
+        if !keys.insert(admission.security.0) {
+            return Err(ServiceError::SharedCallerKey);
+        }
+        if !ids.insert(admission.caller_runtime_id.as_str()) {
+            return Err(ServiceError::DuplicateCaller);
+        }
+    }
+    Ok(())
+}
+
 pub struct CallerAdmission {
     caller_runtime_id: String,
     connection_key_epoch: u32,
@@ -388,6 +406,12 @@ impl ProviderCall {
         &self.request
     }
 
+    /// The caller this call was admitted for: the caller whose key sealed the
+    /// invocation, never a name the request carries.
+    pub fn caller_runtime_id(&self) -> &str {
+        &self.receipt.caller_runtime_id
+    }
+
     /// How many foreign reasoning items the service removed from the request.
     pub fn foreign_reasoning_dropped(&self) -> u32 {
         self.receipt.foreign_reasoning_dropped
@@ -533,17 +557,12 @@ impl TransportService {
         {
             return Err(ServiceError::InvalidAdmission);
         }
-        let mut callers = HashMap::new();
-        let mut keys = HashSet::new();
-        for admission in admissions {
-            if !keys.insert(admission.security.0) {
-                return Err(ServiceError::SharedCallerKey);
-            }
-            let caller_runtime_id = admission.caller_runtime_id.clone();
-            if callers.insert(caller_runtime_id, admission).is_some() {
-                return Err(ServiceError::DuplicateCaller);
-            }
-        }
+        let admissions: Vec<CallerAdmission> = admissions.into_iter().collect();
+        distinct_admissions(&admissions)?;
+        let callers: HashMap<String, CallerAdmission> = admissions
+            .into_iter()
+            .map(|admission| (admission.caller_runtime_id.clone(), admission))
+            .collect();
         if callers.is_empty() {
             return Err(ServiceError::InvalidAdmission);
         }
@@ -3798,6 +3817,28 @@ mod tests {
         assert_eq!(ids, ["epiphany-yggdrasil", "ghostlight-yggdrasil"]);
         let idle = row(&readout, "ghostlight-yggdrasil");
         assert_eq!((idle.spent_micro_usd, idle.reserved_micro_usd), (0, 0));
+    }
+
+    #[test]
+    fn any_admitted_caller_reads_every_callers_row() {
+        let store = TestStore::new();
+        let mut service = open_service(&store, 4);
+        let claim = claim_at(&mut service, "request-1", 1_000);
+        let result = text_result(claim.call(), "done");
+        service.complete(*claim, result, FRAME).unwrap();
+        // Ghostlight asks, with its own key, and sees epiphany's spend.
+        let readout = readout_as(
+            &service,
+            "ghostlight-yggdrasil",
+            "ghostlight-distinct-test-key",
+            1_500,
+            FRAME,
+        )
+        .unwrap();
+        assert_eq!(row(&readout, CALLER).spent_micro_usd, FIXTURE_USAGE_COST);
+        assert_eq!(row(&readout, "ghostlight-yggdrasil").spent_micro_usd, 0);
+        // A key that belongs to no admitted caller reads nothing.
+        assert!(readout_as(&service, "ghostlight-yggdrasil", KEY, 1_500, FRAME).is_err());
     }
 
     #[test]

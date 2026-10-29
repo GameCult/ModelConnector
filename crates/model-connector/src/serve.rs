@@ -19,7 +19,7 @@ use crate::envelope::{
 use crate::readout::PlanQuotaSnapshot;
 use crate::service::{
     CallerAdmission, PriceTable, ProviderCall, SpendCeiling, SpendWindowMs, TransportAdmission,
-    TransportService,
+    TransportService, distinct_admissions,
 };
 
 /// The only provider seam of the connector kit. A connector binary implements
@@ -87,6 +87,7 @@ impl ServeLimits {
         if admissions.is_empty() {
             return Err(ServeError::InvalidConfig("callers"));
         }
+        distinct_admissions(admissions)?;
         let slots = admissions
             .iter()
             .try_fold(0_usize, |total, caller| {
@@ -948,6 +949,26 @@ mod tests {
             result,
             Some(Err(ServeError::InvalidConfig("callers")))
         ));
+    }
+
+    #[test]
+    fn the_limits_refuse_callers_that_share_a_key_or_an_id() {
+        let limits = limits();
+        let shared_key = [
+            caller("one", "shared-key", 1),
+            caller("two", "shared-key", 1),
+        ];
+        assert!(matches!(
+            limits.validate(&shared_key),
+            Err(ServeError::Service(ServiceError::SharedCallerKey))
+        ));
+        let shared_id = [caller("one", "key-a", 1), caller("one", "key-b", 1)];
+        assert!(matches!(
+            limits.validate(&shared_id),
+            Err(ServeError::Service(ServiceError::DuplicateCaller))
+        ));
+        let distinct = [caller("one", "key-a", 1), caller("two", "key-b", 1)];
+        assert!(limits.validate(&distinct).is_ok());
     }
 
     #[test]

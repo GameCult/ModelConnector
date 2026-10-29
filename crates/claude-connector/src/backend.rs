@@ -12,7 +12,9 @@ use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 use crate::config::{ClaudeCodeConfig, PROVIDER};
-use crate::handle::{ClaudeCodeHandle, SessionStore, plan, prefix_digest, stdin_bytes};
+use crate::handle::{
+    Binding, ClaudeCodeHandle, MIN_SECRET_BYTES, SessionStore, plan, prefix_digest, stdin_bytes,
+};
 use crate::launch::{PromptFile, argv, child_env};
 use crate::process::{ProcessPort, RunningChild, StdoutRead};
 use crate::quota::QuotaCell;
@@ -36,6 +38,8 @@ pub trait TokenSource: Send + Sync {
 pub struct CredentialTokenSource {
     directory: Option<PathBuf>,
     name: String,
+    /// The configuration field `missing` names when the credential is absent.
+    field: &'static str,
 }
 
 impl CredentialTokenSource {
@@ -46,13 +50,21 @@ impl CredentialTokenSource {
         Self {
             directory: std::env::var_os("CREDENTIALS_DIRECTORY").map(PathBuf::from),
             name: name.into(),
+            field: "token_credential",
         }
+    }
+
+    /// The same source, naming `field` when its credential is absent.
+    pub fn for_field(mut self, field: &'static str) -> Self {
+        self.field = field;
+        self
     }
 
     pub fn in_directory(directory: impl Into<PathBuf>, name: impl Into<String>) -> Self {
         Self {
             directory: Some(directory.into()),
             name: name.into(),
+            field: "token_credential",
         }
     }
 }
@@ -72,7 +84,7 @@ impl TokenSource for CredentialTokenSource {
         if self.directory.is_none() {
             "credentials_directory"
         } else {
-            "token_credential"
+            self.field
         }
     }
 }
@@ -91,7 +103,15 @@ pub struct ClaudeCodeBackend {
     sessions: Box<dyn SessionStore>,
     sink: Box<dyn StderrSink>,
     tokens: Box<dyn TokenSource>,
+    handle_secret: Box<dyn TokenSource>,
     quota: Arc<QuotaCell>,
+}
+
+/// The handle secret, or `None` when it is absent or shorter than a key.
+fn usable_secret(source: &dyn TokenSource) -> Option<Zeroizing<String>> {
+    source
+        .read()
+        .filter(|secret| secret.len() >= MIN_SECRET_BYTES)
 }
 
 impl ClaudeCodeBackend {
@@ -105,7 +125,11 @@ impl ClaudeCodeBackend {
         let tokens = Box::new(CredentialTokenSource::from_environment(
             config.token_credential.clone(),
         ));
-        Self::with_ports(config, port, sessions, sink, tokens)
+        let handle_secret = Box::new(
+            CredentialTokenSource::from_environment(config.handle_secret_credential.clone())
+                .for_field("handle_secret_credential"),
+        );
+        Self::with_ports(config, port, sessions, sink, tokens, handle_secret)
     }
 
     pub fn with_ports(
@@ -114,6 +138,7 @@ impl ClaudeCodeBackend {
         sessions: Box<dyn SessionStore>,
         sink: Box<dyn StderrSink>,
         tokens: Box<dyn TokenSource>,
+        handle_secret: Box<dyn TokenSource>,
     ) -> Self {
         Self {
             config,
@@ -121,6 +146,7 @@ impl ClaudeCodeBackend {
             sessions,
             sink,
             tokens,
+            handle_secret,
             quota: Arc::new(QuotaCell::new()),
         }
     }
@@ -136,8 +162,25 @@ impl ClaudeCodeBackend {
         binary_matches_pin(&self.config)
     }
 
-    fn run(&self, request: &ProviderRequest) -> (Vec<TransportEvent>, TransportOutcome) {
-        let plan = match plan(request, &self.config, self.sessions.as_ref()) {
+    fn run(
+        &self,
+        request: &ProviderRequest,
+        caller: &str,
+    ) -> (Vec<TransportEvent>, TransportOutcome) {
+        let Some(secret) = usable_secret(self.handle_secret.as_ref()) else {
+            return failed(
+                FailureKind::Authentication,
+                "claude-code: the connector has no handle secret".to_string(),
+                Some(zero_usage()),
+            );
+        };
+        let plan = match plan(
+            request,
+            &self.config,
+            secret.as_bytes(),
+            caller,
+            self.sessions.as_ref(),
+        ) {
             Ok(plan) => plan,
             Err(error) => {
                 return failed(
@@ -198,7 +241,7 @@ impl ClaudeCodeBackend {
         }
 
         match finished {
-            Ok(finished) => self.completed(request, finished),
+            Ok(finished) => self.completed(request, caller, secret.as_bytes(), finished),
             Err(failure_) => failure(failure_),
         }
     }
@@ -206,6 +249,8 @@ impl ClaudeCodeBackend {
     fn completed(
         &self,
         request: &ProviderRequest,
+        caller: &str,
+        secret: &[u8],
         finished: Finished,
     ) -> (Vec<TransportEvent>, TransportOutcome) {
         let mut payloads: Vec<TransportEventPayload> = finished
@@ -226,9 +271,19 @@ impl ClaudeCodeBackend {
         // and whatever follows it is seeded from the caller's transcript.
         if request.output_schema_json.is_none() {
             let handle = ClaudeCodeHandle::Ended {
-                session_id: finished.session_id,
+                session_id: finished.session_id.clone(),
                 instance: self.config.instance.clone(),
-                prefix_sha256: prefix_digest(&request.instructions, &request.model, &prefix),
+                prefix_sha256: prefix_digest(
+                    secret,
+                    &Binding {
+                        caller,
+                        instructions: &request.instructions,
+                        model: &request.model,
+                        session_id: &finished.session_id,
+                        instance: &self.config.instance,
+                        items: &prefix,
+                    },
+                ),
             };
             payloads.push(TransportEventPayload::ReasoningState {
                 state: handle.encode(),
@@ -256,7 +311,11 @@ impl ClaudeCodeBackend {
 
 impl ProviderBackend for ClaudeCodeBackend {
     fn ready(&self) -> Result<(), &'static str> {
-        readiness(&self.config, self.tokens.as_ref())
+        readiness(
+            &self.config,
+            self.tokens.as_ref(),
+            self.handle_secret.as_ref(),
+        )
     }
 
     fn provider(&self) -> &str {
@@ -264,7 +323,7 @@ impl ProviderBackend for ClaudeCodeBackend {
     }
 
     fn execute(&self, call: &ProviderCall) -> TransportResult {
-        let (events, outcome) = self.run(call.request());
+        let (events, outcome) = self.run(call.request(), call.caller_runtime_id());
         call.transported(events, outcome)
     }
 
@@ -327,6 +386,7 @@ fn binary_matches_pin(config: &ClaudeCodeConfig) -> bool {
 pub(crate) fn readiness(
     config: &ClaudeCodeConfig,
     tokens: &dyn TokenSource,
+    handle_secret: &dyn TokenSource,
 ) -> Result<(), &'static str> {
     if !config.work_dir.is_dir() {
         return Err("work_dir");
@@ -342,6 +402,9 @@ pub(crate) fn readiness(
     }
     // Last: outside the unit the credential is the one thing always absent,
     // and it must not hide the faults the document itself has.
+    if usable_secret(handle_secret).is_none() {
+        return Err(handle_secret.missing());
+    }
     if tokens.read().is_none() {
         return Err(tokens.missing());
     }

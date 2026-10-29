@@ -5,9 +5,10 @@
 
 use std::path::PathBuf;
 
+use hmac::{Hmac, Mac};
 use model_connector::{InputItem, ProviderRequest};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use sha2::Sha256;
 
 use crate::config::{ClaudeCodeConfig, PROVIDER};
 
@@ -16,9 +17,11 @@ use crate::config::{ClaudeCodeConfig, PROVIDER};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) enum ClaudeCodeHandle {
-    /// The session a finished turn left behind. `prefix_sha256` is the digest
-    /// of the instructions, the model and every transcript item that precedes
-    /// this handle.
+    /// The session a finished turn left behind. `prefix_sha256` is the
+    /// HMAC-SHA-256, keyed with the connector's handle secret, of the caller
+    /// that minted the handle, the instructions, the model, this session and
+    /// instance, and every transcript item that precedes this handle. Another caller, or anyone
+    /// without the secret, cannot produce or satisfy it.
     Ended {
         session_id: String,
         instance: String,
@@ -36,12 +39,43 @@ impl ClaudeCodeHandle {
     }
 }
 
-/// The digest a handle binds: named MessagePack of the instructions, the model
-/// and the transcript items before the handle.
-pub(crate) fn prefix_digest(instructions: &str, model: &str, items: &[InputItem]) -> [u8; 32] {
-    let bytes =
-        rmp_serde::to_vec_named(&(instructions, model, items)).expect("strings and bytes encode");
-    Sha256::digest(bytes).into()
+/// The smallest handle secret the connector accepts, in bytes.
+pub const MIN_SECRET_BYTES: usize = 32;
+
+/// Everything a handle's tag binds: the minting caller, the instructions, the
+/// model, the session and instance the handle names, and the transcript items
+/// before the handle. Swapping any of them into a valid handle breaks the tag.
+pub(crate) struct Binding<'a> {
+    pub(crate) caller: &'a str,
+    pub(crate) instructions: &'a str,
+    pub(crate) model: &'a str,
+    pub(crate) session_id: &'a str,
+    pub(crate) instance: &'a str,
+    pub(crate) items: &'a [InputItem],
+}
+
+fn prefix_mac(secret: &[u8], binding: &Binding<'_>) -> Hmac<Sha256> {
+    let bytes = rmp_serde::to_vec_named(&(
+        binding.caller,
+        binding.instructions,
+        binding.model,
+        binding.session_id,
+        binding.instance,
+        binding.items,
+    ))
+    .expect("strings and bytes encode");
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret).expect("an HMAC key has any length");
+    mac.update(&bytes);
+    mac
+}
+
+/// The tag a handle carries: keyed named MessagePack of its [`Binding`].
+pub(crate) fn prefix_digest(secret: &[u8], binding: &Binding<'_>) -> [u8; 32] {
+    prefix_mac(secret, binding).finalize().into_bytes().into()
+}
+
+fn prefix_matches(secret: &[u8], binding: &Binding<'_>, tag: &[u8; 32]) -> bool {
+    prefix_mac(secret, binding).verify_slice(tag).is_ok()
 }
 
 /// Whether the CLI's session store still holds a session.
@@ -121,6 +155,8 @@ impl Plan {
 pub(crate) fn plan(
     request: &ProviderRequest,
     config: &ClaudeCodeConfig,
+    secret: &[u8],
+    caller: &str,
     sessions: &dyn SessionStore,
 ) -> Result<Plan, PlanError> {
     if !request.tools.is_empty() {
@@ -174,7 +210,18 @@ pub(crate) fn plan(
             .all(|item| matches!(item, InputItem::UserText { .. }));
         let resumable = instance == config.instance
             && tail_is_user_text
-            && prefix_sha256 == prefix_digest(&request.instructions, &request.model, &input[..at])
+            && prefix_matches(
+                secret,
+                &Binding {
+                    caller,
+                    instructions: &request.instructions,
+                    model: &request.model,
+                    session_id: &session_id,
+                    instance: &instance,
+                    items: &input[..at],
+                },
+                &prefix_sha256,
+            )
             && sessions.exists(&session_id);
         if resumable {
             return Ok(Plan::Resume {

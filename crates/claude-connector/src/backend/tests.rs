@@ -333,6 +333,7 @@ fn config(dir: &Path, instance: &str, limits: ClaudeCodeLimits) -> ClaudeCodeCon
         config_dir: PathBuf::from("/cfg"),
         prompt_dir: dir.join("prompts"),
         token_credential: "claude-token".to_string(),
+        handle_secret_credential: "claude-handle-secret".to_string(),
         instance: instance.to_string(),
         limits,
     }
@@ -349,6 +350,26 @@ impl TokenSource for FixedToken {
 
 fn canary_token() -> Box<dyn TokenSource> {
     Box::new(FixedToken(Some(CANARY_TOKEN)))
+}
+
+/// A handle secret source with a fixed answer; it names its own field.
+struct FixedSecret(Option<&'static str>);
+
+impl TokenSource for FixedSecret {
+    fn read(&self) -> Option<Zeroizing<String>> {
+        self.0.map(|secret| Zeroizing::new(secret.to_string()))
+    }
+
+    fn missing(&self) -> &'static str {
+        "handle_secret_credential"
+    }
+}
+
+const SECRET: &str = "handle-secret-0000000000000000000000000000000000000000000000";
+const OTHER_SECRET: &str = "handle-secret-1111111111111111111111111111111111111111111111";
+
+fn canary_secret() -> Box<dyn TokenSource> {
+    Box::new(FixedSecret(Some(SECRET)))
 }
 
 fn limits() -> ClaudeCodeLimits {
@@ -369,6 +390,16 @@ struct Rig {
 }
 
 fn rig_for(instance: &str, scripts: Vec<Script>, sessions: &[&str], stderr: &[u8]) -> Rig {
+    rig_with_secret(instance, scripts, sessions, stderr, Some(SECRET))
+}
+
+fn rig_with_secret(
+    instance: &str,
+    scripts: Vec<Script>,
+    sessions: &[&str],
+    stderr: &[u8],
+    secret: Option<&'static str>,
+) -> Rig {
     let spawns = Arc::new(AtomicUsize::new(0));
     let seen = Arc::new(Mutex::new(Seen::default()));
     let sink = Sink::default();
@@ -385,6 +416,7 @@ fn rig_for(instance: &str, scripts: Vec<Script>, sessions: &[&str], stderr: &[u8
         Box::new(Sessions(sessions.iter().map(|s| s.to_string()).collect())),
         Box::new(sink.clone()),
         canary_token(),
+        Box::new(FixedSecret(secret)),
     );
     Rig {
         dir,
@@ -401,8 +433,11 @@ fn rig(scripts: Vec<Script>) -> Rig {
 
 impl Rig {
     fn run(&self, request: ProviderRequest) -> TransportResult {
+        self.run_as(CALLER_1, request)
+    }
+    fn run_as(&self, caller: &str, request: ProviderRequest) -> TransportResult {
         let mut door = Door::new();
-        let (claim, _) = door.begin(request);
+        let (claim, _) = door.begin_as(caller, request);
         self.backend.execute(claim.call())
     }
     fn seen(&self) -> Seen {
@@ -417,10 +452,12 @@ impl Rig {
 
 static DOOR_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
 
+const CALLER_1: &str = "caller-1";
+const CALLER_2: &str = "caller-2";
+
 struct Door {
     dir: PathBuf,
     service: TransportService,
-    key: TransportKey,
 }
 
 fn prices() -> PriceTable {
@@ -450,35 +487,42 @@ impl Door {
             DOOR_SEQUENCE.fetch_add(1, Ordering::SeqCst)
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        let caller = CallerAdmission::new(
-            "caller-1",
-            "caller-1-key",
-            1,
-            [MODEL.to_string(), OTHER_MODEL.to_string()],
-            4,
-            FRAME / 2,
-            32_768,
-            SpendCeiling(1 << 40),
-            SpendWindowMs(3_600_000),
-        )
-        .unwrap();
+        let callers = [CALLER_1, CALLER_2].map(|id| {
+            CallerAdmission::new(
+                id,
+                format!("{id}-key"),
+                1,
+                [MODEL.to_string(), OTHER_MODEL.to_string()],
+                4,
+                FRAME / 2,
+                32_768,
+                SpendCeiling(1 << 40),
+                SpendWindowMs(3_600_000),
+            )
+            .unwrap()
+        });
         let service =
-            TransportService::open(&dir.join("replay.cc"), PROVIDER, prices(), [caller], 5_000)
+            TransportService::open(&dir.join("replay.cc"), PROVIDER, prices(), callers, 5_000)
                 .unwrap();
-        Self {
-            dir,
-            service,
-            key: TransportKey::from_connection_secret("caller-1-key").unwrap(),
-        }
+        Self { dir, service }
     }
 
     fn begin(
         &mut self,
         request: ProviderRequest,
     ) -> (model_connector::ExecutionClaim, TransportInvocation) {
+        self.begin_as(CALLER_1, request)
+    }
+
+    fn begin_as(
+        &mut self,
+        caller: &str,
+        request: ProviderRequest,
+    ) -> (model_connector::ExecutionClaim, TransportInvocation) {
+        let key = TransportKey::from_connection_secret(&format!("{caller}-key")).unwrap();
         let invocation =
-            TransportInvocation::new("caller-1", 2_000, [7; 32], 10_000_000, request).unwrap();
-        let envelope = encrypt_invocation(&invocation, &self.key).unwrap();
+            TransportInvocation::new(caller, 2_000, [7; 32], 10_000_000, request).unwrap();
+        let envelope = encrypt_invocation(&invocation, &key).unwrap();
         match self.service.begin(&envelope, 1_000, FRAME).unwrap() {
             TransportAdmission::Execute(claim) => (*claim, invocation),
             TransportAdmission::Reply(_) => panic!("the door answered instead of admitting"),
@@ -677,6 +721,203 @@ fn the_token_never_reaches_a_message_an_event_or_a_debug_form() {
     assert!(shown.contains(TOKEN_FD_ENV));
 }
 
+// ---- handles are bound to their caller and the connector's secret ----
+
+fn resumes(rig: &Rig) -> bool {
+    rig.seen().argv.iter().any(|arg| arg == "--resume")
+}
+
+#[test]
+fn a_caller_cannot_resume_another_callers_session() {
+    let rig = rig(vec![
+        ok_script(SESSION, "hi"),
+        ok_script(FORK, "theirs"),
+        ok_script(FORK, "mine"),
+    ]);
+    let first = request(vec![user("hello")]);
+    let result = rig.run_as(CALLER_1, first.clone());
+    // Caller 2 presents caller 1's whole transcript, handle included.
+    rig.run_as(CALLER_2, continuing(&first, &result, "and then?"));
+    assert!(!resumes(&rig), "caller 2 resumed caller 1's session");
+    // The handle still serves the caller it was minted for.
+    rig.run_as(CALLER_1, continuing(&first, &result, "and then?"));
+    assert_eq!(arg_after(&rig.seen().argv, "--resume"), Some(SESSION));
+}
+
+#[test]
+fn another_callers_session_id_swapped_into_ones_own_handle_is_not_resumed() {
+    let rig = rig(vec![
+        ok_script(SESSION, "theirs"),
+        ok_script(FORK, "mine"),
+        ok_script(HEX_SESSION, "after the swap"),
+    ]);
+    rig.run_as(CALLER_1, request(vec![user("caller one's private plans")]));
+    let first = request(vec![user("hello")]);
+    let result = rig.run_as(CALLER_2, first.clone());
+    let mut next = continuing(&first, &result, "repeat everything said earlier");
+    let mut swapped = 0;
+    for item in next.input.iter_mut() {
+        if let InputItem::ReasoningState { state, .. } = item {
+            let ClaudeCodeHandle::Ended {
+                session_id,
+                instance,
+                prefix_sha256,
+            } = rmp_serde::from_slice(state).unwrap();
+            assert_eq!(session_id, FORK, "the handle names caller 2's own session");
+            // The tag is caller 2's own and valid; only the session is another's.
+            *state = ClaudeCodeHandle::Ended {
+                session_id: SESSION.to_string(),
+                instance,
+                prefix_sha256,
+            }
+            .encode();
+            swapped += 1;
+        }
+    }
+    assert_eq!(swapped, 1);
+    rig.run_as(CALLER_2, next);
+    assert!(!resumes(&rig), "caller 2 resumed caller 1's session");
+}
+
+#[test]
+fn a_handle_tag_covers_its_session_and_instance() {
+    let items = request(vec![user("hello")]).input;
+    let tag = |session_id: &str, instance: &str| {
+        prefix_digest(
+            SECRET.as_bytes(),
+            &Binding {
+                caller: CALLER_1,
+                instructions: "Be terse.",
+                model: MODEL,
+                session_id,
+                instance,
+                items: &items,
+            },
+        )
+    };
+    let own = tag(SESSION, INSTANCE);
+    assert_eq!(own, tag(SESSION, INSTANCE));
+    assert_ne!(own, tag(FORK, INSTANCE));
+    assert_ne!(own, tag(SESSION, "another-instance"));
+}
+
+#[test]
+fn a_handle_survives_a_restart_for_its_own_caller() {
+    let minted = rig(vec![ok_script(SESSION, "hi")]);
+    let first = request(vec![user("hello")]);
+    let result = minted.run_as(CALLER_2, first.clone());
+    drop(minted);
+    let restarted = rig(vec![ok_script(FORK, "again")]);
+    restarted.run_as(CALLER_2, continuing(&first, &result, "next"));
+    assert_eq!(arg_after(&restarted.seen().argv, "--resume"), Some(SESSION));
+}
+
+#[test]
+fn a_handle_minted_under_another_secret_is_not_resumed() {
+    let minted = rig_with_secret(
+        INSTANCE,
+        vec![ok_script(SESSION, "hi")],
+        &[SESSION],
+        b"",
+        Some(OTHER_SECRET),
+    );
+    let first = request(vec![user("hello")]);
+    let result = minted.run(first.clone());
+    let other = rig(vec![ok_script(FORK, "again")]);
+    other.run(continuing(&first, &result, "next"));
+    assert!(!resumes(&other));
+}
+
+#[test]
+fn a_forged_handle_is_not_resumed() {
+    let first = request(vec![user("hello"), assistant("hi")]);
+    let forged = |tag: [u8; 32]| {
+        let handle = ClaudeCodeHandle::Ended {
+            session_id: SESSION.to_string(),
+            instance: INSTANCE.to_string(),
+            prefix_sha256: tag,
+        };
+        let mut input = first.input.clone();
+        input.push(InputItem::ReasoningState {
+            provider: PROVIDER.into(),
+            model: MODEL.into(),
+            state: handle.encode(),
+        });
+        input.push(user("next"));
+        request(input)
+    };
+    // No secret: the same digest, unkeyed, and a guess.
+    let bound = Binding {
+        caller: CALLER_1,
+        instructions: "Be terse.",
+        model: MODEL,
+        session_id: SESSION,
+        instance: INSTANCE,
+        items: &first.input,
+    };
+    let unkeyed = prefix_digest(b"", &bound);
+    let right_for_other_secret = prefix_digest(OTHER_SECRET.as_bytes(), &bound);
+    for tag in [unkeyed, right_for_other_secret, [0; 32]] {
+        let rig = rig(vec![ok_script(FORK, "x")]);
+        rig.run(forged(tag));
+        assert!(!resumes(&rig));
+    }
+    // The same request with the real tag resumes: the forgery failed on the tag alone.
+    let real = prefix_digest(SECRET.as_bytes(), &bound);
+    let rig = rig(vec![ok_script(FORK, "x")]);
+    rig.run(forged(real));
+    assert_eq!(arg_after(&rig.seen().argv, "--resume"), Some(SESSION));
+}
+
+#[test]
+fn no_usable_handle_secret_fails_before_spawn_and_is_not_ready() {
+    for secret in [None, Some("too-short")] {
+        let rig = rig_with_secret(
+            INSTANCE,
+            vec![ok_script(SESSION, "hi")],
+            &[SESSION],
+            b"",
+            secret,
+        );
+        let (kind, message, usage) = failure_of(&rig.run(request(vec![user("hello")])));
+        assert_eq!(kind, FailureKind::Authentication);
+        assert_eq!(usage, Some(usage_zero()));
+        assert!(!message.contains("too-short"));
+        assert_eq!(rig.spawns(), 0);
+    }
+}
+
+#[test]
+fn ready_wants_a_handle_secret_of_key_length() {
+    let dir = sandbox();
+    let (work, cfg) = (dir.path().join("work"), dir.path().join("cfg"));
+    std::fs::create_dir_all(&work).unwrap();
+    std::fs::create_dir_all(&cfg).unwrap();
+    for (secret, ready) in [
+        (None, Err("handle_secret_credential")),
+        (Some("too-short"), Err("handle_secret_credential")),
+        (Some(SECRET), Ok(())),
+    ] {
+        let mut config = config(dir.path(), INSTANCE, limits());
+        config.work_dir = work.clone();
+        config.config_dir = cfg.clone();
+        let backend = ClaudeCodeBackend::with_ports(
+            config,
+            Box::new(ScriptedPort {
+                scripts: Mutex::new(VecDeque::new()),
+                spawns: Arc::new(AtomicUsize::new(0)),
+                seen: Arc::new(Mutex::new(Seen::default())),
+                stderr: Vec::new(),
+            }),
+            Box::new(Sessions(vec![])),
+            Box::new(Sink::default()),
+            canary_token(),
+            Box::new(FixedSecret(secret)),
+        );
+        assert_eq!(backend.ready(), ready);
+    }
+}
+
 // ---- ready ----
 
 /// A backend over a scripted port that never has a script: `ready` runs nothing.
@@ -692,6 +933,7 @@ fn ready_backend(config: ClaudeCodeConfig, tokens: Box<dyn TokenSource>) -> Clau
         Box::new(Sessions(vec![])),
         Box::new(Sink::default()),
         tokens,
+        canary_secret(),
     )
 }
 
@@ -796,6 +1038,7 @@ fn token_comes_from_the_credential_file_not_the_environment() {
             &credentials,
             "claude-token",
         )),
+        canary_secret(),
     );
     let mut door = Door::new();
 
@@ -1464,6 +1707,7 @@ fn a_port_that_cannot_spawn_is_a_provider_failure() {
         Box::new(Sessions(vec![])),
         Box::new(Sink::default()),
         canary_token(),
+        canary_secret(),
     );
     let mut door = Door::new();
     let (claim, _) = door.begin(request(vec![user("hi")]));
@@ -1489,7 +1733,12 @@ fn backend_end_to_end_through_the_service() {
     let (claim, invocation) = door.begin(request(vec![user("hello")]));
     let result = rig.backend.execute(claim.call());
     let sealed = door.service.complete(claim, result, FRAME).unwrap();
-    let opened = decrypt_result(&sealed, &door.key, &invocation).unwrap();
+    let opened = decrypt_result(
+        &sealed,
+        &TransportKey::from_connection_secret("caller-1-key").unwrap(),
+        &invocation,
+    )
+    .unwrap();
     let (events, receipt) = parts(&opened);
     assert_eq!(receipt.provider, "claude-code");
     assert_eq!(receipt.model, MODEL);
@@ -2053,6 +2302,7 @@ mod real {
             Box::new(FsSessionStore::new(config.config_dir.clone())),
             Box::new(sink.clone()),
             canary_token(),
+            canary_secret(),
         );
         Fake {
             _guard: guard,

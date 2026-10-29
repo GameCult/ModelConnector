@@ -23,7 +23,7 @@ pub use daemon::{
 };
 #[cfg(unix)]
 pub use daemon::{check_prompt_dir, serve_config};
-pub use handle::{FsSessionStore, SessionStore};
+pub use handle::{FsSessionStore, MIN_SECRET_BYTES, SessionStore};
 pub use launch::ChildEnv;
 #[cfg(target_os = "linux")]
 pub use lease::{

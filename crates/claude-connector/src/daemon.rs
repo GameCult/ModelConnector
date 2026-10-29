@@ -31,8 +31,8 @@ const MODEL_PREFIX: &str = "claude-";
 
 /// A unix account that may lease the subscription token for a Self run, the
 /// Self unit (`mind-self@<unit_instance>.service`) its process must run in,
-/// the caller whose spend window its leases reserve in, and what each lease
-/// reserves there.
+/// the configured caller whose spend window its leases reserve in, and what
+/// each lease reserves there.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LeaseCallerConfig {
     pub unix_user: String,
@@ -82,7 +82,9 @@ pub struct ClaudeConnectorConfig {
     pub socket_timeout_ms: u64,
     #[cultcache(key = 16)]
     pub max_expiry_skew_ms: u64,
-    /// Exactly one caller until claude-handle-caller-binding lands.
+    /// Every caller of this connector: its own connection key and epoch, models,
+    /// concurrency, payload and output bounds, and spend ceiling and window.
+    /// Ids are unique. Handles are bound to the caller that was given them.
     #[cultcache(key = 17)]
     pub callers: Vec<CallerConfig>,
     /// What each allowed model costs. The keys are the known list of models:
@@ -100,6 +102,10 @@ pub struct ClaudeConnectorConfig {
     /// The furthest a lease's expiry may lie from now.
     #[cultcache(key = 21)]
     pub lease_max_ms: u64,
+    /// The name of the systemd credential that holds the handle secret (at
+    /// least 32 bytes), the key every handle is authenticated with.
+    #[cultcache(key = 22)]
+    pub handle_secret_credential: String,
 }
 
 /// A refusal. It names the field or stage that failed and nothing the
@@ -180,6 +186,11 @@ impl ClaudeConnectorConfig {
         if !is_credential_name(&self.token_credential) {
             return Err(ConfigError::Invalid("token_credential"));
         }
+        if !is_credential_name(&self.handle_secret_credential)
+            || self.handle_secret_credential == self.token_credential
+        {
+            return Err(ConfigError::Invalid("handle_secret_credential"));
+        }
         if self.deadline_ms == 0
             || self.max_line_bytes == 0
             || self.max_total_bytes < self.max_line_bytes
@@ -194,36 +205,42 @@ impl ClaudeConnectorConfig {
         {
             return Err(ConfigError::Invalid("serve limits"));
         }
-        let [caller] = self.callers.as_slice() else {
+        if self.callers.is_empty() {
             return Err(ConfigError::Invalid("callers"));
-        };
-        if !is_trimmed_nonempty(&caller.caller_runtime_id) {
-            return Err(ConfigError::Invalid("caller_runtime_id"));
         }
-        if !caller.connection_key_file.is_absolute() {
-            return Err(ConfigError::Invalid("connection_key_file"));
-        }
-        if caller.connection_key_epoch == 0 {
-            return Err(ConfigError::Invalid("connection_key_epoch"));
-        }
-        if caller.max_concurrent_requests == 0
-            || caller.max_payload_bytes < MIN_PAYLOAD_BYTES
-            || caller.max_output_tokens == 0
-            || caller.spend_ceiling_micro_usd == 0
-            || caller.spend_window_ms == 0
-        {
-            return Err(ConfigError::Invalid("caller bounds"));
-        }
-        if caller.allowed_models.is_empty() {
-            return Err(ConfigError::Invalid("allowed_models"));
-        }
-        let mut seen = BTreeSet::new();
-        for model in &caller.allowed_models {
-            if !has_model_id_form(model)
-                || !seen.insert(model.as_str())
-                || !self.prices.contains_key(model)
+        let mut ids = BTreeSet::new();
+        for caller in &self.callers {
+            if !is_trimmed_nonempty(&caller.caller_runtime_id) {
+                return Err(ConfigError::Invalid("caller_runtime_id"));
+            }
+            if !ids.insert(caller.caller_runtime_id.as_str()) {
+                return Err(ConfigError::Invalid("callers"));
+            }
+            if !caller.connection_key_file.is_absolute() {
+                return Err(ConfigError::Invalid("connection_key_file"));
+            }
+            if caller.connection_key_epoch == 0 {
+                return Err(ConfigError::Invalid("connection_key_epoch"));
+            }
+            if caller.max_concurrent_requests == 0
+                || caller.max_payload_bytes < MIN_PAYLOAD_BYTES
+                || caller.max_output_tokens == 0
+                || caller.spend_ceiling_micro_usd == 0
+                || caller.spend_window_ms == 0
             {
+                return Err(ConfigError::Invalid("caller bounds"));
+            }
+            if caller.allowed_models.is_empty() {
                 return Err(ConfigError::Invalid("allowed_models"));
+            }
+            let mut seen = BTreeSet::new();
+            for model in &caller.allowed_models {
+                if !has_model_id_form(model)
+                    || !seen.insert(model.as_str())
+                    || !self.prices.contains_key(model)
+                {
+                    return Err(ConfigError::Invalid("allowed_models"));
+                }
             }
         }
         if !self
@@ -233,11 +250,11 @@ impl ClaudeConnectorConfig {
         {
             return Err(ConfigError::Invalid("prices"));
         }
-        self.validate_leases(&caller.caller_runtime_id, caller.spend_ceiling_micro_usd)?;
+        self.validate_leases()?;
         Ok(listen)
     }
 
-    fn validate_leases(&self, caller_id: &str, spend_ceiling: u64) -> Result<(), ConfigError> {
+    fn validate_leases(&self) -> Result<(), ConfigError> {
         let Some(socket) = &self.lease_socket else {
             return if self.lease_callers.is_empty() {
                 Ok(())
@@ -255,9 +272,15 @@ impl ClaudeConnectorConfig {
         if self.lease_callers.is_empty()
             || !self.lease_callers.iter().all(|lease| {
                 is_trimmed_nonempty(&lease.unix_user)
-                    && lease.caller_id == caller_id
+                    && self
+                        .callers
+                        .iter()
+                        .find(|caller| caller.caller_runtime_id == lease.caller_id)
+                        .is_some_and(|caller| {
+                            (1..=caller.spend_ceiling_micro_usd)
+                                .contains(&lease.reservation_micro_usd)
+                        })
                     && is_unit_instance(&lease.unit_instance)
-                    && (1..=spend_ceiling).contains(&lease.reservation_micro_usd)
                     && users.insert(lease.unix_user.as_str())
             })
         {
@@ -274,6 +297,7 @@ impl ClaudeConnectorConfig {
             config_dir: self.config_dir.clone(),
             prompt_dir: self.prompt_dir.clone(),
             token_credential: self.token_credential.clone(),
+            handle_secret_credential: self.handle_secret_credential.clone(),
             instance: self.instance.clone(),
             limits: ClaudeCodeLimits {
                 deadline: Duration::from_millis(self.deadline_ms),
@@ -458,6 +482,8 @@ fn readiness_of(config: &ClaudeConnectorConfig) -> Result<Vec<CallerAdmission>, 
     readiness(
         &backend,
         &CredentialTokenSource::from_environment(backend.token_credential.clone()),
+        &CredentialTokenSource::from_environment(backend.handle_secret_credential.clone())
+            .for_field("handle_secret_credential"),
     )
     .map_err(ConfigError::Unusable)?;
     if config.lease_socket.is_some() {

@@ -140,6 +140,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "cultcache-rs",
+ "hmac",
  "libc",
  "model-connector",
  "rmp-serde",

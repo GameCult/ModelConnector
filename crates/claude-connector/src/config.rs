@@ -25,6 +25,9 @@ pub struct ClaudeCodeConfig {
     /// The name of the systemd credential that holds the child's token, under
     /// `$CREDENTIALS_DIRECTORY`.
     pub token_credential: String,
+    /// The name of the systemd credential that holds the handle secret: the
+    /// key every handle is authenticated with.
+    pub handle_secret_credential: String,
     /// The connector instance id written into every handle.
     pub instance: String,
     pub limits: ClaudeCodeLimits,

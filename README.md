@@ -42,8 +42,9 @@ Crate `crates/claude-connector` (library only; the binary that wires it to `serv
   servers, no settings sources and the system prompt replaced. Tool-less turns only: a request
   with tools or a final tool result is refused before any spawn. A request's output schema goes
   to the CLI as `--json-schema` and the result's structured output is the one assistant text.
-- Reasoning state is a session handle (`ClaudeCodeHandle`); a handle that cannot be proven to
-  match the request re-seeds from the caller's transcript, and every resume forks.
+- Reasoning state is a session handle (`ClaudeCodeHandle`) authenticated with a connector secret
+  and bound to the caller it was minted for; a handle that cannot be proven to match the request
+  and its caller re-seeds from the caller's transcript, and every resume forks.
 - `ProcessPort` is the one OS seam (`StdProcessPort`, unix, kills the child's whole process
   group); `SessionStore` and `StderrSink` are the other ports. `ClaudeCodeConfig` is what the
   binary hands in; the credential is read from a systemd credential and reaches the child on a

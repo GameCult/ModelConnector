@@ -74,6 +74,7 @@ fn valid() -> ClaudeConnectorConfig {
         prompt_dir: "/var/lib/claude-connector/prompts".into(),
         instance: "persona-a".to_string(),
         token_credential: "claude-token".to_string(),
+        handle_secret_credential: "claude-handle-secret".to_string(),
         deadline_ms: 600_000,
         max_line_bytes: 4 << 20,
         max_total_bytes: 64 << 20,
@@ -326,11 +327,10 @@ fn config_refuses_aliases_unpriced_models_and_second_callers() {
             Box::new(|c| c.callers[0].allowed_models.clear()),
         ),
         (
-            "second caller",
+            "duplicate caller id",
             Box::new(|c| {
-                let mut second = c.callers[0].clone();
-                second.caller_runtime_id = "other".to_string();
-                c.callers.push(second);
+                let again = c.callers[0].clone();
+                c.callers.push(again);
             }),
         ),
         ("no caller", Box::new(|c| c.callers.clear())),
@@ -538,7 +538,7 @@ fn no_refusal_echoes_a_value() {
         }),
         Box::new(|c| {
             let mut second = c.callers[0].clone();
-            second.caller_runtime_id = CANARY.to_string();
+            second.caller_runtime_id = format!(" {CANARY}");
             c.callers.push(second);
         }),
     ];
@@ -646,6 +646,10 @@ fn init_flags<'a>(scratch: &'a Scratch, extra: &[&'a str]) -> Vec<String> {
         "persona-a",
         "--token-credential",
         "claude-token",
+        "--handle-secret-credential",
+        "claude-handle-secret",
+        "--handle-secret-file",
+        &path("handle.secret"),
         "--caller-id",
         "persona-a-caller",
         "--connection-key-file",
@@ -704,6 +708,11 @@ fn prepare(scratch: &Scratch) -> (Vec<String>, PathBuf) {
     )
     .unwrap();
     std::fs::write(scratch.path("credentials/claude-token"), CANARY).unwrap();
+    std::fs::write(
+        scratch.path("credentials/claude-handle-secret"),
+        "s".repeat(64),
+    )
+    .unwrap();
     std::fs::write(scratch.path("caller.key"), "caller-secret").unwrap();
     std::fs::write(scratch.path("claude"), b"pinned claude").unwrap();
     let sha: String = Sha256::digest(b"pinned claude")
@@ -749,7 +758,7 @@ fn check_passes_a_document_serve_can_start_and_reports_counts_only() {
     );
     assert!(checked.status.success(), "{}", shown(&checked));
     let text = shown(&checked);
-    assert!(text.contains("callers: 1") && text.contains("allowed_models: 1"));
+    assert!(text.contains("callers: 1") && text.contains("lease_callers: 0"));
     assert!(text.contains("prices: 1"));
     for secret in ["persona-a", HAIKU, CANARY, "caller-secret"] {
         assert!(!text.contains(secret), "{text}");
@@ -787,6 +796,32 @@ fn check_refuses_exactly_what_serve_refuses_and_names_the_field() {
             let mut config = load_config(&path).unwrap();
             config.max_frame_bytes = 4099;
             write_config(&path, &config).unwrap();
+        }),
+        ("two callers on one key", "callers", |s, _| {
+            std::fs::write(s.path("twin.key"), "caller-secret").unwrap();
+            let config = s.path("connector.cc");
+            let twin = s.path("twin.key");
+            let added = run(
+                &[
+                    "config",
+                    "add-caller",
+                    config.to_str().unwrap(),
+                    "--caller-id",
+                    "twin",
+                    "--connection-key-file",
+                    twin.to_str().unwrap(),
+                    "--connection-key-epoch",
+                    "1",
+                    "--allowed-model",
+                    HAIKU,
+                    "--spend-ceiling-micro-usd",
+                    "1000",
+                    "--spend-window-ms",
+                    "60000",
+                ],
+                &[],
+            );
+            assert!(added.status.success(), "{}", shown(&added));
         }),
         ("too few connections", "connection capacity", |s, _| {
             let path = s.path("connector.cc");
@@ -1205,4 +1240,431 @@ fn serve_binds_the_lease_socket_and_answers_a_stranger_with_a_refusal() {
     server.wait().unwrap();
     outcome.unwrap();
     assert!(running);
+}
+
+// ---- many callers ----
+
+fn second_caller() -> CallerConfig {
+    CallerConfig {
+        caller_runtime_id: "heartbeat".to_string(),
+        connection_key_file: "/etc/claude-connector/heartbeat.key".into(),
+        connection_key_epoch: 3,
+        allowed_models: vec![HAIKU.to_string()],
+        max_concurrent_requests: 1,
+        max_payload_bytes: 64 << 10,
+        max_output_tokens: 1024,
+        spend_ceiling_micro_usd: 1_000_000,
+        spend_window_ms: 60_000,
+    }
+}
+
+#[test]
+fn several_callers_round_trip_and_each_is_validated_alone() {
+    let scratch = Scratch::new();
+    let path = scratch.path("connector.cc");
+    let mut config = valid();
+    config.callers.push(second_caller());
+    write_config(&path, &config).unwrap();
+    assert_eq!(load_config(&path).unwrap(), config);
+
+    let broken: Vec<(&str, Change)> = vec![
+        (
+            "caller bounds",
+            Box::new(|c| c.callers[1].spend_ceiling_micro_usd = 0),
+        ),
+        (
+            "connection_key_epoch",
+            Box::new(|c| c.callers[1].connection_key_epoch = 0),
+        ),
+        (
+            "connection_key_file",
+            Box::new(|c| c.callers[1].connection_key_file = "heartbeat.key".into()),
+        ),
+        (
+            "allowed_models",
+            Box::new(|c| c.callers[1].allowed_models = vec!["claude-opus-9".to_string()]),
+        ),
+        (
+            "callers",
+            Box::new(|c| c.callers[1].caller_runtime_id = c.callers[0].caller_runtime_id.clone()),
+        ),
+    ];
+    for (field, change) in &broken {
+        let mut config = valid();
+        config.callers.push(second_caller());
+        change(&mut config);
+        assert_eq!(refused(&config), *field);
+    }
+}
+
+#[test]
+fn a_lease_caller_bills_one_configured_caller_within_that_callers_ceiling() {
+    let mut config = valid();
+    config.callers.push(second_caller());
+    let lease = |user: &str, caller: &str, instance: &str, reservation: u64| LeaseCallerConfig {
+        unix_user: user.to_string(),
+        caller_id: caller.to_string(),
+        unit_instance: instance.to_string(),
+        reservation_micro_usd: reservation,
+    };
+    // A lease caller of each caller, each within its own caller's ceiling.
+    config
+        .lease_callers
+        .push(lease("mind-heartbeat", "heartbeat", "heartbeat", 1_000_000));
+    config.validate().unwrap();
+    // The first caller's ceiling does not stretch to the second's lease, nor the reverse.
+    config.lease_callers[1].reservation_micro_usd = 1_000_001;
+    assert_eq!(refused(&config), "lease_callers");
+    config.lease_callers[1].reservation_micro_usd = 1;
+    config.lease_callers[0].reservation_micro_usd = 50_000_001;
+    assert_eq!(refused(&config), "lease_callers");
+    config.lease_callers[0].reservation_micro_usd = 50_000_000;
+    // A lease caller naming no configured caller, or sharing another's account.
+    config.lease_callers[1].caller_id = "nobody".to_string();
+    assert_eq!(refused(&config), "lease_callers");
+    config.lease_callers[1].caller_id = "heartbeat".to_string();
+    config.lease_callers[1].unix_user = config.lease_callers[0].unix_user.clone();
+    assert_eq!(refused(&config), "lease_callers");
+}
+
+#[test]
+fn add_caller_and_add_lease_caller_extend_the_document_and_grow_the_serve_limits() {
+    let scratch = Scratch::new();
+    let made = init(
+        &scratch,
+        &init_flags(
+            &scratch,
+            &[
+                "--lease-socket",
+                "/run/claude-connector/lease.sock",
+                "--lease-user",
+                "mind-eureka-self",
+                "--lease-unit-instance",
+                "eureka",
+                "--lease-reservation-micro-usd",
+                "5000000",
+            ],
+        ),
+    );
+    assert!(made.status.success(), "{}", shown(&made));
+    let path = scratch.path("connector.cc");
+    let path_text = path.to_str().unwrap();
+    let before = load_config(&path).unwrap();
+
+    let key = scratch.path("heartbeat.key");
+    let added = run(
+        &[
+            "config",
+            "add-caller",
+            path_text,
+            "--caller-id",
+            "heartbeat",
+            "--connection-key-file",
+            key.to_str().unwrap(),
+            "--connection-key-epoch",
+            "2",
+            "--allowed-model",
+            HAIKU,
+            "--spend-ceiling-micro-usd",
+            "2000000",
+            "--spend-window-ms",
+            "60000",
+            "--max-concurrent-requests",
+            "30",
+            "--max-payload-bytes",
+            "4194304",
+        ],
+        &[],
+    );
+    assert!(added.status.success(), "{}", shown(&added));
+    let leased = run(
+        &[
+            "config",
+            "add-lease-caller",
+            path_text,
+            "--lease-user",
+            "mind-heartbeat",
+            "--caller-id",
+            "heartbeat",
+            "--lease-unit-instance",
+            "heartbeat",
+            "--lease-reservation-micro-usd",
+            "1000000",
+        ],
+        &[],
+    );
+    assert!(leased.status.success(), "{}", shown(&leased));
+
+    let after = load_config(&path).unwrap();
+    assert_eq!(after.callers[0], before.callers[0]);
+    assert_eq!(after.callers.len(), 2);
+    let heartbeat = &after.callers[1];
+    assert_eq!(heartbeat.caller_runtime_id, "heartbeat");
+    assert_eq!(heartbeat.connection_key_epoch, 2);
+    assert_eq!(heartbeat.spend_ceiling_micro_usd, 2_000_000);
+    assert_eq!(heartbeat.max_payload_bytes, 4 << 20);
+    assert_eq!(after.lease_callers[0], before.lease_callers[0]);
+    assert_eq!(after.lease_callers[1].caller_id, "heartbeat");
+    // The frame carries the largest payload and the connections every slot.
+    assert!(after.max_frame_bytes > before.max_frame_bytes);
+    assert!(after.max_connections >= 34);
+    assert_eq!(after.prices, before.prices);
+    assert_eq!(
+        after.handle_secret_credential,
+        before.handle_secret_credential
+    );
+
+    // Repeating either verb is refused and leaves the document as it was.
+    let again = run(
+        &[
+            "config",
+            "add-caller",
+            path_text,
+            "--caller-id",
+            "heartbeat",
+            "--connection-key-file",
+            key.to_str().unwrap(),
+            "--connection-key-epoch",
+            "2",
+            "--allowed-model",
+            HAIKU,
+            "--spend-ceiling-micro-usd",
+            "2000000",
+            "--spend-window-ms",
+            "60000",
+        ],
+        &[],
+    );
+    assert!(!again.status.success());
+    assert_eq!(load_config(&path).unwrap(), after);
+    let unleased = run(
+        &[
+            "config",
+            "add-lease-caller",
+            path_text,
+            "--lease-user",
+            "mind-heartbeat",
+            "--caller-id",
+            "heartbeat",
+            "--lease-unit-instance",
+            "heartbeat",
+            "--lease-reservation-micro-usd",
+            "1000000",
+        ],
+        &[],
+    );
+    assert!(!unleased.status.success());
+    assert_eq!(load_config(&path).unwrap(), after);
+}
+
+#[test]
+fn add_lease_caller_needs_a_document_that_lends_a_token() {
+    let scratch = Scratch::new();
+    let made = init(&scratch, &init_flags(&scratch, &[]));
+    assert!(made.status.success(), "{}", shown(&made));
+    let path = scratch.path("connector.cc");
+    let leased = run(
+        &[
+            "config",
+            "add-lease-caller",
+            path.to_str().unwrap(),
+            "--lease-user",
+            "mind-heartbeat",
+            "--caller-id",
+            "persona-a-caller",
+            "--lease-unit-instance",
+            "heartbeat",
+            "--lease-reservation-micro-usd",
+            "1000000",
+        ],
+        &[],
+    );
+    assert!(!leased.status.success());
+    assert!(load_config(&path).unwrap().lease_callers.is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn init_creates_the_handle_secret_once_private_and_never_shows_it() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let scratch = Scratch::new();
+    let secret = scratch.path("handle.secret");
+    let made = init(&scratch, &init_flags(&scratch, &[]));
+    assert!(made.status.success(), "{}", shown(&made));
+    let metadata = std::fs::metadata(&secret).unwrap();
+    assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+    let text = std::fs::read_to_string(&secret).unwrap();
+    assert_eq!(text.len(), 64);
+    assert!(text.bytes().all(|b| b.is_ascii_hexdigit()));
+    assert!(!shown(&made).contains(&text));
+
+    // A second init keeps the secret the first one made, since handles depend on it.
+    std::fs::remove_file(scratch.path("connector.cc")).unwrap();
+    let again = init(&scratch, &init_flags(&scratch, &[]));
+    assert!(again.status.success(), "{}", shown(&again));
+    assert_eq!(std::fs::read_to_string(&secret).unwrap(), text);
+
+    // A refused document leaves no secret file behind.
+    let fresh = Scratch::new();
+    let flags = init_flags(&fresh, &["--max-payload-bytes", "1"]);
+    let refused = init(&fresh, &flags);
+    assert!(!refused.status.success());
+    assert!(!fresh.path("handle.secret").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn check_wants_the_handle_secret_credential_and_names_it() {
+    let scratch = Scratch::new();
+    let (flags, credentials) = prepare(&scratch);
+    let made = init(&scratch, &flags);
+    assert!(made.status.success(), "{}", shown(&made));
+    let config = scratch.path("connector.cc");
+    let path = config.to_str().unwrap();
+    for body in [None, Some("too-short")] {
+        let secret = credentials.join("claude-handle-secret");
+        match body {
+            None => std::fs::remove_file(&secret).unwrap(),
+            Some(text) => std::fs::write(&secret, text).unwrap(),
+        }
+        let checked = run(
+            &["config", "check", path],
+            &[("CREDENTIALS_DIRECTORY", &credentials)],
+        );
+        assert!(!checked.status.success());
+        let text = shown(&checked);
+        assert!(text.contains("handle_secret_credential"), "{text}");
+        assert!(!text.contains("too-short"), "{text}");
+    }
+}
+
+/// A document written before the handle secret had a field cannot name where
+/// the secret is, so it is not a document this connector serves from: it is
+/// refused as a store fault, to be authored again with `config init`.
+#[test]
+fn a_document_without_the_handle_secret_field_is_refused_as_a_store() {
+    let scratch = Scratch::new();
+    let path = scratch.path("old.cc");
+    let mut payload = rmp_serde::to_vec(&valid()).unwrap();
+    // array16(23) -> array16(22), and drop the trailing 20-byte fixstr.
+    assert_eq!(payload[..3], [0xdc, 0, 23]);
+    payload[2] = 22;
+    payload.truncate(payload.len() - 21);
+    store_raw(
+        &path,
+        "runtime",
+        ClaudeConnectorConfig::TYPE,
+        Some(ClaudeConnectorConfig::TYPE),
+        payload,
+    );
+    assert!(matches!(load_config(&path), Err(ConfigError::Store)));
+}
+
+#[test]
+fn the_handle_secret_credential_is_a_name_of_its_own() {
+    for name in ["claude-token", "a/b", "", ".."] {
+        let mut config = valid();
+        config.handle_secret_credential = name.to_string();
+        assert_eq!(refused(&config), "handle_secret_credential", "{name:?}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn init_refuses_a_secret_file_it_cannot_create_and_writes_no_document() {
+    let scratch = Scratch::new();
+    let mut flags = init_flags(&scratch, &[]);
+    let at = flags
+        .iter()
+        .position(|f| f == "--handle-secret-file")
+        .unwrap();
+    flags[at + 1] = scratch
+        .path("absent/handle.secret")
+        .to_string_lossy()
+        .into_owned();
+    let made = init(&scratch, &flags);
+    assert!(!made.status.success());
+    assert!(!scratch.path("connector.cc").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn config_init_keeps_an_existing_secret_file_only_if_it_is_usable() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    let write = |path: &Path, bytes: usize, mode: u32| {
+        std::fs::write(path, "k".repeat(bytes)).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    };
+    type Plant = fn(&Scratch, &Path);
+    let refused: Vec<(&str, Plant)> = vec![
+        ("world readable", |_, p| {
+            std::fs::write(p, "k".repeat(64)).unwrap();
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }),
+        ("group writable", |_, p| {
+            std::fs::write(p, "k".repeat(64)).unwrap();
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o660)).unwrap();
+        }),
+        ("read only", |_, p| {
+            std::fs::write(p, "k".repeat(64)).unwrap();
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o400)).unwrap();
+        }),
+        ("one byte short", |_, p| {
+            std::fs::write(p, "k".repeat(31)).unwrap();
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }),
+        ("empty", |_, p| {
+            std::fs::write(p, "").unwrap();
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }),
+        ("a directory", |_, p| {
+            std::fs::create_dir(p).unwrap();
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }),
+        ("a link to a good file", |s, p| {
+            let target = s.path("elsewhere.secret");
+            std::fs::write(&target, "k".repeat(64)).unwrap();
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+            symlink(&target, p).unwrap();
+        }),
+    ];
+    for (name, plant) in refused {
+        let scratch = Scratch::new();
+        let flags = init_flags(&scratch, &[]);
+        let secret = scratch.path("handle.secret");
+        plant(&scratch, &secret);
+        let before = std::fs::symlink_metadata(&secret).unwrap();
+        let made = init(&scratch, &flags);
+        assert!(!made.status.success(), "{name} was accepted");
+        assert!(shown(&made).contains("--handle-secret-file"), "{name}");
+        assert!(!shown(&made).contains("kkkk"), "{name}");
+        assert!(
+            !scratch.path("connector.cc").exists(),
+            "{name} left a document"
+        );
+        let after = std::fs::symlink_metadata(&secret).unwrap();
+        assert_eq!(
+            before.permissions().mode(),
+            after.permissions().mode(),
+            "{name}"
+        );
+        assert_eq!(before.len(), after.len(), "{name}");
+        assert_eq!(
+            before.file_type().is_symlink(),
+            after.file_type().is_symlink(),
+            "{name}"
+        );
+    }
+
+    // The smallest usable file is accepted and left exactly as it was.
+    let scratch = Scratch::new();
+    let flags = init_flags(&scratch, &[]);
+    let secret = scratch.path("handle.secret");
+    write(&secret, 32, 0o600);
+    let made = init(&scratch, &flags);
+    assert!(made.status.success(), "{}", shown(&made));
+    assert_eq!(std::fs::read_to_string(&secret).unwrap(), "k".repeat(32));
+    assert!(scratch.path("connector.cc").exists());
 }
