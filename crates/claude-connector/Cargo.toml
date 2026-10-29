@@ -7,6 +7,9 @@ license.workspace = true
 repository.workspace = true
 publish = false
 
+[[bin]]
+name = "claude-connector"
+path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
