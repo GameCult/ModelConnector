@@ -11,11 +11,15 @@ use std::time::Duration;
 
 use cultcache_rs::{CultCache, DatabaseEntry, SingleFileMessagePackBackingStore};
 use model_connector::{
-    CallerConfig, MIN_PAYLOAD_BYTES, ModelPrice, ServeError, ServeLimits, load_admissions, serve,
+    CallerAdmission, CallerConfig, MIN_PAYLOAD_BYTES, ModelPrice, ServeError, ServeLimits,
+    ServiceError, load_admissions, serve,
 };
 use thiserror::Error;
 
-use crate::{ClaudeCodeBackend, ClaudeCodeConfig, ClaudeCodeLimits, StderrSink};
+use crate::backend::readiness;
+use crate::{
+    ClaudeCodeBackend, ClaudeCodeConfig, ClaudeCodeLimits, CredentialTokenSource, StderrSink,
+};
 
 const CONFIG_KEY: &str = "runtime";
 const MODEL_PREFIX: &str = "claude-";
@@ -81,8 +85,39 @@ pub enum ConfigError {
     PromptDir,
     #[error("the listener could not be bound")]
     Listen,
-    #[error(transparent)]
-    Serve(#[from] ServeError),
+    /// Something the document names exists but cannot be used now.
+    #[error("the configured {0} cannot be used")]
+    Unusable(&'static str),
+    /// The serve loop failed after it started.
+    #[error("the serve loop failed at {0}")]
+    Serving(&'static str),
+}
+
+/// The kit's serve errors carry stored paths, ids and numbers; none of that
+/// text is shown. Each maps to the configuration field or stage it names.
+impl From<ServeError> for ConfigError {
+    fn from(error: ServeError) -> Self {
+        match error {
+            ServeError::InvalidConfig(field) | ServeError::BackendUnready(field) => {
+                Self::Unusable(field)
+            }
+            ServeError::FrameBound { .. } => Self::Invalid("max_frame_bytes"),
+            ServeError::ConnectionKey(_) => Self::Unusable("connection_key_file"),
+            ServeError::Service(error) => match error {
+                ServiceError::ReplayStore(_) => Self::Unusable("replay_store"),
+                ServiceError::UnpricedModel(_) => Self::Invalid("prices"),
+                ServiceError::InvalidAdmission
+                | ServiceError::DuplicateCaller
+                | ServiceError::SharedCallerKey => Self::Invalid("callers"),
+                _ => Self::Serving("service"),
+            },
+            ServeError::ServicePoisoned => Self::Serving("service"),
+            ServeError::Listen(_) => Self::Serving("listener"),
+            ServeError::Thread(_) | ServeError::Connection(_) => Self::Serving("connection"),
+            ServeError::FrameSize | ServeError::FrameEncoding => Self::Serving("frame"),
+            ServeError::Clock => Self::Serving("clock"),
+        }
+    }
 }
 
 impl ClaudeConnectorConfig {
@@ -162,7 +197,11 @@ impl ClaudeConnectorConfig {
                 return Err(ConfigError::Invalid("allowed_models"));
             }
         }
-        if !self.prices.keys().all(|model| is_canonical_model(model)) {
+        if !self
+            .prices
+            .iter()
+            .all(|(model, price)| is_canonical_model(model) && is_fully_priced(price))
+        {
             return Err(ConfigError::Invalid("prices"));
         }
         Ok(listen)
@@ -200,14 +239,45 @@ fn is_trimmed_nonempty(text: &str) -> bool {
     !text.is_empty() && text.trim() == text
 }
 
-/// A model id the CLI echoes back unchanged: aliases are refused because the
-/// stream's `init.model` must equal the requested model.
+/// A model id the CLI echoes back unchanged: `claude-<family>-<major>-<minor>`
+/// with an optional `-YYYYMMDD` suffix, the family lowercase letters. Aliases
+/// and bare prefixes are refused because the stream's `init.model` must equal
+/// the requested model.
 fn is_canonical_model(model: &str) -> bool {
-    model.starts_with(MODEL_PREFIX)
-        && model.len() > MODEL_PREFIX.len()
-        && model
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_'))
+    let Some(rest) = model.strip_prefix(MODEL_PREFIX) else {
+        return false;
+    };
+    let digits = |part: &str, most: usize| {
+        (1..=most).contains(&part.len()) && part.bytes().all(|byte| byte.is_ascii_digit())
+    };
+    let mut parts = rest.split('-');
+    let family = parts.next().unwrap_or("");
+    let major = parts.next().unwrap_or("");
+    let minor = parts.next().unwrap_or("");
+    let date = parts.next();
+    !family.is_empty()
+        && family.bytes().all(|byte| byte.is_ascii_lowercase())
+        && digits(major, 2)
+        && digits(minor, 2)
+        && date.is_none_or(|date| date.len() == 8 && digits(date, 8))
+        && parts.next().is_none()
+}
+
+/// A price is a fuse only if every component it bills is nonzero: a zero rate
+/// lets a call cost nothing against the caller's ceiling.
+fn is_fully_priced(price: &ModelPrice) -> bool {
+    let long = price.long_context.map(|long| long.rates);
+    [Some(price.rates), long].into_iter().flatten().all(|rates| {
+        [
+            rates.input,
+            rates.cache_write_short,
+            rates.cache_write_long,
+            rates.cache_read,
+            rates.output,
+        ]
+        .iter()
+        .all(|rate| *rate > 0)
+    })
 }
 
 /// One file name under `$CREDENTIALS_DIRECTORY`, never a path.
@@ -286,24 +356,49 @@ pub fn check_prompt_dir(dir: &Path) -> Result<(), ConfigError> {
 
 /// The child's stderr is the log's business by size only: its bytes are never
 /// written anywhere the connector controls.
-struct LogSink;
+struct LogSink<W>(std::sync::Mutex<W>);
 
-impl StderrSink for LogSink {
+impl<W: std::io::Write + Send> StderrSink for LogSink<W> {
     fn stderr_tail(&self, tail: &[u8]) {
-        eprintln!("claude-connector: child stderr, {} bytes", tail.len());
+        if let Ok(mut log) = self.0.lock() {
+            let _ = writeln!(log, "claude-connector: child stderr, {} bytes", tail.len());
+        }
     }
+}
+
+/// Everything `serve` needs true before it binds, in one place so that
+/// `config check` passes exactly what `serve` will start: the prompt
+/// directory, the other directories, the credential, the pin, the connection
+/// key and the frame and connection bounds. Returns the admitted callers.
+fn readiness_of(config: &ClaudeConnectorConfig) -> Result<Vec<CallerAdmission>, ConfigError> {
+    config.validate()?;
+    #[cfg(unix)]
+    check_prompt_dir(&config.prompt_dir)?;
+    let admissions = load_admissions(&config.callers)?;
+    config.serve_limits().validate(&admissions)?;
+    let backend = config.backend_config();
+    readiness(
+        &backend,
+        &CredentialTokenSource::from_environment(backend.token_credential.clone()),
+    )
+    .map_err(ConfigError::Unusable)?;
+    Ok(admissions)
+}
+
+/// Whether `serve` would start with this document and this environment.
+pub fn check_ready(config: &ClaudeConnectorConfig) -> Result<(), ConfigError> {
+    readiness_of(config).map(drop)
 }
 
 /// Loads the document and serves until the listener fails.
 #[cfg(unix)]
 pub fn serve_config(path: &Path) -> Result<(), ConfigError> {
     let config = load_config(path)?;
+    let admissions = readiness_of(&config)?;
     let listen = config.validate()?;
-    check_prompt_dir(&config.prompt_dir)?;
-    let admissions = load_admissions(&config.callers)?;
     let backend = Arc::new(ClaudeCodeBackend::new(
         config.backend_config(),
-        Box::new(LogSink),
+        Box::new(LogSink(std::sync::Mutex::new(std::io::stderr()))),
     ));
     let listener = TcpListener::bind(listen).map_err(|_| ConfigError::Listen)?;
     serve(
@@ -315,4 +410,108 @@ pub fn serve_config(path: &Path) -> Result<(), ConfigError> {
         backend,
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use super::*;
+
+    /// A log that a test can read back.
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn the_log_gets_the_size_of_the_childs_stderr_and_never_its_bytes() {
+        let log = Captured::default();
+        let sink = LogSink(Mutex::new(log.clone()));
+        sink.stderr_tail(b"canary-stderr-text, 22 bytes");
+        let written = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+        assert_eq!(written, "claude-connector: child stderr, 28 bytes
+");
+        assert!(!written.contains("canary"));
+    }
+
+    #[cfg(unix)]
+    mod prompt_dir {
+        use std::os::unix::fs::{PermissionsExt, chown, symlink};
+        use std::path::PathBuf;
+
+        use super::super::check_prompt_dir;
+
+        struct Dir(PathBuf);
+
+        impl Dir {
+            fn new(name: &str) -> Self {
+                let path = std::env::temp_dir()
+                    .join(format!("claude-prompt-dir-{}-{name}", std::process::id()));
+                let _ = std::fs::remove_dir_all(&path);
+                std::fs::create_dir_all(&path).unwrap();
+                Self(path)
+            }
+            fn mode(&self, mode: u32) {
+                std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(mode)).unwrap();
+            }
+        }
+
+        impl Drop for Dir {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        #[test]
+        fn only_mode_0700_passes() {
+            let dir = Dir::new("modes");
+            dir.mode(0o700);
+            assert!(check_prompt_dir(&dir.0).is_ok());
+            // Each of these leaves the owner able to enter, or adds a bit
+            // beyond the owner's three; all are refused.
+            for mode in [
+                0o500, 0o300, 0o100, 0o600, 0o770, 0o707, 0o750, 0o755, 0o1700, 0o2700, 0o4700,
+            ] {
+                dir.mode(mode);
+                assert!(check_prompt_dir(&dir.0).is_err(), "{mode:o}");
+            }
+        }
+
+        #[test]
+        fn a_link_to_a_good_directory_is_refused() {
+            let dir = Dir::new("link-target");
+            dir.mode(0o700);
+            let link = std::env::temp_dir()
+                .join(format!("claude-prompt-dir-{}-link", std::process::id()));
+            let _ = std::fs::remove_file(&link);
+            symlink(&dir.0, &link).unwrap();
+            let refused = check_prompt_dir(&link).is_err();
+            std::fs::remove_file(&link).unwrap();
+            assert!(refused);
+        }
+
+        #[test]
+        fn a_directory_owned_by_another_user_is_refused() {
+            // SAFETY: geteuid has no preconditions and cannot fail.
+            if unsafe { libc::geteuid() } != 0 {
+                eprintln!("skipped: only root can give a directory away");
+                return;
+            }
+            let dir = Dir::new("owner");
+            dir.mode(0o700);
+            assert!(check_prompt_dir(&dir.0).is_ok());
+            chown(&dir.0, Some(1234), None).unwrap();
+            assert!(check_prompt_dir(&dir.0).is_err());
+        }
+    }
 }

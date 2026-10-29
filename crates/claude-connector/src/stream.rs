@@ -8,7 +8,8 @@ use serde::Deserialize;
 use serde_json::Value;
 
 /// A call that cannot complete, with the stage that failed. `usage` is `None`
-/// unless a result event reported it.
+/// (the kit bills its reservation) unless a result event reported it or the
+/// call never reached the provider (zero).
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Failure {
     pub kind: FailureKind,
@@ -17,11 +18,22 @@ pub(crate) struct Failure {
 }
 
 impl Failure {
-    pub(crate) fn unbilled(kind: FailureKind, message: &'static str) -> Self {
+    /// A failure after the child ran: what the provider billed is unknown, so
+    /// the kit bills its reservation.
+    pub(crate) fn cost_unknown(kind: FailureKind, message: &'static str) -> Self {
         Self {
             kind,
             message,
             usage: None,
+        }
+    }
+
+    /// A failure before anything was sent to the provider: it bills nothing.
+    pub(crate) fn never_reached(kind: FailureKind, message: &'static str) -> Self {
+        Self {
+            kind,
+            message,
+            usage: Some(sum_usage(std::iter::empty())),
         }
     }
 }
@@ -252,7 +264,7 @@ impl<'a> StreamState<'a> {
 }
 
 fn fail(kind: FailureKind, message: &'static str) -> Step {
-    Step::Done(Box::new(Err(Failure::unbilled(kind, message))))
+    Step::Done(Box::new(Err(Failure::cost_unknown(kind, message))))
 }
 
 /// What this turn consumed, summed over every model it used (harness side

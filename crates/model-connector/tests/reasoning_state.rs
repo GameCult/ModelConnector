@@ -38,8 +38,8 @@ impl RecordingBackend {
 }
 
 impl ProviderBackend for RecordingBackend {
-    fn ready(&self) -> bool {
-        true
+    fn ready(&self) -> Result<(), &'static str> {
+        Ok(())
     }
 
     fn provider(&self) -> &str {
@@ -291,8 +291,8 @@ struct TamperingBackend {
 }
 
 impl ProviderBackend for TamperingBackend {
-    fn ready(&self) -> bool {
-        true
+    fn ready(&self) -> Result<(), &'static str> {
+        Ok(())
     }
 
     fn provider(&self) -> &str {

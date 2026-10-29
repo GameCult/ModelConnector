@@ -13,7 +13,7 @@ mod stream;
 
 pub use backend::{ClaudeCodeBackend, CredentialTokenSource, StderrSink, TokenSource};
 pub use config::{ClaudeCodeConfig, ClaudeCodeLimits};
-pub use daemon::{ClaudeConnectorConfig, ConfigError, load_config, write_config};
+pub use daemon::{ClaudeConnectorConfig, ConfigError, check_ready, load_config, write_config};
 #[cfg(unix)]
 pub use daemon::{check_prompt_dir, serve_config};
 pub use handle::{FsSessionStore, SessionStore};

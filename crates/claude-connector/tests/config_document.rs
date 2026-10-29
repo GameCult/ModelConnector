@@ -15,7 +15,7 @@ use cultcache_rs::{
 use model_connector::{CallerConfig, MIN_PAYLOAD_BYTES, ModelPrice, Rates};
 
 const CANARY: &str = "canary-9f3b7c1d";
-const OPUS: &str = "claude-opus-5";
+const OPUS: &str = "claude-opus-5-1";
 const HAIKU: &str = "claude-haiku-5-5";
 
 /// An edit that should make the valid document refuse.
@@ -263,6 +263,48 @@ fn config_refuses_aliases_unpriced_models_and_second_callers() {
             }),
         ),
         (
+            "family only",
+            Box::new(|c| {
+                c.callers[0].allowed_models = vec!["claude-haiku".to_string()];
+                c.prices.insert("claude-haiku".to_string(), price());
+            }),
+        ),
+        (
+            "latest alias",
+            Box::new(|c| {
+                c.callers[0].allowed_models = vec!["claude-sonnet-latest".to_string()];
+                c.prices.insert("claude-sonnet-latest".to_string(), price());
+            }),
+        ),
+        (
+            "no minor",
+            Box::new(|c| {
+                c.callers[0].allowed_models = vec!["claude-opus-5".to_string()];
+                c.prices.insert("claude-opus-5".to_string(), price());
+            }),
+        ),
+        (
+            "uppercase family",
+            Box::new(|c| {
+                c.callers[0].allowed_models = vec!["claude-Opus-5-1".to_string()];
+                c.prices.insert("claude-Opus-5-1".to_string(), price());
+            }),
+        ),
+        (
+            "short date",
+            Box::new(|c| {
+                c.callers[0].allowed_models = vec!["claude-opus-5-1-2026".to_string()];
+                c.prices.insert("claude-opus-5-1-2026".to_string(), price());
+            }),
+        ),
+        (
+            "trailing part",
+            Box::new(|c| {
+                c.callers[0].allowed_models = vec!["claude-opus-5-1-20260101-x".to_string()];
+                c.prices.insert("claude-opus-5-1-20260101-x".to_string(), price());
+            }),
+        ),
+        (
             "unpriced allowed",
             Box::new(|c| {
                 c.prices.remove(OPUS);
@@ -295,6 +337,12 @@ fn config_refuses_aliases_unpriced_models_and_second_callers() {
         "allowed_models",
         "allowed_models",
         "allowed_models",
+        "allowed_models",
+        "allowed_models",
+        "allowed_models",
+        "allowed_models",
+        "allowed_models",
+        "allowed_models",
         "callers",
         "callers",
     ];
@@ -303,6 +351,44 @@ fn config_refuses_aliases_unpriced_models_and_second_callers() {
         change(&mut config);
         assert_eq!(refused(&config), field, "{name}");
     }
+}
+
+#[test]
+fn a_dated_canonical_id_is_allowed() {
+    let dated = "claude-opus-5-1-20260101".to_string();
+    let mut config = valid();
+    config.callers[0].allowed_models = vec![dated.clone()];
+    config.prices.insert(dated, price());
+    config.validate().unwrap();
+}
+
+#[test]
+fn a_price_with_a_zero_billed_component_is_refused() {
+    let zeroed: Vec<(&str, fn(&mut Rates))> = vec![
+        ("input", |r| r.input = 0),
+        ("cache_write_short", |r| r.cache_write_short = 0),
+        ("cache_write_long", |r| r.cache_write_long = 0),
+        ("cache_read", |r| r.cache_read = 0),
+        ("output", |r| r.output = 0),
+    ];
+    for (name, zero) in &zeroed {
+        let mut config = valid();
+        zero(&mut config.prices.get_mut(HAIKU).unwrap().rates);
+        assert_eq!(refused(&config), "prices", "{name}");
+
+        let mut config = valid();
+        let mut long = price().rates;
+        zero(&mut long);
+        config.prices.get_mut(HAIKU).unwrap().long_context = Some(model_connector::LongContext {
+            above_prompt_tokens: 200_000,
+            rates: long,
+        });
+        assert_eq!(refused(&config), "prices", "long context {name}");
+    }
+    // A zero overhead is not a rate.
+    let mut config = valid();
+    config.prices.get_mut(HAIKU).unwrap().overhead_tokens = 0;
+    config.validate().unwrap();
 }
 
 #[test]
@@ -522,7 +608,7 @@ fn init(scratch: &Scratch, flags: &[String]) -> Output {
 }
 
 #[test]
-fn config_init_then_check_reports_counts_only() {
+fn config_init_writes_the_flags_into_the_document() {
     let scratch = Scratch::new();
     let made = init(&scratch, &init_flags(&scratch, &[]));
     assert!(made.status.success(), "{}", shown(&made));
@@ -532,20 +618,155 @@ fn config_init_then_check_reports_counts_only() {
     assert_eq!(config.prices[HAIKU].rates.cache_write_long, 1_250_000);
     assert_eq!(config.prices[HAIKU].overhead_tokens, 100);
     assert_eq!(config.claude_binary_sha256, [0xab; 32]);
+}
 
+/// A scratch directory in which `serve` would start: every directory, the
+/// pinned binary, the connection key and the credential exist. Returns the
+/// `config init` flags and the credential directory.
+#[cfg(unix)]
+fn prepare(scratch: &Scratch) -> (Vec<String>, PathBuf) {
+    use sha2::{Digest, Sha256};
+    use std::os::unix::fs::PermissionsExt;
+
+    for name in ["work", "home", "prompts", "credentials"] {
+        std::fs::create_dir_all(scratch.path(name)).unwrap();
+    }
+    std::fs::set_permissions(
+        scratch.path("prompts"),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    std::fs::write(scratch.path("credentials/claude-token"), CANARY).unwrap();
+    std::fs::write(scratch.path("caller.key"), "caller-secret").unwrap();
+    std::fs::write(scratch.path("claude"), b"pinned claude").unwrap();
+    let sha: String = Sha256::digest(b"pinned claude")
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let mut flags = init_flags(scratch, &[]);
+    let at = flags.iter().position(|flag| flag == "--claude-sha256").unwrap();
+    flags[at + 1] = sha;
+    (flags, scratch.path("credentials"))
+}
+
+#[cfg(unix)]
+fn check_and_serve(config: &Path, credentials: Option<&Path>) -> (Output, Output) {
+    let envs: Vec<(&str, &Path)> = credentials
+        .map(|dir| ("CREDENTIALS_DIRECTORY", dir))
+        .into_iter()
+        .collect();
+    let path = config.to_str().unwrap();
+    (
+        run(&["config", "check", path], &envs),
+        run(&["serve", "--config", path], &envs),
+    )
+}
+
+#[cfg(unix)]
+#[test]
+fn check_passes_a_document_serve_can_start_and_reports_counts_only() {
+    let scratch = Scratch::new();
+    let (flags, credentials) = prepare(&scratch);
+    let made = init(&scratch, &flags);
+    assert!(made.status.success(), "{}", shown(&made));
     let checked = run(
         &[
             "config",
             "check",
             scratch.path("connector.cc").to_str().unwrap(),
         ],
-        &[],
+        &[("CREDENTIALS_DIRECTORY", &credentials)],
     );
-    assert!(checked.status.success());
+    assert!(checked.status.success(), "{}", shown(&checked));
     let text = shown(&checked);
     assert!(text.contains("callers: 1") && text.contains("allowed_models: 1"));
     assert!(text.contains("prices: 1"));
-    assert!(!text.contains("persona-a") && !text.contains(HAIKU));
+    for secret in ["persona-a", HAIKU, CANARY, "caller-secret"] {
+        assert!(!text.contains(secret), "{text}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn check_refuses_exactly_what_serve_refuses_and_names_the_field() {
+    use std::os::unix::fs::PermissionsExt;
+
+    type Break = fn(&Scratch, &Path);
+    let cases: Vec<(&str, &str, Break)> = vec![
+        ("open prompt dir", "prompt directory", |s, _| {
+            std::fs::set_permissions(s.path("prompts"), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+        }),
+        ("no key file", "connection_key_file", |s, _| {
+            std::fs::remove_file(s.path("caller.key")).unwrap();
+        }),
+        ("binary off its pin", "claude_binary_sha256", |s, _| {
+            std::fs::write(s.path("claude"), b"other bytes").unwrap();
+        }),
+        ("no credential", "token_credential", |_, credentials| {
+            std::fs::remove_file(credentials.join("claude-token")).unwrap();
+        }),
+        ("no work dir", "work_dir", |s, _| {
+            std::fs::remove_dir(s.path("work")).unwrap();
+        }),
+        ("no config dir", "config_dir", |s, _| {
+            std::fs::remove_dir(s.path("home")).unwrap();
+        }),
+        ("frame too small", "max_frame_bytes", |s, _| {
+            let path = s.path("connector.cc");
+            let mut config = load_config(&path).unwrap();
+            config.max_frame_bytes = 4099;
+            write_config(&path, &config).unwrap();
+        }),
+        ("too few connections", "connection capacity", |s, _| {
+            let path = s.path("connector.cc");
+            let mut config = load_config(&path).unwrap();
+            config.max_connections = 1;
+            write_config(&path, &config).unwrap();
+        }),
+    ];
+    for (name, field, break_it) in cases {
+        let scratch = Scratch::new();
+        let (flags, credentials) = prepare(&scratch);
+        let made = init(&scratch, &flags);
+        assert!(made.status.success(), "{name}: {}", shown(&made));
+        break_it(&scratch, &credentials);
+        let (checked, served) = check_and_serve(&scratch.path("connector.cc"), Some(&credentials));
+        assert!(!checked.status.success(), "{name} check passed");
+        assert!(!served.status.success(), "{name} serve started");
+        assert!(shown(&checked).contains(field), "{name}: {}", shown(&checked));
+        assert_eq!(shown(&checked), shown(&served), "{name}");
+        for secret in [CANARY, "caller-secret", "other bytes"] {
+            assert!(!shown(&checked).contains(secret), "{name}");
+        }
+    }
+
+    // No credential directory at all is the same refusal.
+    let scratch = Scratch::new();
+    let (flags, _) = prepare(&scratch);
+    assert!(init(&scratch, &flags).status.success());
+    let (checked, served) = check_and_serve(&scratch.path("connector.cc"), None);
+    assert!(!checked.status.success() && !served.status.success());
+    assert!(shown(&checked).contains("token_credential"));
+    assert_eq!(shown(&checked), shown(&served));
+}
+
+#[cfg(unix)]
+#[test]
+fn serve_names_a_corrupt_replay_store_without_its_path() {
+    let scratch = Scratch::new();
+    let (mut flags, credentials) = prepare(&scratch);
+    let store = scratch.path(&format!("{CANARY}-store/replay.cc"));
+    std::fs::create_dir_all(store.parent().unwrap()).unwrap();
+    std::fs::write(&store, b"not a cultcache store").unwrap();
+    let at = flags.iter().position(|flag| flag == "--replay-store").unwrap();
+    flags[at + 1] = store.to_string_lossy().into_owned();
+    assert!(init(&scratch, &flags).status.success());
+    let (_, served) = check_and_serve(&scratch.path("connector.cc"), Some(&credentials));
+    assert!(!served.status.success());
+    let text = shown(&served);
+    assert!(text.contains("replay_store"), "{text}");
+    assert!(!text.contains(CANARY) && !text.contains("replay.cc"), "{text}");
 }
 
 #[test]

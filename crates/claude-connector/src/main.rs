@@ -12,7 +12,9 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use claude_connector::{ClaudeConnectorConfig, ConfigError, load_config, write_config};
+use claude_connector::{
+    ClaudeConnectorConfig, ConfigError, check_ready, load_config, write_config,
+};
 use model_connector::{CallerConfig, ModelPrice, Rates, frame_bytes_for_payload};
 
 fn main() -> ExitCode {
@@ -59,7 +61,8 @@ fn serve(_: &str) -> Result<(), Failure> {
 
 fn check(path: &str) -> Result<(), Failure> {
     let config = load_config(path.as_ref())?;
-    println!("claude connector configuration is valid");
+    check_ready(&config)?;
+    println!("claude connector configuration is valid and ready to serve");
     println!("callers: {}", config.callers.len());
     println!("allowed_models: {}", config.callers[0].allowed_models.len());
     println!("prices: {}", config.prices.len());

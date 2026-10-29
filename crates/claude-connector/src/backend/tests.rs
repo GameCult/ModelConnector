@@ -633,7 +633,7 @@ fn ready_checks_the_pinned_binary_digest() {
     std::fs::create_dir_all(&cfg).unwrap();
     let binary = dir.path().join("claude");
 
-    let ready = |sha: [u8; 32], binary: &Path, work: &Path, prompts: &Path, token: bool| {
+    let ready_field = |sha: [u8; 32], binary: &Path, work: &Path, prompts: &Path, token: bool| {
         let mut config = config(dir.path(), INSTANCE, limits());
         config.claude_binary = binary.to_path_buf();
         config.claude_binary_sha256 = sha;
@@ -643,8 +643,27 @@ fn ready_checks_the_pinned_binary_digest() {
         let tokens = Box::new(FixedToken(token.then_some("t")));
         ready_backend(config, tokens).ready()
     };
+    let ready = |sha: [u8; 32], binary: &Path, work: &Path, prompts: &Path, token: bool| {
+        ready_field(sha, binary, work, prompts, token).is_ok()
+    };
     let prompts = dir.path().join("prompts");
     let pin = pin_of(PINNED);
+    assert_eq!(
+        ready_field([0; 32], &binary, &work, &prompts, true),
+        Err("claude_binary_sha256")
+    );
+    assert_eq!(
+        ready_field(pin, &binary, &dir.path().join("absent"), &prompts, true),
+        Err("work_dir")
+    );
+    assert_eq!(
+        ready_field(pin, &binary, &work, &dir.path().join("absent"), true),
+        Err("prompt_dir")
+    );
+    assert_eq!(
+        ready_field(pin, &binary, &work, &prompts, false),
+        Err("token_credential")
+    );
 
     assert!(ready(pin, &binary, &work, &prompts, true));
     assert!(!ready([0; 32], &binary, &work, &prompts, true), "other pin");
@@ -702,7 +721,7 @@ fn token_comes_from_the_credential_file_not_the_environment() {
     let mut door = Door::new();
 
     // The variable is set and the file is absent: nothing to give the child.
-    assert!(!backend.ready());
+    assert_eq!(backend.ready(), Err("token_credential"));
     let (claim, _) = door.begin(request(vec![user("hi")]));
     let (kind, message, usage) = failure_of(&backend.execute(claim.call()));
     assert_eq!(kind, FailureKind::Authentication);
@@ -717,7 +736,7 @@ fn token_comes_from_the_credential_file_not_the_environment() {
         format!("{CANARY_TOKEN}\n"),
     )
     .unwrap();
-    assert!(backend.ready());
+    assert_eq!(backend.ready(), Ok(()));
     let mut door = Door::new();
     let (claim, _) = door.begin(request(vec![user("hi")]));
     let result = backend.execute(claim.call());
@@ -730,7 +749,7 @@ fn token_comes_from_the_credential_file_not_the_environment() {
 
     // An empty credential is no token.
     std::fs::write(credentials.join("claude-token"), "\n").unwrap();
-    assert!(!backend.ready());
+    assert_eq!(backend.ready(), Err("token_credential"));
 }
 
 #[test]
@@ -1369,9 +1388,11 @@ fn a_port_that_cannot_spawn_is_a_provider_failure() {
     );
     let mut door = Door::new();
     let (claim, _) = door.begin(request(vec![user("hi")]));
-    let (kind, message, usage) = failure_of(&backend.execute(claim.call()));
+    let result = backend.execute(claim.call());
+    let (kind, message, usage) = failure_of(&result);
     assert_eq!(kind, FailureKind::Provider);
-    assert_eq!(usage, None);
+    assert_eq!(usage, Some(usage_zero()), "a child that never ran bills nothing");
+    assert_eq!(parts(&result).1.cost_micro_usd, 0);
     assert!(
         !message.contains(dir.path().to_str().unwrap()),
         "no path in a message"
@@ -1619,12 +1640,14 @@ fn prompt_file_lives_in_prompt_dir_exclusively() {
         Some(rig.dir.path().join("prompts").as_path())
     );
 
-    // A prompt directory that cannot take the file fails staging: the failure
-    // is the unbilled constructor's, and no child runs.
+    // A prompt directory that cannot take the file fails staging: nothing
+    // reached the provider, so it bills nothing, and no child runs.
     let rig = rig_for(INSTANCE, vec![ok_script(SESSION, "x")], &[SESSION], b"");
     std::fs::remove_dir_all(rig.dir.path().join("prompts")).unwrap();
-    let (kind, _, usage) = failure_of(&rig.run(request(vec![user("hi")])));
-    assert_eq!((kind, usage), (FailureKind::Provider, None));
+    let result = rig.run(request(vec![user("hi")]));
+    let (kind, _, usage) = failure_of(&result);
+    assert_eq!((kind, usage), (FailureKind::Provider, Some(usage_zero())));
+    assert_eq!(parts(&result).1.cost_micro_usd, 0);
     assert_eq!(rig.spawns(), 0);
 }
 
@@ -1638,8 +1661,10 @@ fn pin_is_checked_before_every_spawn() {
 
     // The binary is swapped after readiness: the next call never spawns.
     std::fs::write(&binary, b"swapped bytes").unwrap();
-    let (kind, message, usage) = failure_of(&rig.run(request(vec![user("hi")])));
-    assert_eq!((kind, usage), (FailureKind::Provider, None));
+    let result = rig.run(request(vec![user("hi")]));
+    let (kind, message, usage) = failure_of(&result);
+    assert_eq!((kind, usage), (FailureKind::Provider, Some(usage_zero())));
+    assert_eq!(parts(&result).1.cost_micro_usd, 0, "billed nothing, not the reservation");
     assert!(!message.contains(rig.dir.path().to_str().unwrap()));
     assert_eq!(rig.spawns(), 1, "no child for a binary off its pin");
     assert!(!rig.backend.binary_matches_pin());

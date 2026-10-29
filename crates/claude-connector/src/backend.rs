@@ -110,12 +110,7 @@ impl ClaudeCodeBackend {
     /// The one pin check: `ready` and every spawn use it, and nothing caches
     /// its answer.
     fn binary_matches_pin(&self) -> bool {
-        let Ok(mut file) = File::open(&self.config.claude_binary) else {
-            return false;
-        };
-        let mut hasher = Sha256::new();
-        io::copy(&mut file, &mut hasher).is_ok()
-            && <[u8; 32]>::from(hasher.finalize()) == self.config.claude_binary_sha256
+        binary_matches_pin(&self.config)
     }
 
     fn run(&self, request: &ProviderRequest) -> (Vec<TransportEvent>, TransportOutcome) {
@@ -137,13 +132,13 @@ impl ClaudeCodeBackend {
             );
         };
         if !self.binary_matches_pin() {
-            return failure(Failure::unbilled(
+            return failure(Failure::never_reached(
                 FailureKind::Provider,
                 "claude-code: the claude binary does not match its pin",
             ));
         }
         let Ok(prompt) = PromptFile::create(&self.config.prompt_dir, &request.instructions) else {
-            return failure(Failure::unbilled(
+            return failure(Failure::never_reached(
                 FailureKind::Provider,
                 "claude-code: the system prompt could not be staged",
             ));
@@ -159,7 +154,7 @@ impl ClaudeCodeBackend {
             stdin_bytes(plan.blocks()),
         );
         let Ok(mut child) = spawned else {
-            return failure(Failure::unbilled(
+            return failure(Failure::never_reached(
                 FailureKind::Provider,
                 "claude-code: the child could not be spawned",
             ));
@@ -224,12 +219,8 @@ impl ClaudeCodeBackend {
 }
 
 impl ProviderBackend for ClaudeCodeBackend {
-    fn ready(&self) -> bool {
-        self.config.work_dir.is_dir()
-            && self.config.config_dir.is_dir()
-            && self.config.prompt_dir.is_dir()
-            && self.tokens.read().is_some()
-            && self.binary_matches_pin()
+    fn ready(&self) -> Result<(), &'static str> {
+        readiness(&self.config, self.tokens.as_ref())
     }
 
     fn provider(&self) -> &str {
@@ -256,19 +247,19 @@ fn read_stream(
                 }
             }
             StdoutRead::Eof => {
-                return Err(Failure::unbilled(
+                return Err(Failure::cost_unknown(
                     FailureKind::Provider,
                     "claude-code: the stream ended without a result",
                 ));
             }
             StdoutRead::Timeout => {
-                return Err(Failure::unbilled(
+                return Err(Failure::cost_unknown(
                     FailureKind::Timeout,
                     "claude-code: the deadline passed before a result",
                 ));
             }
             StdoutRead::Breach => {
-                return Err(Failure::unbilled(
+                return Err(Failure::cost_unknown(
                     FailureKind::Provider,
                     "claude-code: the output passed its size cap",
                 ));
@@ -278,6 +269,39 @@ fn read_stream(
     // The result is in; give the child until its deadline to close stdout.
     while matches!(child.read_line(deadline), StdoutRead::Line(_)) {}
     finished
+}
+
+fn binary_matches_pin(config: &ClaudeCodeConfig) -> bool {
+    let Ok(mut file) = File::open(&config.claude_binary) else {
+        return false;
+    };
+    let mut hasher = Sha256::new();
+    io::copy(&mut file, &mut hasher).is_ok()
+        && <[u8; 32]>::from(hasher.finalize()) == config.claude_binary_sha256
+}
+
+/// Whether the backend can take work, naming the first config field that
+/// cannot be used. `config check` and `serve` both ask this.
+pub(crate) fn readiness(
+    config: &ClaudeCodeConfig,
+    tokens: &dyn TokenSource,
+) -> Result<(), &'static str> {
+    if !config.work_dir.is_dir() {
+        return Err("work_dir");
+    }
+    if !config.config_dir.is_dir() {
+        return Err("config_dir");
+    }
+    if !config.prompt_dir.is_dir() {
+        return Err("prompt_dir");
+    }
+    if tokens.read().is_none() {
+        return Err("token_credential");
+    }
+    if !binary_matches_pin(config) {
+        return Err("claude_binary_sha256");
+    }
+    Ok(())
 }
 
 fn zero_usage() -> Usage {
