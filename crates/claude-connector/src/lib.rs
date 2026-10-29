@@ -9,6 +9,7 @@ mod daemon;
 mod handle;
 mod launch;
 mod process;
+mod quota;
 mod stream;
 
 pub use backend::{ClaudeCodeBackend, CredentialTokenSource, StderrSink, TokenSource};
@@ -21,3 +22,4 @@ pub use launch::ChildEnv;
 #[cfg(unix)]
 pub use process::StdProcessPort;
 pub use process::{ProcessPort, RunningChild, StdoutRead};
+pub use quota::QuotaCell;

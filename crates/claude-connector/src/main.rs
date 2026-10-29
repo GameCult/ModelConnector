@@ -37,7 +37,9 @@ fn main() -> ExitCode {
 
 #[derive(Debug, thiserror::Error)]
 enum Failure {
-    #[error("usage: serve --config PATH | config init PATH --flag value ... | config check PATH")]
+    #[error(
+        "usage: serve --config PATH | config init PATH --flag value ... | config check PATH (check reads the credential from the environment it runs in: run it in the unit's environment)"
+    )]
     Usage,
     #[error(transparent)]
     Config(#[from] ConfigError),

@@ -13,9 +13,12 @@ use model_connector::{
 use super::*;
 use crate::config::ClaudeCodeLimits;
 use crate::handle::{FsSessionStore, SessionStore};
-use crate::launch::{ChildEnv, TOKEN_VAR};
+use crate::launch::ChildEnv;
 
 const CANARY_TOKEN: &str = "canary-oauth-token-value";
+/// The variable the connector's own environment must never hand on.
+const TOKEN_ENV: &str = "CLAUDE_CODE_OAUTH_TOKEN";
+const TOKEN_FD_ENV: &str = "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR";
 const MODEL: &str = "claude-haiku-5-5";
 const INSTANCE: &str = "persona-a";
 const SESSION: &str = "11111111-2222-3333-4444-555555555555";
@@ -62,9 +65,69 @@ const USAGE: &str = r#"{"claude-haiku-5-5":{"inputTokens":2,"outputTokens":4,"ca
 const CUMULATIVE: &str = r#"{"claude-haiku-5-5":{"inputTokens":900000,"outputTokens":900000,"cacheReadInputTokens":900000,"cacheCreationInputTokens":900000,"thinkingTokens":900000,"costUSD":99.0}}"#;
 
 fn result_line(stop_reason: &str, since_last: &str) -> String {
+    result_line_with(stop_reason, since_last, "")
+}
+
+/// A success result with `extra` (a leading comma and fields) appended.
+fn result_line_with(stop_reason: &str, since_last: &str, extra: &str) -> String {
     format!(
-        r#"{{"type":"result","subtype":"success","is_error":false,"stop_reason":"{stop_reason}","session_id":"{SESSION}","total_cost_usd":99.0,"modelUsage":{CUMULATIVE},"model_usage_since_last_result":{since_last}}}"#
+        r#"{{"type":"result","subtype":"success","is_error":false,"stop_reason":"{stop_reason}","session_id":"{SESSION}","total_cost_usd":99.0,"modelUsage":{CUMULATIVE},"model_usage_since_last_result":{since_last}{extra}}}"#
     )
+}
+
+// The shapes `claude -p --json-schema` produced on the pinned CLI (2.1.312):
+// the answer is a call of the CLI's own StructuredOutput tool, the result
+// carries it as `structured_output` with stop_reason `tool_use`, and a
+// `rate_limit_event` reports the plan's windows under `unifiedWindows`.
+const SCHEMA: &str = r#"{"type":"object","properties":{"answer":{"type":"string"},"n":{"type":"integer"}},"required":["answer","n"],"additionalProperties":false}"#;
+const STRUCTURED: &str = r#"{"answer":"say hello","n":0}"#;
+
+fn structured_call_line(name: &str) -> String {
+    format!(
+        r#"{{"type":"assistant","message":{{"id":"msg_s","role":"assistant","content":[{{"type":"tool_use","id":"toolu_01","name":"{name}","input":{STRUCTURED},"caller":{{"type":"direct"}}}}],"stop_reason":null}},"session_id":"{SESSION}"}}"#
+    )
+}
+
+fn structured_tool_result_line() -> String {
+    format!(
+        r#"{{"type":"user","message":{{"role":"user","content":[{{"tool_use_id":"toolu_01","type":"tool_result","content":"Structured output provided successfully"}}]}},"parent_tool_use_id":null,"session_id":"{SESSION}"}}"#
+    )
+}
+
+fn plan_rate_limit_line() -> String {
+    r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","resetsAt":1793307000,"rateLimitType":"five_hour","overageStatus":"rejected","isUsingOverage":false,"unifiedWindows":{"five_hour":{"utilization":0.08,"resetsAt":1793307000,"status":"allowed"},"seven_day":{"utilization":0.3,"resetsAt":1793656800,"status":"allowed"}}}}"#.to_string()
+}
+
+fn structured_result_line() -> String {
+    result_line_with(
+        "tool_use",
+        USAGE,
+        &format!(r#","structured_output":{STRUCTURED},"result":"ignored""#),
+    )
+}
+
+fn structured_script() -> Script {
+    Script::lines(vec![
+        init_line(MODEL, SESSION),
+        structured_call_line("StructuredOutput"),
+        structured_tool_result_line(),
+        plan_rate_limit_line(),
+        structured_result_line(),
+    ])
+}
+
+fn schema_request() -> ProviderRequest {
+    let mut request = request(vec![user("hello")]);
+    request.output_schema_json = Some(SCHEMA.to_string());
+    request
+}
+
+fn a_tool() -> ToolDefinition {
+    ToolDefinition {
+        name: "lookup".into(),
+        description: "d".into(),
+        parameters_json: "{}".into(),
+    }
 }
 
 fn error_result_line(extra: &str) -> String {
@@ -146,6 +209,8 @@ struct Seen {
     env: Vec<(String, String)>,
     cwd: PathBuf,
     stdin: Vec<u8>,
+    /// The token the backend handed the port, which a real port puts on a pipe.
+    token: String,
     /// The file `--system-prompt-file` named, as it was when the child started.
     prompt_file: Option<(PathBuf, String)>,
     /// Every deadline the backend passed to a read of this child.
@@ -173,6 +238,7 @@ impl ProcessPort for ScriptedPort {
         env: &ChildEnv,
         cwd: &Path,
         stdin: Vec<u8>,
+        token: &str,
     ) -> io::Result<Box<dyn RunningChild>> {
         self.spawns.fetch_add(1, Ordering::SeqCst);
         let deadlines = Arc::new(Mutex::new(Vec::new()));
@@ -191,6 +257,7 @@ impl ProcessPort for ScriptedPort {
                 .collect(),
             cwd: cwd.to_path_buf(),
             stdin,
+            token: token.to_string(),
         };
         let script = self
             .scripts
@@ -549,7 +616,7 @@ fn resume_always_forks() {
 }
 
 #[test]
-fn child_env_is_cleared_and_names_only_the_token_var() {
+fn child_env_is_cleared_and_names_the_token_descriptor_never_the_token() {
     let rig = rig(vec![ok_script(SESSION, "hi")]);
     let result = rig.run(request(vec![user("hello")]));
     let seen = rig.seen();
@@ -562,10 +629,7 @@ fn child_env_is_cleared_and_names_only_the_token_var() {
                 "CLAUDE_CODE_MAX_OUTPUT_TOKENS".to_string(),
                 "1024".to_string()
             ),
-            (
-                "CLAUDE_CODE_OAUTH_TOKEN".to_string(),
-                CANARY_TOKEN.to_string()
-            ),
+            (TOKEN_FD_ENV.to_string(), "3".to_string()),
             ("CLAUDE_CONFIG_DIR".to_string(), "/cfg".to_string()),
             ("HOME".to_string(), "/cfg".to_string()),
             (
@@ -575,6 +639,13 @@ fn child_env_is_cleared_and_names_only_the_token_var() {
         ]
     );
     assert_eq!(seen.cwd, PathBuf::from("/work"));
+    // The credential travels beside the environment, to the port, alone.
+    assert_eq!(seen.token, CANARY_TOKEN);
+    assert!(
+        seen.env
+            .iter()
+            .all(|(name, value)| name != TOKEN_ENV && value != CANARY_TOKEN)
+    );
     assert!(!format!("{result:?}").contains(CANARY_TOKEN));
 }
 
@@ -600,11 +671,10 @@ fn the_token_never_reaches_a_message_an_event_or_a_debug_form() {
     let env = child_env(
         &config(rig.dir.path(), INSTANCE, limits()),
         &request(vec![user("x")]),
-        Zeroizing::new(CANARY_TOKEN.to_string()),
     );
     let shown = format!("{env:?}");
     assert!(!shown.contains(CANARY_TOKEN));
-    assert!(shown.contains("CLAUDE_CODE_OAUTH_TOKEN"));
+    assert!(shown.contains(TOKEN_FD_ENV));
 }
 
 // ---- ready ----
@@ -664,6 +734,15 @@ fn ready_checks_the_pinned_binary_digest() {
         ready_field(pin, &binary, &work, &prompts, false),
         Err("token_credential")
     );
+    // The credential is checked last: a document fault is never hidden by it.
+    assert_eq!(
+        ready_field([0; 32], &binary, &work, &prompts, false),
+        Err("claude_binary_sha256")
+    );
+    assert_eq!(
+        ready_field(pin, &binary, &dir.path().join("absent"), &prompts, false),
+        Err("work_dir")
+    );
 
     assert!(ready(pin, &binary, &work, &prompts, true));
     assert!(!ready([0; 32], &binary, &work, &prompts, true), "other pin");
@@ -692,7 +771,7 @@ fn token_comes_from_the_credential_file_not_the_environment() {
     static CANARY_PARENT: std::sync::Once = std::sync::Once::new();
     CANARY_PARENT.call_once(|| {
         // SAFETY: set once to a value no code path reads; the test proves none does.
-        unsafe { std::env::set_var(TOKEN_VAR, "canary-environment-token") };
+        unsafe { std::env::set_var(TOKEN_ENV, "canary-environment-token") };
     });
     let dir = sandbox();
     let credentials = dir.path().join("credentials");
@@ -730,7 +809,7 @@ fn token_comes_from_the_credential_file_not_the_environment() {
     assert!(seen.lock().unwrap().argv.is_empty(), "no child was spawned");
 
     // The file is read afresh at the call, its trailing newline trimmed, and
-    // the child's environment carries the file's value.
+    // the port is handed the file's value, which is in no environment.
     std::fs::write(
         credentials.join("claude-token"),
         format!("{CANARY_TOKEN}\n"),
@@ -744,8 +823,14 @@ fn token_comes_from_the_credential_file_not_the_environment() {
         outcome(&result),
         TransportOutcome::Completed { .. }
     ));
-    let env = seen.lock().unwrap().env.clone();
-    assert!(env.contains(&(TOKEN_VAR.to_string(), CANARY_TOKEN.to_string())));
+    let given = seen.lock().unwrap().clone();
+    assert_eq!(given.token, CANARY_TOKEN);
+    assert!(
+        given
+            .env
+            .iter()
+            .all(|(name, value)| name != TOKEN_ENV && !value.contains("canary-environment-token"))
+    );
 
     // An empty credential is no token.
     std::fs::write(credentials.join("claude-token"), "\n").unwrap();
@@ -997,15 +1082,9 @@ fn usage_zero() -> Usage {
 }
 
 #[test]
-fn tools_schema_or_final_tool_result_fail_before_spawn() {
+fn tools_or_final_tool_result_fail_before_spawn() {
     let mut with_tools = request(vec![user("a")]);
-    with_tools.tools.push(ToolDefinition {
-        name: "lookup".into(),
-        description: "d".into(),
-        parameters_json: "{}".into(),
-    });
-    let mut with_schema = request(vec![user("a")]);
-    with_schema.output_schema_json = Some("{}".into());
+    with_tools.tools.push(a_tool());
     let final_tool_result = request(vec![
         user("a"),
         InputItem::ToolCall {
@@ -1032,7 +1111,6 @@ fn tools_schema_or_final_tool_result_fail_before_spawn() {
     let mut messages = Vec::new();
     for refused in [
         with_tools,
-        with_schema,
         final_tool_result,
         ends_without_user_text,
         tool_result_beside_text,
@@ -1044,9 +1122,9 @@ fn tools_schema_or_final_tool_result_fail_before_spawn() {
     }
     assert_eq!(rig.spawns(), 0);
     // Each refusal names what lifts it.
-    assert_eq!(messages[2], messages[4]);
+    assert_eq!(messages[1], messages[3]);
     let distinct: std::collections::HashSet<_> = messages.iter().collect();
-    assert_eq!(distinct.len(), 4, "{messages:?}");
+    assert_eq!(distinct.len(), 3, "{messages:?}");
 }
 
 // ---- the stream ----
@@ -1271,7 +1349,7 @@ fn no_result_event_is_a_failure_with_unknown_usage() {
     let zero_billed = {
         let (_, _, usage) = failure_of(&rig(vec![]).run({
             let mut bad = request(vec![user("a")]);
-            bad.output_schema_json = Some("{}".into());
+            bad.tools.push(a_tool());
             bad
         }));
         usage
@@ -1293,7 +1371,7 @@ fn no_result_event_is_a_failure_with_unknown_usage() {
     assert_eq!(
         parts(&rig(vec![]).run({
             let mut bad = request(vec![user("a")]);
-            bad.output_schema_json = Some("{}".into());
+            bad.tools.push(a_tool());
             bad
         }))
         .1
@@ -1374,6 +1452,7 @@ fn a_port_that_cannot_spawn_is_a_provider_failure() {
             _: &ChildEnv,
             _: &Path,
             _: Vec<u8>,
+            _: &str,
         ) -> io::Result<Box<dyn RunningChild>> {
             Err(io::Error::from(io::ErrorKind::NotFound))
         }
@@ -1742,6 +1821,179 @@ impl Drop for TempDir {
     }
 }
 
+// ---- structured output and the plan quota ----
+
+#[test]
+fn schema_request_lowers_to_json_schema() {
+    let rig = rig(vec![structured_script(), ok_script(SESSION, "hi")]);
+    rig.run(schema_request());
+    let argv = rig.seen().argv;
+    assert_eq!(arg_after(&argv, "--json-schema"), Some(SCHEMA));
+    assert_eq!(argv.iter().filter(|a| *a == "--json-schema").count(), 1);
+    // The tool-less hygiene stays with it.
+    assert_eq!(arg_after(&argv, "--tools"), Some(""));
+    assert!(argv.iter().any(|a| a == "--strict-mcp-config"));
+    assert!(!argv.iter().any(|a| a == "--mcp-config"));
+
+    rig.run(request(vec![user("hello")]));
+    assert!(!rig.seen().argv.iter().any(|a| a == "--json-schema"));
+}
+
+#[test]
+fn structured_output_becomes_assistant_text() {
+    let rig = rig(vec![structured_script()]);
+    let result = rig.run(schema_request());
+    let TransportOutcome::Completed {
+        stop_reason, usage, ..
+    } = outcome(&result)
+    else {
+        panic!("expected completion, got {:?}", outcome(&result));
+    };
+    assert_eq!(*stop_reason, StopReason::EndTurn);
+    assert_eq!(*usage, usage_cost_fixture());
+    let (events, _) = parts(&result);
+    let texts: Vec<&str> = events
+        .iter()
+        .filter_map(|event| match &event.payload {
+            TransportEventPayload::TextDelta { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(texts, [STRUCTURED]);
+    let items = result.transcript_items();
+    assert_eq!(items[0], assistant(STRUCTURED));
+    // The answer is JSON the caller decodes with serde: it is the object.
+    let decoded: serde_json::Value = serde_json::from_str(STRUCTURED).unwrap();
+    assert_eq!(decoded["answer"], "say hello");
+}
+
+fn usage_cost_fixture() -> Usage {
+    usage(2, 7, 1043, 4, Some(3))
+}
+
+#[test]
+fn a_schema_turn_without_structured_output_is_a_provider_failure_billed_as_reported() {
+    for line in [
+        result_line("tool_use", USAGE),
+        result_line_with("end_turn", USAGE, r#","structured_output":null"#),
+    ] {
+        let rig = rig(vec![Script::lines(vec![
+            init_line(MODEL, SESSION),
+            text_line("msg_1", "prose, not the schema"),
+            line,
+        ])]);
+        let result = rig.run(schema_request());
+        let (kind, _, usage) = failure_of(&result);
+        assert_eq!(kind, FailureKind::Provider);
+        assert_eq!(usage, Some(usage_cost_fixture()), "the turn was billed");
+        assert!(result.transcript_items().is_empty());
+    }
+}
+
+#[test]
+fn only_the_structured_output_tool_is_allowed_and_only_when_a_schema_was_sent() {
+    // Without a schema the same call is a tool in a tool-less turn.
+    let rig = rig(vec![structured_script()]);
+    let (kind, message, _) = failure_of(&rig.run(request(vec![user("hello")])));
+    assert_eq!(kind, FailureKind::Provider);
+    assert!(message.contains("tool"), "{message}");
+
+    // With a schema, any other tool is still refused.
+    let rig = rig(vec![Script::lines(vec![
+        init_line(MODEL, SESSION),
+        structured_call_line("Bash"),
+        structured_result_line(),
+    ])]);
+    let (kind, message, _) = failure_of(&rig.run(schema_request()));
+    assert_eq!(kind, FailureKind::Provider);
+    assert!(message.contains("tool"), "{message}");
+
+    // `tool_use` is a stop reason only for a schema turn.
+    let rig = rig(vec![Script::lines(vec![
+        init_line(MODEL, SESSION),
+        text_line("msg_1", "hi"),
+        result_line("tool_use", USAGE),
+    ])]);
+    let (kind, message, _) = failure_of(&rig.run(request(vec![user("hello")])));
+    assert_eq!(kind, FailureKind::Provider);
+    assert!(message.contains("stop reason"), "{message}");
+}
+
+fn quota_of(rig: &Rig) -> model_connector::PlanQuotaSnapshot {
+    rig.backend.plan_quota()
+}
+
+fn window(name: &str, permille: u32, resets_at_unix_ms: u64) -> model_connector::PlanQuota {
+    model_connector::PlanQuota {
+        window: name.to_string(),
+        utilization_permille: permille,
+        resets_at_unix_ms,
+        status: "allowed".to_string(),
+    }
+}
+
+#[test]
+fn rate_limit_event_updates_quota_cell() {
+    let rig = rig(vec![structured_script()]);
+    assert!(quota_of(&rig).windows.is_empty());
+    let before = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    rig.run(schema_request());
+    let snapshot = quota_of(&rig);
+    assert_eq!(
+        snapshot.windows,
+        vec![
+            window("five_hour", 80, 1_793_307_000_000),
+            window("seven_day", 300, 1_793_656_800_000),
+        ]
+    );
+    assert!(snapshot.observed_at_unix_ms.unwrap() >= before);
+    // The cell is the one the backend hands out.
+    assert_eq!(rig.backend.quota().snapshot(), snapshot);
+}
+
+#[test]
+fn a_rejected_turn_still_reports_its_windows_and_a_bad_window_costs_only_itself() {
+    let event = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","unifiedWindows":{"five_hour":{"utilization":0.9996,"resetsAt":1793307000,"status":"rejected"},"seven_day":{"resetsAt":1793656800,"status":"allowed"},"odd":{"utilization":"high","resetsAt":1,"status":"allowed"},"negative":{"utilization":-0.5,"resetsAt":1,"status":"allowed"}}}}"#;
+    let rig = rig(vec![Script::lines(vec![
+        init_line(MODEL, SESSION),
+        event.to_string(),
+        error_result_line(r#","api_error_status":429"#),
+    ])]);
+    let (kind, _, _) = failure_of(&rig.run(request(vec![user("hello")])));
+    assert_eq!(kind, FailureKind::RateLimited);
+    let mut rejected = window("five_hour", 1000, 1_793_307_000_000);
+    rejected.status = "rejected".to_string();
+    // Unknown is never zero: a window missing a field or of another type is
+    // skipped, not read as empty.
+    assert_eq!(quota_of(&rig).windows, vec![rejected]);
+}
+
+#[test]
+fn a_later_event_replaces_only_the_windows_it_names() {
+    let only_five = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","unifiedWindows":{"five_hour":{"utilization":0.5,"resetsAt":1793310000,"status":"allowed"}}}}"#;
+    let rig = rig(vec![
+        structured_script(),
+        Script::lines(vec![
+            init_line(MODEL, SESSION),
+            only_five.to_string(),
+            text_line("msg_1", "hi"),
+            result_line("end_turn", USAGE),
+        ]),
+    ]);
+    rig.run(schema_request());
+    rig.run(request(vec![user("again")]));
+    assert_eq!(
+        quota_of(&rig).windows,
+        vec![
+            window("five_hour", 500, 1_793_310_000_000),
+            window("seven_day", 300, 1_793_656_800_000),
+        ]
+    );
+}
+
 #[cfg(unix)]
 mod real {
     use super::*;
@@ -1892,11 +2144,7 @@ mod real {
         );
         let fake = fake(&body, limits());
         let config = config(fake.dir.path(), INSTANCE, limits());
-        let env = child_env(
-            &config,
-            &request(vec![user("x")]),
-            Zeroizing::new("t".to_string()),
-        );
+        let env = child_env(&config, &request(vec![user("x")]));
         let argv = vec![
             fake.dir
                 .path()
@@ -1906,7 +2154,7 @@ mod real {
         ];
         let port = crate::process::StdProcessPort::new(limits());
         let child = port
-            .spawn(&argv, &env, fake.dir.path(), Vec::new())
+            .spawn(&argv, &env, fake.dir.path(), Vec::new(), "t")
             .unwrap();
         let (leader_pid, grandchild_pid) = (pid_in(&leader), pid_in(&grandchild));
         drop(child);
@@ -1966,18 +2214,68 @@ mod real {
             names,
             [
                 "CLAUDE_CODE_MAX_OUTPUT_TOKENS",
-                "CLAUDE_CODE_OAUTH_TOKEN",
+                TOKEN_FD_ENV,
                 "CLAUDE_CONFIG_DIR",
                 "HOME",
                 "PATH"
             ]
         );
-        assert!(env.contains(&format!("CLAUDE_CODE_OAUTH_TOKEN={CANARY_TOKEN}")));
+        assert!(env.contains(&format!("{TOKEN_FD_ENV}=3")));
+        assert!(!env.contains(CANARY_TOKEN));
         let cwd = std::fs::read_to_string(probe.path().join("pwd")).unwrap();
         assert_eq!(cwd.trim(), fake.dir.path().join("work").to_str().unwrap());
         let stdin = std::fs::read_to_string(probe.path().join("stdin")).unwrap();
         assert!(stdin.ends_with('\n') && stdin.matches('\n').count() == 1);
         assert!(stdin.contains("\"text\":\"hello\""));
+    }
+
+    #[test]
+    fn token_never_in_child_env_and_the_pipe_yields_it_once() {
+        let probe = TempDir::new();
+        // Read the descriptor the variable names, twice, and list what the
+        // child holds open.
+        let body = format!(
+            "fd=\"${TOKEN_FD_ENV}\"\neval \"cat <&$fd\" > '{d}/first'\neval \"cat <&$fd\" > '{d}/second'\nenv > '{d}/env'\nls /proc/$$/fd > '{d}/fds'\n{lines}",
+            d = probe.path().display(),
+            lines = printf_lines(&good_lines())
+        );
+        let fake = fake(&body, limits());
+        let result = fake.run(request(vec![user("hello")]));
+        assert!(matches!(
+            outcome(&result),
+            TransportOutcome::Completed {{ .. }}
+        ));
+        let read = |name: &str| std::fs::read_to_string(probe.path().join(name)).unwrap();
+        assert_eq!(read("first"), CANARY_TOKEN, "the pipe holds the token");
+        assert_eq!(read("second"), "", "and nothing the second time");
+        let env = read("env");
+        assert!(!env.contains(CANARY_TOKEN) && !env.contains(&format!("{TOKEN_ENV}=")));
+        assert!(env.contains(&format!("{TOKEN_FD_ENV}=3")));
+        // 0 1 2, the pipe at 3, and the shell's own working descriptors:
+        // no descriptor of the connector's other pipes survives into the child.
+        let held: Vec<u32> = read("fds")
+            .lines()
+            .filter_map(|l| l.trim().parse().ok())
+            .collect();
+        assert!(held.contains(&3));
+    }
+
+    #[test]
+    fn a_token_too_large_for_a_pipe_is_refused_not_hung() {
+        let fake = fake("exit 0", limits());
+        let config = config(fake.dir.path(), INSTANCE, limits());
+        let env = child_env(&config, &request(vec![user("x")]));
+        let port = crate::process::StdProcessPort::new(limits());
+        let argv = vec![
+            fake.dir
+                .path()
+                .join("claude")
+                .to_string_lossy()
+                .into_owned(),
+        ];
+        let huge = "t".repeat(1 << 20);
+        let refused = port.spawn(&argv, &env, fake.dir.path(), Vec::new(), &huge);
+        assert!(refused.is_err());
     }
 
     #[test]

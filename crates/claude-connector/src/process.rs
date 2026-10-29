@@ -20,7 +20,9 @@ pub enum StdoutRead {
 }
 
 /// Starts a `claude` child. `argv[0]` is the program; the environment is
-/// exactly `env`; `stdin` is written and closed.
+/// exactly `env`; `stdin` is written and closed. `token` is the child's
+/// credential: it reaches the child on a pipe at `launch::TOKEN_FD`, once, and
+/// is in no environment.
 pub trait ProcessPort: Send + Sync {
     fn spawn(
         &self,
@@ -28,6 +30,7 @@ pub trait ProcessPort: Send + Sync {
         env: &ChildEnv,
         cwd: &Path,
         stdin: Vec<u8>,
+        token: &str,
     ) -> io::Result<Box<dyn RunningChild>>;
 }
 
@@ -47,6 +50,7 @@ pub use unix::StdProcessPort;
 #[cfg(unix)]
 mod unix {
     use std::io::{self, BufRead, BufReader, Read, Write};
+    use std::os::fd::{AsRawFd, RawFd};
     use std::os::unix::process::CommandExt;
     use std::path::Path;
     use std::process::{Child, Command, Stdio};
@@ -57,7 +61,31 @@ mod unix {
 
     use super::{ProcessPort, RunningChild, StdoutRead};
     use crate::config::ClaudeCodeLimits;
-    use crate::launch::ChildEnv;
+    use crate::launch::{ChildEnv, TOKEN_FD};
+
+    /// A pipe holds a token without blocking the writer; a token is a few
+    /// hundred bytes, so anything near the pipe's capacity is not one.
+    const MAX_TOKEN_BYTES: usize = 4096;
+
+    /// Puts the pipe's read end at [`TOKEN_FD`] in the child. Runs between
+    /// fork and exec, so it calls nothing but `dup2` and `fcntl`.
+    fn place_token_fd(source: RawFd) -> io::Result<()> {
+        // SAFETY: dup2 and fcntl take integers only and are async-signal-safe.
+        unsafe {
+            if source == TOKEN_FD {
+                // dup2 onto itself changes nothing, so the close-on-exec flag
+                // the pipe was created with must be cleared by hand.
+                let flags = libc::fcntl(TOKEN_FD, libc::F_GETFD);
+                if flags < 0 || libc::fcntl(TOKEN_FD, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0
+                {
+                    return Err(io::Error::last_os_error());
+                }
+            } else if libc::dup2(source, TOKEN_FD) < 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        Ok(())
+    }
 
     /// Spawns each child in its own process group, so that killing the call
     /// kills what the child started too.
@@ -78,7 +106,11 @@ mod unix {
             env: &ChildEnv,
             cwd: &Path,
             stdin: Vec<u8>,
+            token: &str,
         ) -> io::Result<Box<dyn RunningChild>> {
+            if token.len() > MAX_TOKEN_BYTES {
+                return Err(io::Error::from(io::ErrorKind::InvalidInput));
+            }
             let (program, args) = argv
                 .split_first()
                 .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
@@ -92,7 +124,17 @@ mod unix {
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .process_group(0);
+            // The write end closes here, so the child sees the token and then
+            // the end of the pipe. Both ends are close-on-exec; only the copy
+            // `place_token_fd` makes reaches the child.
+            let (reader, mut writer) = std::io::pipe()?;
+            writer.write_all(token.as_bytes())?;
+            drop(writer);
+            let source = reader.as_raw_fd();
+            // SAFETY: the closure calls only async-signal-safe functions.
+            unsafe { command.pre_exec(move || place_token_fd(source)) };
             let mut child = command.spawn()?;
+            drop(reader);
             let (stdin_pipe, stdout, stderr) =
                 (child.stdin.take(), child.stdout.take(), child.stderr.take());
 

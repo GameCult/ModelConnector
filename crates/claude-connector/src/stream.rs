@@ -3,9 +3,15 @@
 
 use std::collections::BTreeMap;
 
-use model_connector::{FailureKind, StopReason, Usage};
+use model_connector::{FailureKind, PlanQuota, StopReason, Usage};
 use serde::Deserialize;
 use serde_json::Value;
+
+use crate::quota::QuotaCell;
+
+/// The tool the CLI gives the model to deliver an answer that must match a
+/// `--json-schema`. Its call is the structured output, not a tool exchange.
+const STRUCTURED_OUTPUT_TOOL: &str = "StructuredOutput";
 
 /// A call that cannot complete, with the stage that failed. `usage` is `None`
 /// (the kit bills its reservation) unless a result event reported it or the
@@ -63,12 +69,16 @@ struct Line {
     session_id: Option<String>,
     model: Option<String>,
     message: Option<Message>,
-    rate_limit_info: Option<RateLimitInfo>,
+    /// Read by hand: the shape moves with the CLI, and a field that changes
+    /// type must cost the quota reading, never the call.
+    rate_limit_info: Option<Value>,
     is_error: Option<bool>,
     stop_reason: Option<String>,
     api_error_status: Option<Value>,
     result: Option<Value>,
     errors: Option<Value>,
+    /// The answer to a `--json-schema` request, an object.
+    structured_output: Option<Value>,
     /// What this turn alone consumed. `modelUsage` is deliberately not read:
     /// on a resumed session it carries every earlier turn too.
     model_usage_since_last_result: Option<Value>,
@@ -85,11 +95,7 @@ struct Block {
     #[serde(rename = "type")]
     kind: String,
     text: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct RateLimitInfo {
-    status: Option<String>,
+    name: Option<String>,
 }
 
 /// One model's entry. The four counts are required: an entry that lacks one
@@ -107,6 +113,10 @@ struct ModelUsage {
 /// One call's stream, line by line.
 pub(crate) struct StreamState<'a> {
     model: &'a str,
+    /// Whether the request carried an output schema, so the answer is the
+    /// result's structured output.
+    structured: bool,
+    quota: &'a QuotaCell,
     session_id: Option<String>,
     texts: Vec<String>,
     message_id: Option<String>,
@@ -114,9 +124,11 @@ pub(crate) struct StreamState<'a> {
 }
 
 impl<'a> StreamState<'a> {
-    pub(crate) fn new(model: &'a str) -> Self {
+    pub(crate) fn new(model: &'a str, structured: bool, quota: &'a QuotaCell) -> Self {
         Self {
             model,
+            structured,
+            quota,
             session_id: None,
             texts: Vec::new(),
             message_id: None,
@@ -151,10 +163,11 @@ impl<'a> StreamState<'a> {
             },
             "assistant" => self.assistant(line.message),
             "rate_limit_event" => {
-                self.plan_rejected |= line
-                    .rate_limit_info
-                    .and_then(|info| info.status)
-                    .is_some_and(|status| status == "rejected");
+                if let Some(info) = &line.rate_limit_info {
+                    self.plan_rejected |=
+                        info.get("status").and_then(Value::as_str) == Some("rejected");
+                    self.quota.observe(plan_windows(info));
+                }
                 Step::More
             }
             "result" => Step::Done(Box::new(self.result(line))),
@@ -175,6 +188,9 @@ impl<'a> StreamState<'a> {
                     if let Some(text) = block.text.filter(|text| !text.is_empty()) {
                         self.texts.push(text);
                     }
+                }
+                "tool_use"
+                    if self.structured && block.name.as_deref() == Some(STRUCTURED_OUTPUT_TOOL) => {
                 }
                 "tool_use" => {
                     return fail(
@@ -210,8 +226,23 @@ impl<'a> StreamState<'a> {
                 usage: None,
             });
         };
+        let mut texts = std::mem::take(&mut self.texts);
+        if self.structured {
+            // The answer is the structured output alone; any prose around the
+            // tool call is not part of it.
+            let Some(output) = line.structured_output.filter(|value| !value.is_null()) else {
+                return Err(Failure {
+                    kind: FailureKind::Provider,
+                    message: "claude-code: a schema was sent and the result carried no structured output",
+                    usage: Some(usage),
+                });
+            };
+            texts = vec![output.to_string()];
+        }
         let stop_reason = match line.stop_reason.as_deref() {
             Some("end_turn") => StopReason::EndTurn,
+            // The structured-output tool call is how such a turn ends.
+            Some("tool_use") if self.structured => StopReason::EndTurn,
             Some("max_tokens") => StopReason::MaxOutputTokens,
             Some("stop_sequence") => StopReason::StopSequence,
             Some("refusal") => StopReason::Refusal,
@@ -233,7 +264,7 @@ impl<'a> StreamState<'a> {
         };
         Ok(Finished {
             session_id,
-            texts: std::mem::take(&mut self.texts),
+            texts,
             message_id: self.message_id.take(),
             stop_reason,
             usage,
@@ -261,6 +292,34 @@ impl<'a> StreamState<'a> {
             _ => FailureKind::Provider,
         }
     }
+}
+
+/// The plan windows one `rate_limit_event` reports under
+/// `rate_limit_info.unifiedWindows`: utilization as a fraction of the window,
+/// reset as unix seconds. A window missing any of its three fields is skipped;
+/// an unknown reading is never zero.
+fn plan_windows(info: &Value) -> Vec<PlanQuota> {
+    let Some(windows) = info.get("unifiedWindows").and_then(Value::as_object) else {
+        return Vec::new();
+    };
+    windows
+        .iter()
+        .filter_map(|(window, reading)| {
+            let utilization = reading.get("utilization")?.as_f64()?;
+            let resets_at = reading.get("resetsAt")?.as_u64()?;
+            let status = reading.get("status")?.as_str()?;
+            if !utilization.is_finite() || utilization < 0.0 {
+                return None;
+            }
+            Some(PlanQuota {
+                window: window.clone(),
+                // `as` saturates a float at the integer's bounds.
+                utilization_permille: (utilization * 1000.0).round() as u32,
+                resets_at_unix_ms: resets_at.saturating_mul(1000),
+                status: status.to_string(),
+            })
+        })
+        .collect()
 }
 
 fn fail(kind: FailureKind, message: &'static str) -> Step {

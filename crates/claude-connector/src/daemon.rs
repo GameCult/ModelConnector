@@ -68,7 +68,8 @@ pub struct ClaudeConnectorConfig {
     /// Exactly one caller until claude-handle-caller-binding lands.
     #[cultcache(key = 17)]
     pub callers: Vec<CallerConfig>,
-    /// What each allowed model costs; keys are canonical model ids.
+    /// What each allowed model costs. The keys are the known list of models:
+    /// ids exactly as the CLI reports them in its init event.
     #[cultcache(key = 18)]
     pub prices: BTreeMap<String, ModelPrice>,
 }
@@ -190,7 +191,7 @@ impl ClaudeConnectorConfig {
         }
         let mut seen = BTreeSet::new();
         for model in &caller.allowed_models {
-            if !is_canonical_model(model)
+            if !has_model_id_form(model)
                 || !seen.insert(model.as_str())
                 || !self.prices.contains_key(model)
             {
@@ -200,7 +201,7 @@ impl ClaudeConnectorConfig {
         if !self
             .prices
             .iter()
-            .all(|(model, price)| is_canonical_model(model) && is_fully_priced(price))
+            .all(|(model, price)| has_model_id_form(model) && is_fully_priced(price))
         {
             return Err(ConfigError::Invalid("prices"));
         }
@@ -239,28 +240,36 @@ fn is_trimmed_nonempty(text: &str) -> bool {
     !text.is_empty() && text.trim() == text
 }
 
-/// A model id the CLI echoes back unchanged: `claude-<family>-<major>-<minor>`
-/// with an optional `-YYYYMMDD` suffix, the family lowercase letters. Aliases
-/// and bare prefixes are refused because the stream's `init.model` must equal
-/// the requested model.
-fn is_canonical_model(model: &str) -> bool {
+/// The loose shape of a model id, only to catch typos:
+/// `claude-<family>-<major>`, then an optional `-<minor>` and an optional
+/// `-YYYYMMDD`, the family lowercase letters. No shape can tell an alias from
+/// a canonical id, so the known list is the price table's keys (ruling
+/// claude-model-ids-from-price-table); an alias that slips in fails its first
+/// call, when the stream's `init.model` differs from the request.
+fn has_model_id_form(model: &str) -> bool {
     let Some(rest) = model.strip_prefix(MODEL_PREFIX) else {
         return false;
     };
     let digits = |part: &str, most: usize| {
         (1..=most).contains(&part.len()) && part.bytes().all(|byte| byte.is_ascii_digit())
     };
+    let date = |part: &str| part.len() == 8 && digits(part, 8);
     let mut parts = rest.split('-');
     let family = parts.next().unwrap_or("");
-    let major = parts.next().unwrap_or("");
-    let minor = parts.next().unwrap_or("");
-    let date = parts.next();
+    let tail: Vec<&str> = parts.collect();
+    let Some((major, after)) = tail.split_first() else {
+        return false;
+    };
+    let after_ok = match after {
+        [] => true,
+        [one] => digits(one, 2) || date(one),
+        [minor, last] => digits(minor, 2) && date(last),
+        _ => false,
+    };
     !family.is_empty()
         && family.bytes().all(|byte| byte.is_ascii_lowercase())
         && digits(major, 2)
-        && digits(minor, 2)
-        && date.is_none_or(|date| date.len() == 8 && digits(date, 8))
-        && parts.next().is_none()
+        && after_ok
 }
 
 /// A price is a fuse only if every component it bills is nonzero: a zero rate

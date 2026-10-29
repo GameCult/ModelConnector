@@ -9,19 +9,22 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use model_connector::{ProviderRequest, ReasoningEffort};
-use zeroize::Zeroizing;
 
 use crate::config::ClaudeCodeConfig;
 use crate::handle::Plan;
 
-/// The one credential variable: the child's environment is the only
-/// environment the token ever enters.
-pub(crate) const TOKEN_VAR: &str = "CLAUDE_CODE_OAUTH_TOKEN";
+/// The variable that tells the CLI which file descriptor holds its credential.
+/// The token itself never enters the environment: the process port writes it
+/// into a pipe and hands the child the read end at [`TOKEN_FD`].
+pub(crate) const TOKEN_FD_VAR: &str = "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR";
+/// The descriptor number the child finds the token pipe at: the first one
+/// after stdin, stdout and stderr.
+pub(crate) const TOKEN_FD: i32 = 3;
 const CHILD_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
 
 /// The environment of the child: exactly these names and nothing inherited.
-/// Values are never formatted; `Debug` lists names only.
-pub struct ChildEnv(Vec<(&'static str, Zeroizing<String>)>);
+/// `Debug` lists names only.
+pub struct ChildEnv(Vec<(&'static str, String)>);
 
 impl ChildEnv {
     pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
@@ -37,21 +40,17 @@ impl fmt::Debug for ChildEnv {
     }
 }
 
-pub(crate) fn child_env(
-    config: &ClaudeCodeConfig,
-    request: &ProviderRequest,
-    token: Zeroizing<String>,
-) -> ChildEnv {
+pub(crate) fn child_env(config: &ClaudeCodeConfig, request: &ProviderRequest) -> ChildEnv {
     let config_dir = config.config_dir.to_string_lossy().into_owned();
     ChildEnv(vec![
-        ("PATH", Zeroizing::new(CHILD_PATH.to_string())),
-        ("HOME", Zeroizing::new(config_dir.clone())),
-        ("CLAUDE_CONFIG_DIR", Zeroizing::new(config_dir)),
+        ("PATH", CHILD_PATH.to_string()),
+        ("HOME", config_dir.clone()),
+        ("CLAUDE_CONFIG_DIR", config_dir),
         (
             "CLAUDE_CODE_MAX_OUTPUT_TOKENS",
-            Zeroizing::new(request.max_output_tokens.to_string()),
+            request.max_output_tokens.to_string(),
         ),
-        (TOKEN_VAR, token),
+        (TOKEN_FD_VAR, TOKEN_FD.to_string()),
     ])
 }
 
@@ -108,7 +107,8 @@ fn effort(effort: ReasoningEffort) -> &'static str {
 /// rather than an argument because one argument is capped near 128 KiB
 /// (E2BIG) and instructions are not, the child has
 /// no tools, no MCP servers, no settings, no slash commands and nobody to ask
-/// for permission, and a resume always forks.
+/// for permission, and a resume always forks. A request's output schema goes
+/// to the CLI as `--json-schema`; without one the flag is absent.
 pub(crate) fn argv(
     config: &ClaudeCodeConfig,
     request: &ProviderRequest,
@@ -141,6 +141,9 @@ pub(crate) fn argv(
     .collect();
     if let Some(level) = request.reasoning_effort {
         argv.extend(["--effort".to_string(), effort(level).to_string()]);
+    }
+    if let Some(schema) = &request.output_schema_json {
+        argv.extend(["--json-schema".to_string(), schema.clone()]);
     }
     if let Plan::Resume { session_id, .. } = plan {
         argv.extend([

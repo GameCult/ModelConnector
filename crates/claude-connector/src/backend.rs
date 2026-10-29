@@ -1,11 +1,12 @@
 use std::fs::File;
 use std::io;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Instant;
 
 use model_connector::{
-    FailureKind, InputItem, ProviderBackend, ProviderCall, ProviderRequest, TransportEvent,
-    TransportEventPayload, TransportOutcome, TransportResult, Usage,
+    FailureKind, InputItem, PlanQuotaSnapshot, ProviderBackend, ProviderCall, ProviderRequest,
+    TransportEvent, TransportEventPayload, TransportOutcome, TransportResult, Usage,
 };
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
@@ -14,6 +15,7 @@ use crate::config::{ClaudeCodeConfig, PROVIDER};
 use crate::handle::{ClaudeCodeHandle, SessionStore, plan, prefix_digest, stdin_bytes};
 use crate::launch::{PromptFile, argv, child_env};
 use crate::process::{ProcessPort, RunningChild, StdoutRead};
+use crate::quota::QuotaCell;
 use crate::stream::{Failure, Finished, Step, StreamState};
 
 /// Where the child's credential comes from, read afresh at every use. The
@@ -22,6 +24,10 @@ use crate::stream::{Failure, Finished, Step, StreamState};
 pub trait TokenSource: Send + Sync {
     /// The token, or `None` when there is none or it is empty.
     fn read(&self) -> Option<Zeroizing<String>>;
+    /// What `config check` names when `read` has no token.
+    fn missing(&self) -> &'static str {
+        "token_credential"
+    }
 }
 
 /// A token in a file named by a systemd credential: the file
@@ -59,6 +65,16 @@ impl TokenSource for CredentialTokenSource {
         token.truncate(trimmed);
         (!token.is_empty()).then_some(token)
     }
+
+    /// No directory at all is the unit's environment lacking its credentials,
+    /// which is not the same fault as a credential the directory lacks.
+    fn missing(&self) -> &'static str {
+        if self.directory.is_none() {
+            "credentials_directory"
+        } else {
+            "token_credential"
+        }
+    }
 }
 
 /// Where the tail of a child's stderr goes. The backend never puts it in a
@@ -75,6 +91,7 @@ pub struct ClaudeCodeBackend {
     sessions: Box<dyn SessionStore>,
     sink: Box<dyn StderrSink>,
     tokens: Box<dyn TokenSource>,
+    quota: Arc<QuotaCell>,
 }
 
 impl ClaudeCodeBackend {
@@ -104,7 +121,13 @@ impl ClaudeCodeBackend {
             sessions,
             sink,
             tokens,
+            quota: Arc::new(QuotaCell::new()),
         }
+    }
+
+    /// The plan windows every stream this backend reads feeds.
+    pub fn quota(&self) -> Arc<QuotaCell> {
+        self.quota.clone()
     }
 
     /// The one pin check: `ready` and every spawn use it, and nothing caches
@@ -144,7 +167,7 @@ impl ClaudeCodeBackend {
             ));
         };
         let argv = argv(&self.config, request, &plan, prompt.path());
-        let env = child_env(&self.config, request, token);
+        let env = child_env(&self.config, request);
         let deadline = Instant::now() + self.config.limits.deadline;
 
         let spawned = self.port.spawn(
@@ -152,6 +175,7 @@ impl ClaudeCodeBackend {
             &env,
             &self.config.work_dir,
             stdin_bytes(plan.blocks()),
+            &token,
         );
         let Ok(mut child) = spawned else {
             return failure(Failure::never_reached(
@@ -159,7 +183,13 @@ impl ClaudeCodeBackend {
                 "claude-code: the child could not be spawned",
             ));
         };
-        let finished = read_stream(child.as_mut(), deadline, &request.model);
+        let finished = read_stream(
+            child.as_mut(),
+            deadline,
+            &request.model,
+            request.output_schema_json.is_some(),
+            &self.quota,
+        );
         child.kill();
         child.wait();
         let tail = child.stderr_tail();
@@ -231,14 +261,20 @@ impl ProviderBackend for ClaudeCodeBackend {
         let (events, outcome) = self.run(call.request());
         call.transported(events, outcome)
     }
+
+    fn plan_quota(&self) -> PlanQuotaSnapshot {
+        self.quota.snapshot()
+    }
 }
 
 fn read_stream(
     child: &mut dyn RunningChild,
     deadline: Instant,
     model: &str,
+    structured: bool,
+    quota: &QuotaCell,
 ) -> Result<Finished, Failure> {
-    let mut state = StreamState::new(model);
+    let mut state = StreamState::new(model, structured, quota);
     let finished = loop {
         match child.read_line(deadline) {
             StdoutRead::Line(line) => {
@@ -295,11 +331,13 @@ pub(crate) fn readiness(
     if !config.prompt_dir.is_dir() {
         return Err("prompt_dir");
     }
-    if tokens.read().is_none() {
-        return Err("token_credential");
-    }
     if !binary_matches_pin(config) {
         return Err("claude_binary_sha256");
+    }
+    // Last: outside the unit the credential is the one thing always absent,
+    // and it must not hide the faults the document itself has.
+    if tokens.read().is_none() {
+        return Err(tokens.missing());
     }
     Ok(())
 }
