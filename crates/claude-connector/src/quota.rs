@@ -110,7 +110,10 @@ mod tests {
         let cell = QuotaCell::new();
         cell.observe_at(100, [quota("five_hour", 80, 0)]);
         cell.observe_at(900, Vec::new());
-        assert_eq!(cell.snapshot_at(950).windows, vec![quota("five_hour", 80, 100)]);
+        assert_eq!(
+            cell.snapshot_at(950).windows,
+            vec![quota("five_hour", 80, 100)]
+        );
     }
 
     #[test]
@@ -123,7 +126,10 @@ mod tests {
         assert_eq!(expired.len(), 1);
         assert_eq!(expired[0].status, "expired");
         assert_eq!(expired[0].utilization_permille, None);
-        assert_eq!(expired[0].observed_at_unix_ms, 100, "its age stays readable");
+        assert_eq!(
+            expired[0].observed_at_unix_ms, 100,
+            "its age stays readable"
+        );
         assert_eq!(expired[0].resets_at_unix_ms, RESET);
     }
 

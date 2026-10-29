@@ -2456,7 +2456,12 @@ fn a_result_that_made_no_api_call_bills_nothing() {
         // CLI reported rows: the reservation stands.
         ("", 2300, empty, false),
         (r#""api_error_status":500,"#, 0, empty, false),
-        (r#""api_error_status":null,"#, 0, r#","model_usage_since_last_result":"?""#, false),
+        (
+            r#""api_error_status":null,"#,
+            0,
+            r#","model_usage_since_last_result":"?""#,
+            false,
+        ),
     ];
     for (status, api_ms, extra, free) in cases {
         let line = not_logged_in_line(status, api_ms, extra);

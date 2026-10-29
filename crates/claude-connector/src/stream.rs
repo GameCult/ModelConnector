@@ -357,11 +357,7 @@ fn fail(kind: FailureKind, message: &'static str) -> Step {
 /// 403 or 429, or a call never made); elsewhere the CLI also zeroes usage on
 /// crashes after real work. A call never made (`absent_is_zero`) may also
 /// omit the field. `None` is billed the reservation by the kit.
-fn read_usage(
-    reported: Option<Value>,
-    empty_is_zero: bool,
-    absent_is_zero: bool,
-) -> Option<Usage> {
+fn read_usage(reported: Option<Value>, empty_is_zero: bool, absent_is_zero: bool) -> Option<Usage> {
     let Some(reported) = reported else {
         return absent_is_zero.then(|| sum_usage(std::iter::empty()));
     };

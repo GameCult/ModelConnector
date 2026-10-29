@@ -107,15 +107,7 @@ mod tests {
             panic!("a readout is a map, not a positional array");
         };
         let names: Vec<&str> = fields.iter().filter_map(|(k, _)| k.as_str()).collect();
-        assert_eq!(
-            names,
-            [
-                "schema_id",
-                "at_unix_ms",
-                "callers",
-                "plan_quota"
-            ]
-        );
+        assert_eq!(names, ["schema_id", "at_unix_ms", "callers", "plan_quota"]);
         assert_eq!(wire_decode::<SpendReadout>(&bytes).unwrap(), readout());
     }
 
