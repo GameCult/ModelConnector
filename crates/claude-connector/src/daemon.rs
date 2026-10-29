@@ -436,6 +436,54 @@ mod tests {
     }
 
     #[test]
+    fn serve_errors_name_a_field_or_stage_and_never_a_stored_value() {
+        const CANARY: &str = "canary-path-8e2a";
+        let io = || std::io::Error::other(CANARY);
+        let cases: Vec<(ServeError, &str)> = vec![
+            (ServeError::InvalidConfig("callers"), "callers"),
+            (ServeError::BackendUnready("work_dir"), "work_dir"),
+            (
+                ServeError::FrameBound {
+                    max_frame_bytes: 4099,
+                    payload_bytes: 4096,
+                    needed_frame_bytes: 9999,
+                },
+                "max_frame_bytes",
+            ),
+            (ServeError::ConnectionKey(io()), "connection_key_file"),
+            (
+                ServeError::Service(ServiceError::ReplayStore(format!("{CANARY}/replay.cc"))),
+                "replay_store",
+            ),
+            (
+                ServeError::Service(ServiceError::UnpricedModel(CANARY.to_string())),
+                "prices",
+            ),
+            (
+                ServeError::Service(ServiceError::InvalidAdmission),
+                "callers",
+            ),
+            (
+                ServeError::Service(ServiceError::DuplicateCaller),
+                "callers",
+            ),
+            (
+                ServeError::Service(ServiceError::SharedCallerKey),
+                "callers",
+            ),
+            (ServeError::Listen(io()), "listener"),
+        ];
+        for (error, field) in cases {
+            let shown = ConfigError::from(error);
+            let text = format!("{shown} {shown:?}");
+            assert!(text.contains(field), "{text}");
+            for stored in [CANARY, "4099", "9999", "replay.cc"] {
+                assert!(!text.contains(stored), "{text}");
+            }
+        }
+    }
+
+    #[test]
     fn the_log_gets_the_size_of_the_childs_stderr_and_never_its_bytes() {
         let log = Captured::default();
         let sink = LogSink(Mutex::new(log.clone()));
