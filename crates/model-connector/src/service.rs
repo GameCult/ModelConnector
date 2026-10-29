@@ -679,7 +679,7 @@ impl TransportService {
             &readout,
             &asker.security,
         )?;
-        if encode_spend_readout_response_frame(&sealed)?.len() > max_frame_bytes {
+        if !readout_fits_frame(&sealed, max_frame_bytes)? {
             return Err(ServiceError::FrameBound);
         }
         Ok(sealed)
@@ -1083,6 +1083,14 @@ impl TransportService {
 
 fn fits_frame(envelope: &TransportEnvelope, max_frame_bytes: usize) -> Result<bool, ServiceError> {
     encode_result_frame(envelope).map(|bytes| bytes.len() <= max_frame_bytes)
+}
+
+/// `fits_frame` for the frame a spend readout answer travels in.
+fn readout_fits_frame(
+    envelope: &TransportEnvelope,
+    max_frame_bytes: usize,
+) -> Result<bool, ServiceError> {
+    encode_spend_readout_response_frame(envelope).map(|bytes| bytes.len() <= max_frame_bytes)
 }
 
 /// The provider named on the stand-in failure, fixed so its size is bounded.
@@ -1836,6 +1844,17 @@ mod tests {
         let size = encode_result_frame(&envelope).unwrap().len();
         assert_eq!(fits_frame(&envelope, size), Ok(true));
         assert_eq!(fits_frame(&envelope, size - 1), Ok(false));
+    }
+
+    #[test]
+    fn a_readout_frame_check_is_inclusive_of_the_serialized_envelope() {
+        let readout = SpendReadout::new(1, Vec::new(), PlanQuotaSnapshot::default());
+        let envelope = encrypt_spend_readout(CALLER, "sized", &readout, &security(KEY)).unwrap();
+        let size = encode_spend_readout_response_frame(&envelope)
+            .unwrap()
+            .len();
+        assert_eq!(readout_fits_frame(&envelope, size), Ok(true));
+        assert_eq!(readout_fits_frame(&envelope, size - 1), Ok(false));
     }
 
     fn claim_for(
@@ -3837,19 +3856,10 @@ mod tests {
     fn a_readout_that_cannot_fit_the_frame_is_a_frame_bound_failure() {
         let store = TestStore::new();
         let service = open_service(&store, 4);
-        let asked = encrypt_spend_readout_request(CALLER, "readout-1", &security(KEY)).unwrap();
-        let answer = service
-            .spend_readout(&asked, 1_000, PlanQuotaSnapshot::default(), FRAME)
-            .unwrap();
-        let exact = encode_spend_readout_response_frame(&answer).unwrap().len();
-        assert!(readout_as(&service, CALLER, KEY, 1_000, exact).is_ok());
-        assert_eq!(
-            readout_as(&service, CALLER, KEY, 1_000, exact - 1).unwrap_err(),
-            ServiceError::FrameBound
-        );
         assert_eq!(
             readout_as(&service, CALLER, KEY, 1_000, 64).unwrap_err(),
             ServiceError::FrameBound
         );
+        assert!(readout_as(&service, CALLER, KEY, 1_000, FRAME).is_ok());
     }
 }
