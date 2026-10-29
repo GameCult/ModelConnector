@@ -306,6 +306,16 @@ mod unix {
             fd
         }
 
+        /// The three tests below name descriptor numbers by value, and a number
+        /// one releases is the lowest free one for the next `high_dup`. They
+        /// hold this for their whole body, so none sees a number another
+        /// freed or places over one another owns.
+        static FDS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+        fn fds() -> std::sync::MutexGuard<'static, ()> {
+            FDS.lock().unwrap_or_else(|e| e.into_inner())
+        }
+
         fn close(fd: RawFd) {
             // SAFETY: closing a descriptor the test owns.
             unsafe { libc::close(fd) };
@@ -313,6 +323,7 @@ mod unix {
 
         #[test]
         fn placing_a_descriptor_on_itself_clears_close_on_exec() {
+            let _held = fds();
             let (reader, _writer) = std::io::pipe().unwrap();
             let fd = high_dup(reader.as_raw_fd(), true);
             assert!(cloexec(fd));
@@ -326,6 +337,7 @@ mod unix {
 
         #[test]
         fn placing_a_descriptor_elsewhere_copies_it_open_across_exec() {
+            let _held = fds();
             let (reader, _writer) = std::io::pipe().unwrap();
             let source = high_dup(reader.as_raw_fd(), true);
             let target = high_dup(reader.as_raw_fd(), true);
@@ -339,6 +351,7 @@ mod unix {
 
         #[test]
         fn a_descriptor_that_is_not_open_is_refused_either_way() {
+            let _held = fds();
             let (reader, _writer) = std::io::pipe().unwrap();
             let closed = high_dup(reader.as_raw_fd(), true);
             close(closed);
