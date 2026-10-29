@@ -74,8 +74,7 @@
       "type": "object",
       "properties": {
         "observed_at_unix_ms": {
-          "description": "When this window was last reported. Its age in a readout is the
-readout's `at_unix_ms` minus this.",
+          "description": "When this window was last reported. Its age in a readout is the\nreadout's `at_unix_ms` minus this.",
           "type": "integer",
           "format": "uint64",
           "minimum": 0
@@ -89,9 +88,7 @@ readout's `at_unix_ms` minus this.",
           "type": "string"
         },
         "utilization_permille": {
-          "description": "How much of the window was used when it was observed, in thousandths;
-`None` once the window has reset (`status` is then `expired`), because
-the old reading says nothing about the new window.",
+          "description": "How much of the window was used when it was observed, in thousandths;\n`None` once the window has reset (`status` is then `expired`), because\nthe old reading says nothing about the new window.",
           "type": [
             "integer",
             "null"
