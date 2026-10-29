@@ -277,10 +277,10 @@ fn read_stream(
     child: &mut dyn RunningChild,
     deadline: Instant,
     model: &str,
-    structured: bool,
+    schema: Option<&str>,
     quota: &QuotaCell,
 ) -> Result<Finished, Failure> {
-    let mut state = StreamState::new(model, structured, quota);
+    let mut state = StreamState::new(model, schema, quota);
     let finished = loop {
         match child.read_line(deadline) {
             StdoutRead::Line(line) => {
