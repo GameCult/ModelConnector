@@ -12,9 +12,11 @@ use zeroize::Zeroizing;
 
 use crate::contract::TransportResult;
 use crate::envelope::{
-    ServiceError, TransportFrameError, decode_invocation_frame, encode_result_frame,
-    frame_bytes_for_payload, read_transport_frame, write_transport_frame,
+    RequestFrame, ServiceError, TransportFrameError, decode_request_frame, encode_result_frame,
+    encode_spend_readout_response_frame, frame_bytes_for_payload, read_transport_frame,
+    write_transport_frame,
 };
+use crate::readout::PlanQuotaSnapshot;
 use crate::service::{
     CallerAdmission, PriceTable, ProviderCall, SpendCeiling, SpendWindowMs, TransportAdmission,
     TransportService,
@@ -32,6 +34,11 @@ pub trait ProviderBackend: Send + Sync {
     /// `serve` on: it names the provider on every receipt and decides which
     /// reasoning state is foreign.
     fn provider(&self) -> &str;
+    /// What the provider's own plan allows and has used, for the spend
+    /// readout. A provider with no plan to report keeps the default.
+    fn plan_quota(&self) -> PlanQuotaSnapshot {
+        PlanQuotaSnapshot::default()
+    }
     /// Executes one admitted call. The service has already bound it to its
     /// caller and recorded its replay claim. The call cannot show a foreign
     /// reasoning item and builds the result's receipt itself.
@@ -232,17 +239,28 @@ fn serve_connection(
         .and_then(|()| stream.set_write_timeout(Some(timeout)))
         .map_err(ServeError::Connection)?;
     let request = read_transport_frame(&mut stream, limits.max_frame_bytes).map_err(frame_error)?;
-    let response = execute_inference_frame(&request, service, backend, limits)?;
+    let response = answer_frame(&request, service, backend, limits)?;
     write_transport_frame(&mut stream, &response, limits.max_frame_bytes).map_err(frame_error)
 }
 
-fn execute_inference_frame(
+fn answer_frame(
     request: &[u8],
     service: &Mutex<TransportService>,
     backend: &dyn ProviderBackend,
     limits: &ServeLimits,
 ) -> Result<Vec<u8>, ServeError> {
-    let envelope = decode_invocation_frame(request).map_err(|_| ServeError::FrameEncoding)?;
+    let envelope = match decode_request_frame(request).map_err(|_| ServeError::FrameEncoding)? {
+        RequestFrame::Invoke(envelope) => envelope,
+        RequestFrame::SpendReadout(envelope) => {
+            let plan = backend.plan_quota();
+            let response = service
+                .lock()
+                .map_err(|_| ServeError::ServicePoisoned)?
+                .spend_readout(&envelope, unix_ms()?, plan, limits.max_frame_bytes)?;
+            return encode_spend_readout_response_frame(&response)
+                .map_err(|_| ServeError::FrameEncoding);
+        }
+    };
     let admission = service
         .lock()
         .map_err(|_| ServeError::ServicePoisoned)?
@@ -493,6 +511,92 @@ mod tests {
                 spend_window_ms: WINDOW_MS,
             })
             .collect()
+    }
+
+    /// A counting backend that reports a plan, as a provider with one would.
+    struct PlanBackend {
+        inner: Arc<CountingBackend>,
+        plan: PlanQuotaSnapshot,
+    }
+
+    impl ProviderBackend for PlanBackend {
+        fn ready(&self) -> Result<(), &'static str> {
+            self.inner.ready()
+        }
+
+        fn provider(&self) -> &str {
+            self.inner.provider()
+        }
+
+        fn plan_quota(&self) -> PlanQuotaSnapshot {
+            self.plan.clone()
+        }
+
+        fn execute(&self, call: &ProviderCall) -> TransportResult {
+            self.inner.execute(call)
+        }
+    }
+
+    #[test]
+    fn serve_reads_out_spend_and_plan_quota_without_executing_anything() {
+        let store = TestStore::new();
+        let inner = CountingBackend::new(true);
+        let plan = PlanQuotaSnapshot {
+            windows: vec![crate::readout::PlanQuota {
+                window: "five_hour".into(),
+                utilization_permille: 80,
+                resets_at_unix_ms: 1_793_307_000_000,
+                status: "allowed".into(),
+            }],
+            observed_at_unix_ms: Some(1_793_300_000_000),
+        };
+        let backend = Arc::new(PlanBackend {
+            inner: inner.clone(),
+            plan: plan.clone(),
+        });
+        let (client, endpoint) = start_with(backend, &store, vec![caller(CALLER, KEY, 4)]);
+        client.execute(&fresh("request-1")).unwrap();
+        assert_eq!(inner.executions.load(Ordering::SeqCst), 1);
+
+        let before = now_ms();
+        let readout = client.spend_readout(CALLER).unwrap();
+        assert!(readout.at_unix_ms >= before && readout.at_unix_ms <= now_ms());
+        assert_eq!(readout.plan_quota, plan.windows);
+        assert_eq!(
+            readout.plan_quota_observed_at_unix_ms,
+            plan.observed_at_unix_ms
+        );
+        let [row] = readout.callers.as_slice() else {
+            panic!("one admitted caller");
+        };
+        assert_eq!(row.caller_id, CALLER);
+        assert_eq!((row.ceiling_micro_usd, row.window_ms), (CEILING, WINDOW_MS));
+        assert!(row.spent_micro_usd > 0, "the settled call was charged");
+        assert_eq!(row.reserved_micro_usd, 0);
+        assert_eq!(
+            inner.executions.load(Ordering::SeqCst),
+            1,
+            "a readout runs nothing"
+        );
+
+        // A client without the caller's key is dropped, not answered.
+        let stranger = ConnectorClient::new(
+            endpoint,
+            "some-other-key",
+            FRAME,
+            Some(Duration::from_secs(5)),
+        )
+        .unwrap();
+        assert!(stranger.spend_readout(CALLER).is_err());
+    }
+
+    #[test]
+    fn a_backend_with_no_plan_reads_out_none() {
+        let store = TestStore::new();
+        let (client, _) = start(CountingBackend::new(true), &store);
+        let readout = client.spend_readout(CALLER).unwrap();
+        assert!(readout.plan_quota.is_empty());
+        assert_eq!(readout.plan_quota_observed_at_unix_ms, None);
     }
 
     #[test]

@@ -4,11 +4,16 @@ use std::time::Duration;
 use thiserror::Error;
 use zeroize::Zeroizing;
 
+use rand_core::{OsRng, RngCore};
+
 use crate::contract::{TransportInvocation, TransportKey, TransportResult};
 use crate::envelope::{
-    MAX_IDENTITY_BYTES, ServiceError, TransportFrameError, decode_result_frame, decrypt_result,
-    encode_invocation_frame, encrypt_invocation, read_transport_frame, write_transport_frame,
+    MAX_IDENTITY_BYTES, ServiceError, TransportFrameError, decode_result_frame,
+    decode_spend_readout_response_frame, decrypt_result, decrypt_spend_readout,
+    encode_invocation_frame, encode_spend_readout_request_frame, encrypt_invocation,
+    encrypt_spend_readout_request, read_transport_frame, write_transport_frame,
 };
+use crate::readout::SpendReadout;
 
 #[derive(Clone)]
 pub struct ConnectorClient {
@@ -52,6 +57,34 @@ impl ConnectorClient {
             return Err(ConnectorClientError::RequestIdTooLong);
         }
         let request = encode_invocation_frame(&encrypt_invocation(invocation, &self.security)?)?;
+        let response = self.exchange(&request)?;
+        let envelope = decode_result_frame(&response)?;
+        decrypt_result(&envelope, &self.security, invocation).map_err(Into::into)
+    }
+
+    /// Reads the connector's spend ledger and plan quota as `caller_runtime_id`,
+    /// which must be a caller whose connection key this client holds.
+    pub fn spend_readout(
+        &self,
+        caller_runtime_id: &str,
+    ) -> Result<SpendReadout, ConnectorClientError> {
+        let mut nonce = [0_u8; 16];
+        OsRng.fill_bytes(&mut nonce);
+        let request_id = format!(
+            "spend-readout-{}",
+            nonce.iter().map(|b| format!("{b:02x}")).collect::<String>()
+        );
+        let sealed = encrypt_spend_readout_request(caller_runtime_id, &request_id, &self.security)?;
+        let response = self.exchange(&encode_spend_readout_request_frame(&sealed)?)?;
+        let envelope = decode_spend_readout_response_frame(&response)?;
+        if envelope.caller_runtime_id != caller_runtime_id || envelope.request_id != request_id {
+            return Err(ServiceError::OuterIdentity.into());
+        }
+        decrypt_spend_readout(&envelope, &self.security).map_err(Into::into)
+    }
+
+    /// Sends one frame on a fresh connection and reads the one answer.
+    fn exchange(&self, request: &[u8]) -> Result<Vec<u8>, ConnectorClientError> {
         let connect_timeout = self
             .response_timeout
             .unwrap_or(Duration::from_secs(10))
@@ -62,12 +95,9 @@ impl ConnectorClient {
             .set_read_timeout(self.response_timeout)
             .and_then(|()| stream.set_write_timeout(self.response_timeout))
             .map_err(ConnectorClientError::Connection)?;
-        write_transport_frame(&mut stream, &request, self.max_frame_bytes)
+        write_transport_frame(&mut stream, request, self.max_frame_bytes)
             .map_err(client_frame_error)?;
-        let response =
-            read_transport_frame(&mut stream, self.max_frame_bytes).map_err(client_frame_error)?;
-        let envelope = decode_result_frame(&response)?;
-        decrypt_result(&envelope, &self.security, invocation).map_err(Into::into)
+        read_transport_frame(&mut stream, self.max_frame_bytes).map_err(client_frame_error)
     }
 }
 
