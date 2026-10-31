@@ -887,7 +887,6 @@ mod tests {
             [0xff; 32],
             [0xff; 32],
             0,
-            u64::MAX,
         ))
         .unwrap()
         .len();

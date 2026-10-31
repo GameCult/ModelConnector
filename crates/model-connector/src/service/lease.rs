@@ -301,9 +301,9 @@ mod tests {
             else {
                 return None;
             };
-            let result = crate::envelope::decrypt_result(&reply, &security(KEY)).unwrap();
+            let result = crate::envelope::decrypt_result(&reply, &security(KEY), &invocation).unwrap();
             match result.disposition {
-                TransportDisposition::Refused { refusal } => Some(refusal),
+                TransportDisposition::Refused(refusal) => Some(refusal),
                 other => panic!("unexpected {other:?}"),
             }
         };
