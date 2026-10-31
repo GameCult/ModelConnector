@@ -1805,7 +1805,7 @@ fn usage_the_result_does_not_report_stays_unknown() {
 
 #[test]
 fn door_set_is_exactly_401_403_429() {
-    // Ruling claude-code-plan-quota-fuse-2 with spend-bills-on-identity-not-
+    // Ruling claude-code-plan-quota-fuse-2 with its
     // validity: a refusal at the door is charged nothing, for exactly the
     // statuses the provider cannot have billed (401, 403, 429) and only when
     // the result says its usage is explicitly empty. Every other shape is
