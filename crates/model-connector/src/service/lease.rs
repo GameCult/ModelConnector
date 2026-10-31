@@ -129,7 +129,11 @@ impl TransportService {
         let spend_window_ms = caller.spend_window_ms;
         let connection_key_epoch = caller.connection_key_epoch;
         require_id(invocation_id, "invocation_id")?;
-        if invocation_id.len() + LEASE_PREFIX.len() + SEQUENCE_SUFFIX_BYTES > MAX_IDENTITY_BYTES {
+        let suffix = match turn {
+            LeaseTurn::SelfRun => 0,
+            LeaseTurn::PersonaTurn => SEQUENCE_SUFFIX_BYTES,
+        };
+        if invocation_id.len() + LEASE_PREFIX.len() + suffix > MAX_IDENTITY_BYTES {
             return Err(ContractError::Invalid("invocation_id").into());
         }
         if max_cost_micro_usd == 0 {
@@ -724,9 +728,29 @@ mod tests {
             .unwrap();
         assert!(
             service
-                .begin_lease(CALLER, LeaseTurn::SelfRun, &format!("{longest}r"), 100, NOW + 1, NOW)
+                .begin_lease(
+                    CALLER,
+                    LeaseTurn::SelfRun,
+                    &format!("{longest}r"),
+                    100,
+                    NOW + 1,
+                    NOW
+                )
                 .is_err()
         );
+    }
+
+    #[test]
+    fn a_persona_invocation_id_leaves_room_for_its_sequence() {
+        let store = TestStore::new();
+        let mut service = open(&store, 1 << 40);
+        let longest = "r".repeat(MAX_IDENTITY_BYTES - LEASE_PREFIX.len() - SEQUENCE_SUFFIX_BYTES);
+        let persona = |service: &mut TransportService, id: &str| {
+            service.begin_lease(CALLER, LeaseTurn::PersonaTurn, id, 100, NOW + 60_000, NOW)
+        };
+        let grant = granted(persona(&mut service, &longest).unwrap());
+        assert!(grant.lease_id.len() <= MAX_IDENTITY_BYTES);
+        assert!(persona(&mut service, &format!("{longest}r")).is_err());
     }
 
     #[test]
