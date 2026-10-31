@@ -215,8 +215,6 @@ fn granted_ok(answer: &Answer) -> bool {
     matches!(answer.message, Some(LeaseMessage::ClaudeLeaseGrant(_))) && answer.fds.len() == 1
 }
 
-/// Asks, as a fresh unit invocation each time, until the caller's previous
-
 fn contains(haystack: &[u8], needle: &str) -> bool {
     haystack
         .windows(needle.len())
