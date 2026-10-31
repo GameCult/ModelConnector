@@ -642,8 +642,6 @@ mod tests {
         ));
         assert_eq!(inner.executions.load(Ordering::SeqCst), 1);
     }
-        assert_eq!(backend.executions.load(Ordering::SeqCst), 1);
-    }
 
     #[test]
     fn serve_end_to_end_replays_without_a_second_execution() {
