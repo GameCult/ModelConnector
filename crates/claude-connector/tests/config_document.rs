@@ -280,6 +280,9 @@ fn the_dollar_flags_are_not_flags() {
         let scratch = Scratch::new();
         let made = init(&scratch, &init_flags(&scratch, extra));
         assert!(!made.status.success(), "{extra:?} was accepted");
-        assert!(!Path::new(&scratch.path("connector.cc")).exists(), "{extra:?}");
+        assert!(
+            !Path::new(&scratch.path("connector.cc")).exists(),
+            "{extra:?}"
+        );
     }
 }

@@ -762,8 +762,15 @@ mod tests {
     #[test]
     fn the_invocations_identity_covers_its_request() {
         let one = invocation();
-        let mut other = one.clone();
-        other.request.max_output_tokens += 1;
+        let mut request = one.request.clone();
+        request.max_output_tokens += 1;
+        let other = TransportInvocation::new(
+            one.caller_runtime_id.clone(),
+            one.expires_at_unix_ms,
+            one.native_request_sha256,
+            request,
+        )
+        .unwrap();
         assert_ne!(
             canonical_invocation_bytes(&one).unwrap(),
             canonical_invocation_bytes(&other).unwrap()

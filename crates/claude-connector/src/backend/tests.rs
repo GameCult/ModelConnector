@@ -5,8 +5,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use model_connector::{
-    CallerAdmission, PlanQuotaSnapshot, ReasoningEffort, StopReason, ToolDefinition, TransportAdmission, TransportDisposition, TransportInvocation,
-    TransportKey, TransportReceipt, TransportService, decrypt_result, encrypt_invocation,
+    CallerAdmission, PlanQuotaSnapshot, ReasoningEffort, StopReason, ToolDefinition,
+    TransportAdmission, TransportDisposition, TransportInvocation, TransportKey, TransportReceipt,
+    TransportService, decrypt_result, encrypt_invocation,
 };
 
 use super::*;
@@ -480,8 +481,7 @@ impl Door {
             .unwrap()
         });
         let service =
-            TransportService::open(&dir.join("replay.cc"), PROVIDER, callers, 5_000)
-                .unwrap();
+            TransportService::open(&dir.join("replay.cc"), PROVIDER, callers, 5_000).unwrap();
         Self { dir, service }
     }
 
@@ -498,13 +498,13 @@ impl Door {
         request: ProviderRequest,
     ) -> (model_connector::ExecutionClaim, TransportInvocation) {
         let key = TransportKey::from_connection_secret(&format!("{caller}-key")).unwrap();
-        let invocation =
-            TransportInvocation::new(caller, 2_000, [7; 32], request).unwrap();
+        let invocation = TransportInvocation::new(caller, 2_000, [7; 32], request).unwrap();
         let envelope = encrypt_invocation(&invocation, &key).unwrap();
         match self
             .service
             .begin(&envelope, 1_000, &PlanQuotaSnapshot::default(), FRAME)
-            .unwrap() {
+            .unwrap()
+        {
             TransportAdmission::Execute(claim) => (*claim, invocation),
             TransportAdmission::Reply(_) => panic!("the door answered instead of admitting"),
         }

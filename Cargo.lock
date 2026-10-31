@@ -144,6 +144,7 @@ dependencies = [
  "libc",
  "model-connector",
  "rmp-serde",
+ "rmpv",
  "serde",
  "serde_json",
  "sha2",

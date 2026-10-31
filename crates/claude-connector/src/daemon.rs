@@ -11,8 +11,8 @@ use std::time::Duration;
 
 use cultcache_rs::{CultCache, DatabaseEntry, SingleFileMessagePackBackingStore};
 use model_connector::{
-    CallerAdmission, CallerConfig, LeaseTurn, MIN_PAYLOAD_BYTES, ProviderBackend,
-    ServeError, ServeLimits, ServiceError, TransportService, load_admissions, serve_service,
+    CallerAdmission, CallerConfig, LeaseTurn, MIN_PAYLOAD_BYTES, ProviderBackend, ServeError,
+    ServeLimits, ServiceError, TransportService, load_admissions, serve_service,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -230,9 +230,7 @@ impl ClaudeConnectorConfig {
             }
             let mut seen = BTreeSet::new();
             for model in &caller.allowed_models {
-                if !has_model_id_form(model)
-                    || !seen.insert(model.as_str())
-                {
+                if !has_model_id_form(model) || !seen.insert(model.as_str()) {
                     return Err(ConfigError::Invalid("allowed_models"));
                 }
             }
@@ -343,7 +341,6 @@ fn has_model_id_form(model: &str) -> bool {
         && digits(major, 2)
         && after_ok
 }
-
 
 /// One file name under `$CREDENTIALS_DIRECTORY`, never a path.
 fn is_credential_name(name: &str) -> bool {

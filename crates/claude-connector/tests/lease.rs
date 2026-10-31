@@ -279,7 +279,12 @@ fn start(setup: Setup) -> Harness {
     });
     let quota = Arc::new(QuotaCell::new());
     let listener = UnixListener::bind(&socket).unwrap();
-    let serving = (service.clone(), quota.clone(), tokens.clone(), units.clone());
+    let serving = (
+        service.clone(),
+        quota.clone(),
+        tokens.clone(),
+        units.clone(),
+    );
     let caller = LeaseCaller {
         uid: setup.uid,
         caller_id: CALLER.to_string(),
@@ -343,7 +348,10 @@ fn ask_until_granted(harness: &Harness, first_invocation: u64) -> Answer {
 fn a_grant_passes_one_fd_holding_the_token_then_end_of_file() {
     let harness = start(setup());
     let mut answer = ask(&harness, 60_000);
-    assert_eq!(granted(&answer).lease_id, format!("lease:{}", invocation(1)));
+    assert_eq!(
+        granted(&answer).lease_id,
+        format!("lease:{}", invocation(1))
+    );
     assert_eq!(answer.fds.len(), 1);
     let mut read = Vec::new();
     File::from(answer.fds.remove(0))
@@ -351,7 +359,10 @@ fn a_grant_passes_one_fd_holding_the_token_then_end_of_file() {
         .unwrap();
     assert_eq!(read, TOKEN.as_bytes());
     assert_eq!(harness.tokens.reads.load(Ordering::SeqCst), 1);
-    assert!(!contains(&answer.raw, TOKEN), "the token is in the pipe only");
+    assert!(
+        !contains(&answer.raw, TOKEN),
+        "the token is in the pipe only"
+    );
 }
 
 #[test]
@@ -416,7 +427,10 @@ fn a_rejected_window_refuses_the_lease_until_its_reset() {
         .quota
         .observe([window("five_hour", 1_000, "rejected", reset)]);
     let refused = ask(&harness, 60_000);
-    assert_eq!(refusal_of(&refused), Some(LeaseRefusalKind::ProviderRejected));
+    assert_eq!(
+        refusal_of(&refused),
+        Some(LeaseRefusalKind::ProviderRejected)
+    );
     assert!(refused.fds.is_empty());
     assert_eq!(harness.tokens.reads.load(Ordering::SeqCst), 0);
     // At the provider's own reset the refusal lifts, with no one lifting it.

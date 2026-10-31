@@ -11,12 +11,6 @@
       "format": "uint64",
       "minimum": 0
     },
-    "max_cost_micro_usd": {
-      "description": "The most this request may cost, in micro-USD: the caller's own bound\non it. Required nonzero. It is part of the invocation's identity, so a\nchanged budget under a recorded request id is a `ReplayConflict`.",
-      "type": "integer",
-      "format": "uint64",
-      "minimum": 0
-    },
     "native_request_sha256": {
       "type": "array",
       "items": {
@@ -53,7 +47,6 @@
     "expires_at_unix_ms",
     "native_request_sha256",
     "provider_request_sha256",
-    "max_cost_micro_usd",
     "request"
   ],
   "$defs": {

@@ -524,7 +524,8 @@ impl TransportService {
             .get::<ReplayRecord>(&replay_key(&identity))
             .map_err(replay_store_error)?
             .ok_or(ServiceError::NoActiveRequest)?;
-        if active.state != ReplayState::Active || active.invocation_sha256 != claim.invocation_sha256
+        if active.state != ReplayState::Active
+            || active.invocation_sha256 != claim.invocation_sha256
         {
             return Err(ServiceError::ActiveRequestMismatch);
         }
@@ -897,13 +898,9 @@ mod tests {
 
         let mut changed_request = request();
         changed_request.instructions.push_str(" Different cargo.");
-        let conflicting = TransportInvocation::new(
-            "epiphany-yggdrasil",
-            2_000,
-            [7; 32],
-            changed_request,
-        )
-        .unwrap();
+        let conflicting =
+            TransportInvocation::new("epiphany-yggdrasil", 2_000, [7; 32], changed_request)
+                .unwrap();
         let refusal = match service
             .begin_unplanned(
                 &encrypt_invocation(&conflicting, &security).unwrap(),
@@ -932,7 +929,9 @@ mod tests {
         let mut service = open_service(&store, 1);
         let first_envelope = encrypt_invocation(&first, &security).unwrap();
         assert!(matches!(
-            service.begin_unplanned(&first_envelope, 1_000, FRAME).unwrap(),
+            service
+                .begin_unplanned(&first_envelope, 1_000, FRAME)
+                .unwrap(),
             TransportAdmission::Execute(_)
         ));
 
@@ -1035,10 +1034,12 @@ mod tests {
     ) -> (TransportAdmission, TransportInvocation) {
         let mut request = invocation_for(CALLER, request_id).request;
         edit(&mut request);
-        let invocation =
-            TransportInvocation::new(CALLER, 2_000, [7; 32], request).unwrap();
+        let invocation = TransportInvocation::new(CALLER, 2_000, [7; 32], request).unwrap();
         let envelope = encrypt_invocation(&invocation, &security(KEY)).unwrap();
-        (service.begin_unplanned(&envelope, 1_000, FRAME).unwrap(), invocation)
+        (
+            service.begin_unplanned(&envelope, 1_000, FRAME).unwrap(),
+            invocation,
+        )
     }
 
     fn refusal_of(admission: TransportAdmission, invocation: &TransportInvocation) -> Refusal {
@@ -1118,14 +1119,9 @@ mod tests {
                 32_768,
             )
             .unwrap();
-            TransportService::open(
-                &store.path,
-                "fixture-sse",
-                [admission],
-                5_000,
-            )
-            .unwrap()
-            .begin_unplanned(&envelope, 1_000, FRAME)
+            TransportService::open(&store.path, "fixture-sse", [admission], 5_000)
+                .unwrap()
+                .begin_unplanned(&envelope, 1_000, FRAME)
         };
         assert!(matches!(admit(size), Ok(TransportAdmission::Execute(_))));
         let refused = admit(size - 1).unwrap();
@@ -1272,15 +1268,7 @@ mod tests {
     #[test]
     fn identities_are_bounded_at_admission_and_on_the_request() {
         let admit = |caller_id: String, model: String| {
-            CallerAdmission::new(
-                caller_id,
-                KEY,
-                1,
-                [model],
-                4,
-                64 * 1024,
-                32_768,
-            )
+            CallerAdmission::new(caller_id, KEY, 1, [model], 4, 64 * 1024, 32_768)
         };
         let at = "i".repeat(MAX_IDENTITY_BYTES);
         let over = "i".repeat(MAX_IDENTITY_BYTES + 1);
@@ -1298,7 +1286,9 @@ mod tests {
         let mut service = open_service(&store, 8);
         let ok = invocation_for(CALLER, &at);
         assert!(matches!(
-            service.begin_unplanned(&raw_envelope(&ok), 1_000, FRAME).unwrap(),
+            service
+                .begin_unplanned(&raw_envelope(&ok), 1_000, FRAME)
+                .unwrap(),
             TransportAdmission::Execute(_)
         ));
     }
@@ -1315,8 +1305,9 @@ mod tests {
             let mut service = open_service(&store, 1);
             let id = "i".repeat(length);
             let long = invocation_for(CALLER, &id);
-            let TransportAdmission::Reply(reply) =
-                service.begin_unplanned(&raw_envelope(&long), 1_000, FRAME).unwrap()
+            let TransportAdmission::Reply(reply) = service
+                .begin_unplanned(&raw_envelope(&long), 1_000, FRAME)
+                .unwrap()
             else {
                 panic!("an over-long id must be refused, not executed ({length})");
             };
@@ -1353,7 +1344,9 @@ mod tests {
         let store = TestStore::new();
         let mut service = open_service(&store, 1);
         assert!(matches!(
-            service.begin_unplanned(&raw_envelope(&long), 1_000, frame_cap).unwrap(),
+            service
+                .begin_unplanned(&raw_envelope(&long), 1_000, frame_cap)
+                .unwrap(),
             TransportAdmission::Reply(_)
         ));
         assert_eq!(
@@ -1543,7 +1536,9 @@ mod tests {
         let big = text_result(claim.call(), "y");
         service.complete(*claim, big, FRAME).unwrap();
         assert_eq!(
-            service.begin_unplanned(&raw_envelope(&invocation), 1_000, 10).err(),
+            service
+                .begin_unplanned(&raw_envelope(&invocation), 1_000, 10)
+                .err(),
             Some(ServiceError::FrameBound)
         );
     }
@@ -1758,25 +1753,15 @@ mod tests {
         for tag in ["", " ", STAND_IN_PROVIDER] {
             assert!(
                 matches!(
-                    TransportService::open(
-                        &store.path,
-                        tag,
-                        [caller(CALLER, KEY, 1)],
-                        5_000
-                    ),
+                    TransportService::open(&store.path, tag, [caller(CALLER, KEY, 1)], 5_000),
                     Err(ServiceError::InvalidAdmission)
                 ),
                 "{tag:?}"
             );
         }
         assert!(
-            TransportService::open(
-                &store.path,
-                "fixture-sse",
-                [caller(CALLER, KEY, 1)],
-                5_000
-            )
-            .is_ok()
+            TransportService::open(&store.path, "fixture-sse", [caller(CALLER, KEY, 1)], 5_000)
+                .is_ok()
         );
     }
 
@@ -2060,12 +2045,7 @@ mod tests {
                 .unwrap();
         }
         assert!(matches!(
-            TransportService::open(
-                &store.path,
-                "fixture-sse",
-                [caller(CALLER, KEY, 1)],
-                5_000
-            ),
+            TransportService::open(&store.path, "fixture-sse", [caller(CALLER, KEY, 1)], 5_000),
             Err(ServiceError::ReplayStore(_))
         ));
     }

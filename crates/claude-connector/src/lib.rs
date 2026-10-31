@@ -28,8 +28,8 @@ pub use launch::ChildEnv;
 #[cfg(target_os = "linux")]
 pub use lease::{
     LeaseCaller, LeaseGranted, LeaseLimits, LeaseMessage, LeaseRefusalKind, LeaseRefused,
-    LeaseRequest, MAX_LEASE_FRAME_BYTES, PeerCredentials, PeerUnit,
-    PeerUnits, decode_frame, encode_frame, peer_credentials, serve_leases, user_uid,
+    LeaseRequest, MAX_LEASE_FRAME_BYTES, PeerCredentials, PeerUnit, PeerUnits, decode_frame,
+    encode_frame, peer_credentials, serve_leases, user_uid,
 };
 #[cfg(unix)]
 pub use process::StdProcessPort;

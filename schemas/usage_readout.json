@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "UsageReadout",
+  "type": "object",
+  "properties": {
+    "at_unix_ms": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "plan_quota": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/PlanQuota"
+      }
+    },
+    "schema_id": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "schema_id",
+    "at_unix_ms",
+    "plan_quota"
+  ],
+  "$defs": {
+    "PlanQuota": {
+      "description": "One window of the subscription plan, as the provider reported it.",
+      "type": "object",
+      "properties": {
+        "observed_at_unix_ms": {
+          "description": "When this window was last reported. Its age in a readout is the\nreadout's `at_unix_ms` minus this.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "resets_at_unix_ms": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "status": {
+          "type": "string"
+        },
+        "utilization_permille": {
+          "description": "How much of the window was used when it was observed, in thousandths;\n`None` once the window has reset (`status` is then `expired`), because\nthe old reading says nothing about the new window.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "window": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "window",
+        "resets_at_unix_ms",
+        "status",
+        "observed_at_unix_ms"
+      ]
+    }
+  }
+}

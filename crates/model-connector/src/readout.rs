@@ -9,7 +9,6 @@ use crate::contract::ContractError;
 
 pub const USAGE_READOUT_SCHEMA_ID: &str = "gamecult.model.usage_readout.v1";
 
-
 /// One window of the subscription plan, as the provider reported it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]

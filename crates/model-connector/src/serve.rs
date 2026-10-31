@@ -382,10 +382,7 @@ mod tests {
         FailureKind, Refusal, TransportDisposition, TransportEvent, TransportEventPayload,
         TransportInvocation, TransportOutcome, TransportResult,
     };
-    use crate::fixtures::{
-        TestStore, caller, invocation_for, receipt,
-        request,
-    };
+    use crate::fixtures::{TestStore, caller, invocation_for, receipt, request};
 
     const CALLER: &str = "epiphany-yggdrasil";
     const KEY: &str = "epiphany-distinct-test-key";
@@ -461,13 +458,7 @@ mod tests {
         let (sender, receiver) = std::sync::mpsc::channel();
         let path = path.to_path_buf();
         thread::spawn(move || {
-            let _ = sender.send(serve(
-                listener,
-                limits,
-                admissions,
-                &path,
-                backend,
-            ));
+            let _ = sender.send(serve(listener, limits, admissions, &path, backend));
         });
         receiver.recv_timeout(Duration::from_secs(2)).ok()
     }
@@ -493,15 +484,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let endpoint = listener.local_addr().unwrap();
         let path = store.path.clone();
-        thread::spawn(move || {
-            serve(
-                listener,
-                limits(),
-                admissions,
-                &path,
-                backend,
-            )
-        });
+        thread::spawn(move || serve(listener, limits(), admissions, &path, backend));
         let client =
             ConnectorClient::new(endpoint, KEY, FRAME, Some(Duration::from_secs(5))).unwrap();
         (client, endpoint)
@@ -770,10 +753,9 @@ mod tests {
         let envelope =
             crate::envelope::encrypt_invocation(&invocation, &crate::fixtures::security(KEY))
                 .unwrap();
-        let TransportAdmission::Execute(claim) =
-            service
-                .begin(&envelope, now_ms(), &PlanQuotaSnapshot::default(), 1 << 20)
-                .unwrap()
+        let TransportAdmission::Execute(claim) = service
+            .begin(&envelope, now_ms(), &PlanQuotaSnapshot::default(), 1 << 20)
+            .unwrap()
         else {
             panic!("a fresh request must execute");
         };
@@ -881,12 +863,7 @@ mod tests {
     fn the_smallest_frame_also_carries_the_failure_that_stands_in_for_a_result() {
         let long = "x".repeat(crate::envelope::MAX_IDENTITY_BYTES);
         let plaintext = crate::contract::wire_encode(&crate::service::result_size_failure(
-            &long,
-            &long,
-            &long,
-            [0xff; 32],
-            [0xff; 32],
-            0,
+            &long, &long, &long, [0xff; 32], [0xff; 32], 0,
         ))
         .unwrap()
         .len();
@@ -994,16 +971,7 @@ mod tests {
     }
 
     fn admission(id: &str, key: &str, slots: usize, payload: usize) -> CallerAdmission {
-        CallerAdmission::new(
-            id,
-            key,
-            1,
-            ["gpt-5.4".to_string()],
-            slots,
-            payload,
-            32_768,
-        )
-        .unwrap()
+        CallerAdmission::new(id, key, 1, ["gpt-5.4".to_string()], slots, payload, 32_768).unwrap()
     }
 
     /// `Some(field)` when serve refused the configuration, `None` while it serves.
@@ -1233,10 +1201,9 @@ mod tests {
             &crate::fixtures::security(KEY),
         )
         .unwrap();
-        let TransportAdmission::Execute(claim) =
-            service
-                .begin(&envelope, now_ms(), &PlanQuotaSnapshot::default(), 1 << 20)
-                .unwrap()
+        let TransportAdmission::Execute(claim) = service
+            .begin(&envelope, now_ms(), &PlanQuotaSnapshot::default(), 1 << 20)
+            .unwrap()
         else {
             panic!("a fresh request must execute");
         };
@@ -1385,15 +1352,7 @@ mod tests {
         let backend = CountingBackend::new(true);
         let path = store.path.clone();
         let served = backend.clone();
-        thread::spawn(move || {
-            serve(
-                listener,
-                limits(),
-                admissions,
-                &path,
-                served,
-            )
-        });
+        thread::spawn(move || serve(listener, limits(), admissions, &path, served));
         let client =
             ConnectorClient::new(endpoint, KEY, FRAME, Some(Duration::from_secs(5))).unwrap();
         client.execute(&fresh("request-key")).unwrap();

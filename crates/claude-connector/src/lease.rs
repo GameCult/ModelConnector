@@ -671,9 +671,9 @@ mod tests {
     fn a_frame_that_trickles_past_its_deadline_is_refused_however_small_each_read() {
         let (mut reader, mut writer) = UnixStream::pair().unwrap();
         let frame = encode_frame(&LeaseMessage::ClaudeLeaseRefusal(LeaseRefused {
-                kind: LeaseRefusalKind::Busy,
-                detail: "lease:x".to_string(),
-            }));
+            kind: LeaseRefusalKind::Busy,
+            detail: "lease:x".to_string(),
+        }));
         let trickle = thread::spawn(move || {
             for byte in frame {
                 if writer.write_all(&[byte]).is_err() {

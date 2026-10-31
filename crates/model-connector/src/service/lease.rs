@@ -128,16 +128,10 @@ mod tests {
         TransportService::open(
             &store.path,
             "fixture-sse",
-            [CallerAdmission::new(
-                CALLER,
-                KEY,
-                1,
-                ["gpt-5.4".to_string()],
-                1,
-                65_536,
-                32_768,
-            )
-            .unwrap()],
+            [
+                CallerAdmission::new(CALLER, KEY, 1, ["gpt-5.4".to_string()], 1, 65_536, 32_768)
+                    .unwrap(),
+            ],
             5_000,
         )
         .unwrap()
@@ -185,7 +179,10 @@ mod tests {
     fn a_lease_is_named_by_its_invocation() {
         let store = TestStore::new();
         let mut service = open(&store);
-        assert_eq!(granted(lease(&mut service, "run-1")).lease_id, "lease:run-1");
+        assert_eq!(
+            granted(lease(&mut service, "run-1")).lease_id,
+            "lease:run-1"
+        );
     }
 
     #[test]
@@ -231,14 +228,28 @@ mod tests {
         );
         assert_eq!(
             service
-                .begin_lease(CALLER, LeaseTurn::SelfRun, "run-2", NOW + 99, NOW + 9, &none())
+                .begin_lease(
+                    CALLER,
+                    LeaseTurn::SelfRun,
+                    "run-2",
+                    NOW + 99,
+                    NOW + 9,
+                    &none()
+                )
                 .unwrap(),
             LeaseAdmission::Refused(LeaseRefusal::Busy),
             "one millisecond before its expiry the lease still holds"
         );
         granted(
             service
-                .begin_lease(CALLER, LeaseTurn::SelfRun, "run-2", NOW + 99, NOW + 10, &none())
+                .begin_lease(
+                    CALLER,
+                    LeaseTurn::SelfRun,
+                    "run-2",
+                    NOW + 99,
+                    NOW + 10,
+                    &none(),
+                )
                 .unwrap(),
         );
     }
@@ -249,7 +260,14 @@ mod tests {
         let mut service = open(&store);
         assert_eq!(
             service
-                .begin_lease("stranger", LeaseTurn::SelfRun, "run-1", NOW + 1, NOW, &none())
+                .begin_lease(
+                    "stranger",
+                    LeaseTurn::SelfRun,
+                    "run-1",
+                    NOW + 1,
+                    NOW,
+                    &none()
+                )
                 .unwrap(),
             LeaseAdmission::Refused(LeaseRefusal::UnknownCaller)
         );
@@ -286,8 +304,7 @@ mod tests {
         let call = |service: &mut TransportService, now: u64, plan: &PlanQuotaSnapshot| {
             let mut asked = request();
             asked.request_id = format!("call-{now}");
-            let invocation =
-                TransportInvocation::new(CALLER, now + 1_000, [7; 32], asked).unwrap();
+            let invocation = TransportInvocation::new(CALLER, now + 1_000, [7; 32], asked).unwrap();
             let sealed = crate::envelope::encrypt_message(
                 CALLER,
                 invocation.request_id(),
@@ -301,7 +318,8 @@ mod tests {
             else {
                 return None;
             };
-            let result = crate::envelope::decrypt_result(&reply, &security(KEY), &invocation).unwrap();
+            let result =
+                crate::envelope::decrypt_result(&reply, &security(KEY), &invocation).unwrap();
             match result.disposition {
                 TransportDisposition::Refused(refusal) => Some(refusal),
                 other => panic!("unexpected {other:?}"),
@@ -361,7 +379,12 @@ mod tests {
         let store = TestStore::new();
         let mut service = open(&store);
         let longest = "r".repeat(MAX_IDENTITY_BYTES - LEASE_PREFIX.len() - PERSONA_SUFFIX.len());
-        let grant = granted(lease_in(&mut service, LeaseTurn::PersonaTurn, &longest, &none()));
+        let grant = granted(lease_in(
+            &mut service,
+            LeaseTurn::PersonaTurn,
+            &longest,
+            &none(),
+        ));
         assert_eq!(grant.lease_id.len(), MAX_IDENTITY_BYTES);
         assert!(lease_try(&mut service, LeaseTurn::PersonaTurn, &format!("{longest}r")).is_err());
     }

@@ -67,14 +67,6 @@ impl FlakyStore {
     pub(crate) fn allowance(&self) -> Arc<AtomicUsize> {
         self.pushes_allowed.clone()
     }
-
-    /// A store over the same records that accepts `pushes_allowed` more writes.
-    pub(crate) fn reopened(&self, pushes_allowed: usize) -> Self {
-        Self {
-            held: self.held.clone(),
-            pushes_allowed: Arc::new(AtomicUsize::new(pushes_allowed)),
-        }
-    }
 }
 
 #[cfg(feature = "daemon")]
@@ -132,7 +124,6 @@ pub(crate) fn request() -> ProviderRequest {
     });
     request
 }
-
 
 pub(crate) fn invocation() -> TransportInvocation {
     TransportInvocation::new("epiphany-yggdrasil", 2_000, [7; 32], request()).unwrap()
