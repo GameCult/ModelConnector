@@ -15,7 +15,7 @@ use cultcache_rs::{
     CacheBackingStore, CultCache, CultCacheEnvelope, DatabaseEntry,
     SingleFileMessagePackBackingStore,
 };
-use model_connector::{CallerConfig, MIN_PAYLOAD_BYTES, ModelPrice, Rates};
+use model_connector::{CallerConfig, LeaseTurn, MIN_PAYLOAD_BYTES, ModelPrice, Rates};
 
 const CANARY: &str = "canary-9f3b7c1d";
 const OPUS: &str = "claude-opus-5-1";
@@ -99,6 +99,7 @@ fn valid() -> ClaudeConnectorConfig {
         lease_callers: vec![LeaseCallerConfig {
             unix_user: "mind-eureka-self".to_string(),
             caller_id: "persona-a-caller".to_string(),
+            turn: LeaseTurn::SelfRun,
             unit_instance: "eureka".to_string(),
             reservation_micro_usd: 5_000_000,
         }],
@@ -1106,6 +1107,8 @@ fn config_init_binds_each_lease_user_to_the_configured_caller() {
                 "mind-eureka-self",
                 "--lease-max-ms",
                 "120000",
+                "--turn",
+                "self",
                 "--lease-unit-instance",
                 "eureka",
                 "--lease-reservation-micro-usd",
@@ -1120,6 +1123,7 @@ fn config_init_binds_each_lease_user_to_the_configured_caller() {
         [LeaseCallerConfig {
             unix_user: "mind-eureka-self".to_string(),
             caller_id: "persona-a-caller".to_string(),
+            turn: LeaseTurn::SelfRun,
             unit_instance: "eureka".to_string(),
             reservation_micro_usd: 5_000_000,
         }]
@@ -1139,6 +1143,8 @@ fn config_check_refuses_a_lease_account_the_system_does_not_have() {
             socket.to_str().unwrap(),
             "--lease-user",
             "no-such-account-4f1c",
+            "--turn",
+            "self",
             "--lease-unit-instance",
             "eureka",
             "--lease-reservation-micro-usd",
@@ -1185,6 +1191,8 @@ fn serve_binds_the_lease_socket_and_answers_a_stranger_with_a_refusal() {
             socket.to_str().unwrap(),
             "--lease-user",
             "nobody",
+            "--turn",
+            "self",
             "--lease-unit-instance",
             "eureka",
             "--lease-reservation-micro-usd",
@@ -1304,6 +1312,7 @@ fn a_lease_caller_bills_one_configured_caller_within_that_callers_ceiling() {
     let lease = |user: &str, caller: &str, instance: &str, reservation: u64| LeaseCallerConfig {
         unix_user: user.to_string(),
         caller_id: caller.to_string(),
+        turn: LeaseTurn::SelfRun,
         unit_instance: instance.to_string(),
         reservation_micro_usd: reservation,
     };
@@ -1339,6 +1348,8 @@ fn add_caller_and_add_lease_caller_extend_the_document_and_grow_the_serve_limits
                 "/run/claude-connector/lease.sock",
                 "--lease-user",
                 "mind-eureka-self",
+                "--turn",
+                "self",
                 "--lease-unit-instance",
                 "eureka",
                 "--lease-reservation-micro-usd",
@@ -1386,6 +1397,8 @@ fn add_caller_and_add_lease_caller_extend_the_document_and_grow_the_serve_limits
             "mind-heartbeat",
             "--caller-id",
             "heartbeat",
+            "--turn",
+            "self",
             "--lease-unit-instance",
             "heartbeat",
             "--lease-reservation-micro-usd",
@@ -1446,6 +1459,8 @@ fn add_caller_and_add_lease_caller_extend_the_document_and_grow_the_serve_limits
             "mind-heartbeat",
             "--caller-id",
             "heartbeat",
+            "--turn",
+            "self",
             "--lease-unit-instance",
             "heartbeat",
             "--lease-reservation-micro-usd",
@@ -1472,6 +1487,8 @@ fn add_lease_caller_needs_a_document_that_lends_a_token() {
             "mind-heartbeat",
             "--caller-id",
             "persona-a-caller",
+            "--turn",
+            "self",
             "--lease-unit-instance",
             "heartbeat",
             "--lease-reservation-micro-usd",
@@ -1667,4 +1684,70 @@ fn config_init_keeps_an_existing_secret_file_only_if_it_is_usable() {
     assert!(made.status.success(), "{}", shown(&made));
     assert_eq!(std::fs::read_to_string(&secret).unwrap(), "k".repeat(32));
     assert!(scratch.path("connector.cc").exists());
+}
+
+#[test]
+fn a_persona_lease_row_validates_and_an_account_leases_for_one_turn_only() {
+    let mut config = valid();
+    let mut persona = config.lease_callers[0].clone();
+    persona.unix_user = "mind-eureka-persona".to_string();
+    persona.turn = LeaseTurn::PersonaTurn;
+    config.lease_callers.push(persona.clone());
+    config.validate().unwrap();
+    // The same account under the other turn is a second row for one uid.
+    config.lease_callers[1].unix_user = config.lease_callers[0].unix_user.clone();
+    assert_eq!(refused(&config), "lease_callers");
+}
+
+#[test]
+fn add_lease_caller_takes_the_turn_and_refuses_an_unknown_one() {
+    let scratch = Scratch::new();
+    let made = init(
+        &scratch,
+        &init_flags(
+            &scratch,
+            &[
+                "--lease-socket",
+                "/run/claude-connector/lease.sock",
+                "--lease-user",
+                "mind-eureka-self",
+                "--turn",
+                "self",
+                "--lease-unit-instance",
+                "eureka",
+                "--lease-reservation-micro-usd",
+                "5000000",
+            ],
+        ),
+    );
+    assert!(made.status.success(), "{}", shown(&made));
+    let path = scratch.path("connector.cc");
+    let add = |turn: &str| {
+        run(
+            &[
+                "config",
+                "add-lease-caller",
+                path.to_str().unwrap(),
+                "--lease-user",
+                "mind-eureka-persona",
+                "--caller-id",
+                "persona-a-caller",
+                "--turn",
+                turn,
+                "--lease-unit-instance",
+                "eureka",
+                "--lease-reservation-micro-usd",
+                "1000000",
+            ],
+            &[],
+        )
+    };
+    let unknown = add("heartbeat");
+    assert!(!unknown.status.success());
+    assert_eq!(load_config(&path).unwrap().lease_callers.len(), 1);
+    let added = add("persona");
+    assert!(added.status.success(), "{}", shown(&added));
+    let config = load_config(&path).unwrap();
+    assert_eq!(config.lease_callers[1].turn, LeaseTurn::PersonaTurn);
+    assert_eq!(config.lease_callers[0].turn, LeaseTurn::SelfRun);
 }

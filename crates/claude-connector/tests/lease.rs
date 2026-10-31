@@ -22,7 +22,8 @@ use claude_connector::{
     decode_frame, encode_frame, serve_leases,
 };
 use model_connector::{
-    CallerAdmission, LeaseAdmission, LeaseRefusal, ModelPrice, ModelUsage, Rates, SpendCeiling,
+    CallerAdmission, LeaseAdmission, LeaseRefusal, LeaseTurn, LeaseUse, ModelPrice, ModelUsage, Rates,
+    SpendCeiling,
     SpendWindowMs, TransportService, Usage,
 };
 use zeroize::Zeroizing;
@@ -147,6 +148,7 @@ struct Setup {
     ceiling: u64,
     reservation: u64,
     uid: u32,
+    turn: LeaseTurn,
     token: Option<&'static str>,
     max_connections: usize,
 }
@@ -156,6 +158,7 @@ fn setup(ceiling: u64, reservation: u64) -> Setup {
         ceiling,
         reservation,
         uid: own_uid(),
+        turn: LeaseTurn::SelfRun,
         token: Some(TOKEN),
         max_connections: 8,
     }
@@ -218,6 +221,7 @@ fn start_with(
     let caller = LeaseCaller {
         uid: setup.uid,
         caller_id: CALLER.to_string(),
+        turn: setup.turn,
         unit_instance: instance.to_string(),
         reservation_micro_usd: setup.reservation,
     };
@@ -411,7 +415,7 @@ fn probe_reserve(harness: &Harness, name: &str, cost: u64) -> LeaseAdmission {
         .service
         .lock()
         .unwrap()
-        .begin_lease(CALLER, name, cost, FAR, now_ms())
+        .begin_lease(CALLER, LeaseTurn::SelfRun, name, cost, FAR, now_ms())
         .unwrap()
 }
 
@@ -539,7 +543,7 @@ fn the_reservation_is_claimed_before_the_token_is_read_or_lent() {
         let admission = service
             .lock()
             .unwrap()
-            .begin_lease(CALLER, "probe", 1, FAR, now_ms())
+            .begin_lease(CALLER, LeaseTurn::SelfRun, "probe", 1, FAR, now_ms())
             .unwrap();
         *sink.lock().unwrap() = Some(admission);
     }));
@@ -1163,4 +1167,162 @@ fn the_unit_is_asked_of_the_callers_unit_through_the_peers_handle() {
         *harness.units.as_ref().unwrap().asked_about.lock().unwrap(),
         vec![(std::process::id().to_string(), UNIT.to_string())]
     );
+}
+
+const PERSONA_UNIT: &str = "mind-persona@eureka.service";
+
+/// A listener whose one lease caller is a Persona account; peers start in
+/// invocation 1 of the Persona unit.
+fn start_persona(setup: Setup) -> Harness {
+    let units = Arc::new(FakeUnits {
+        peer: Mutex::new(None),
+        asked_about: Mutex::new(Vec::new()),
+    });
+    let harness = start_with(
+        Setup {
+            turn: LeaseTurn::PersonaTurn,
+            ..setup
+        },
+        units.clone(),
+        Some(units),
+        INSTANCE,
+    );
+    harness.run_in(PERSONA_UNIT, 1);
+    harness
+}
+
+fn lease_on(
+    harness: &Harness,
+    turn: LeaseTurn,
+    invocation: &str,
+) -> LeaseAdmission {
+    harness
+        .service
+        .lock()
+        .unwrap()
+        .begin_lease(CALLER, turn, invocation, 100, FAR, now_ms())
+        .unwrap()
+}
+
+fn lease_id(admission: &LeaseAdmission) -> String {
+    match admission {
+        LeaseAdmission::Granted(grant) => grant.lease_id.clone(),
+        other => panic!("expected a grant, got {other:?}"),
+    }
+}
+
+fn busy() -> LeaseAdmission {
+    LeaseAdmission::Refused(LeaseRefusal::Busy)
+}
+
+#[test]
+fn persona_and_self_of_one_caller_lease_together() {
+    let harness = start(setup(1_000_000, 100));
+    let own = lease_on(&harness, LeaseTurn::SelfRun, "self-run");
+    assert_eq!(lease_id(&own), "lease:self-run");
+    let persona = lease_on(&harness, LeaseTurn::PersonaTurn, "persona-run");
+    assert_eq!(lease_id(&persona), "lease:persona-run:1");
+    // Each turn kind still holds one: a second Self run is busy while the
+    // first is open, a second Persona lease of the same invocation too.
+    assert_eq!(lease_on(&harness, LeaseTurn::SelfRun, "self-run-2"), busy());
+    assert_eq!(
+        lease_on(&harness, LeaseTurn::PersonaTurn, "persona-run"),
+        busy()
+    );
+    // Settling the Persona lease frees nothing of the Self lease's.
+    harness
+        .service
+        .lock()
+        .unwrap()
+        .settle_lease(CALLER, "lease:persona-run:1", LeaseUse::Reservation)
+        .unwrap();
+    assert_eq!(lease_on(&harness, LeaseTurn::SelfRun, "self-run-2"), busy());
+}
+
+#[test]
+fn persona_invocation_leases_sequentially() {
+    let harness = start(setup(1_000_000, 100));
+    for expected in 1..=3 {
+        let granted = lease_on(&harness, LeaseTurn::PersonaTurn, "persona-run");
+        let id = lease_id(&granted);
+        assert_eq!(id, format!("lease:persona-run:{expected}"));
+        harness
+            .service
+            .lock()
+            .unwrap()
+            .settle_lease(CALLER, &id, LeaseUse::Reservation)
+            .unwrap();
+    }
+    // Another invocation counts from one: the sequence is per invocation.
+    let other = lease_on(&harness, LeaseTurn::PersonaTurn, "persona-other");
+    assert_eq!(lease_id(&other), "lease:persona-other:1");
+}
+
+#[test]
+fn persona_invocation_second_open_lease_busy() {
+    let harness = start_persona(setup(1_000_000, 100));
+    let first = ask(&harness, 60_000);
+    assert!(granted_ok(&first));
+    let second = ask(&harness, 60_000);
+    assert_eq!(refusal_of(&second), Some(LeaseRefusalKind::Busy));
+    assert!(second.fds.is_empty());
+    assert_eq!(harness.tokens.reads.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn persona_turns_of_a_live_invocation_each_lend_a_token_over_the_socket() {
+    let harness = start_persona(setup(1_000_000, 100));
+    for _ in 0..2 {
+        let mut answer = ask(&harness, 60_000);
+        assert!(granted_ok(&answer));
+        settle(&mut answer, vec![used(MODEL, 10)]);
+    }
+    assert_eq!(harness.tokens.reads.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn self_invocation_still_leases_once() {
+    let harness = start(setup(1_000_000, 100));
+    let id = lease_id(&lease_on(&harness, LeaseTurn::SelfRun, "self-run"));
+    harness
+        .service
+        .lock()
+        .unwrap()
+        .settle_lease(CALLER, &id, LeaseUse::Reservation)
+        .unwrap();
+    assert_eq!(lease_on(&harness, LeaseTurn::SelfRun, "self-run"), busy());
+}
+
+#[test]
+fn persona_row_refuses_mind_self_unit() {
+    let harness = start_persona(setup(1_000_000, 100));
+    harness.run_in(UNIT, 1);
+    let answer = ask(&harness, 60_000);
+    assert_eq!(refusal_of(&answer), Some(LeaseRefusalKind::UnknownCaller));
+    assert!(answer.fds.is_empty());
+    assert_eq!(harness.tokens.reads.load(Ordering::SeqCst), 0);
+    // And a Self row refuses the Persona unit.
+    let harness = start(setup(1_000_000, 100));
+    harness.run_in(PERSONA_UNIT, 1);
+    let answer = ask(&harness, 60_000);
+    assert_eq!(refusal_of(&answer), Some(LeaseRefusalKind::UnknownCaller));
+    assert_eq!(harness.tokens.reads.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn a_persona_lease_reserves_and_settles_in_the_callers_window() {
+    let harness = start(setup(1_000, 600));
+    let id = lease_id(&lease_on(&harness, LeaseTurn::PersonaTurn, "persona-run"));
+    // 100 reserved by the helper; a Self probe of 901 cannot fit, 900 can.
+    assert_eq!(probe_reserve(&harness, "p1", 901), ceiling_refused());
+    harness
+        .service
+        .lock()
+        .unwrap()
+        .settle_lease(CALLER, &id, LeaseUse::NeverLent)
+        .unwrap();
+    assert!(matches!(
+        probe_reserve(&harness, "p2", 1_000),
+        LeaseAdmission::Granted(_)
+    ));
 }

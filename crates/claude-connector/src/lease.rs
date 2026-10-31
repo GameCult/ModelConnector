@@ -28,7 +28,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use model_connector::{
-    LeaseAdmission, LeaseGrant, LeaseRefusal, LeaseSettlement, LeaseUse, ModelUsage,
+    LeaseAdmission, LeaseGrant, LeaseRefusal, LeaseSettlement, LeaseTurn, LeaseUse, ModelUsage,
     TransportService,
 };
 use serde::{Deserialize, Serialize};
@@ -179,13 +179,17 @@ fn read_message(stream: &mut impl Bounded, deadline: Instant) -> io::Result<Leas
 /// The most a pipe takes in one atomic write.
 const PIPE_BUF: usize = 4096;
 
-/// A unix account allowed to lease, the Self unit its process must run in,
-/// and the caller whose spend window its leases reserve in.
+/// A unix account allowed to lease, the unit its process must run in (the
+/// Self or the Persona unit of its instance, by `turn`), and the caller whose
+/// spend window its leases reserve in.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LeaseCaller {
     pub uid: u32,
     pub caller_id: String,
-    /// The `<instance>` of `mind-self@<instance>.service`.
+    /// Which kind of turn this account leases for; it picks the unit.
+    pub turn: LeaseTurn,
+    /// The `<instance>` of `mind-self@<instance>.service` or
+    /// `mind-persona@<instance>.service`.
     pub unit_instance: String,
     /// What each of this caller's leases reserves, whatever the run asks.
     pub reservation_micro_usd: u64,
@@ -194,7 +198,10 @@ pub struct LeaseCaller {
 impl LeaseCaller {
     /// The one unit a lease to this caller may be requested from.
     pub fn unit(&self) -> String {
-        format!("mind-self@{}.service", self.unit_instance)
+        match self.turn {
+            LeaseTurn::SelfRun => format!("mind-self@{}.service", self.unit_instance),
+            LeaseTurn::PersonaTurn => format!("mind-persona@{}.service", self.unit_instance),
+        }
     }
 }
 
@@ -400,7 +407,8 @@ struct Lender {
 /// Serves leases on `listener` until it fails. Each connection is one lease:
 /// request, then grant or refusal, then (after a grant) settle. A caller is
 /// the account whose uid the kernel reports for the connection, and only a
-/// process in that caller's Self unit may lease, once per unit invocation; no
+/// process in that caller's unit may lease, once per unit invocation for a Self
+/// run and once per turn for a Persona; no
 /// field of any message names either.
 pub fn serve_leases(
     listener: &UnixListener,
@@ -485,6 +493,7 @@ impl Lender {
             .map_err(|_| io::Error::other("service lock"))?
             .begin_lease(
                 &caller.caller_id,
+                caller.turn,
                 &invocation.invocation_id,
                 caller.reservation_micro_usd,
                 request.expires_at_unix_ms,

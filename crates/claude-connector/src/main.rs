@@ -18,7 +18,7 @@ use claude_connector::{
     ClaudeConnectorConfig, ConfigError, LeaseCallerConfig, MIN_SECRET_BYTES, check_ready,
     load_config, write_config,
 };
-use model_connector::{CallerConfig, ModelPrice, Rates, frame_bytes_for_payload};
+use model_connector::{CallerConfig, LeaseTurn, ModelPrice, Rates, frame_bytes_for_payload};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -95,7 +95,7 @@ const CALLER: [&str; 7] = [
     "--max-output-tokens",
 ];
 
-const INIT: [&str; 21] = [
+const INIT: [&str; 22] = [
     "--listen",
     "--replay-store",
     "--claude-binary",
@@ -115,12 +115,14 @@ const INIT: [&str; 21] = [
     "--socket-timeout-ms",
     "--lease-socket",
     "--lease-max-ms",
+    "--turn",
     "--lease-unit-instance",
     "--lease-reservation-micro-usd",
 ];
 
-const LEASE_CALLER: [&str; 3] = [
+const LEASE_CALLER: [&str; 4] = [
     "--caller-id",
+    "--turn",
     "--lease-unit-instance",
     "--lease-reservation-micro-usd",
 ];
@@ -178,6 +180,15 @@ impl Flags {
         self.text(name)?
             .parse()
             .map_err(|_| Failure::Malformed(name))
+    }
+
+    /// The kind of turn a leasing account serves: `self` or `persona`.
+    fn turn(&self) -> Result<LeaseTurn, Failure> {
+        match self.text("--turn")?.as_str() {
+            "self" => Ok(LeaseTurn::SelfRun),
+            "persona" => Ok(LeaseTurn::PersonaTurn),
+            _ => Err(Failure::Malformed("--turn")),
+        }
     }
 
     fn number_or<T: std::str::FromStr>(
@@ -328,6 +339,7 @@ fn init(path: &str, args: &[&str]) -> Result<(), Failure> {
             Ok(LeaseCallerConfig {
                 unix_user: unix_user.clone(),
                 caller_id: first.caller_runtime_id.clone(),
+                turn: flags.turn()?,
                 unit_instance: flags.text("--lease-unit-instance")?,
                 reservation_micro_usd: flags.number("--lease-reservation-micro-usd")?,
             })
@@ -398,6 +410,7 @@ fn add_lease_caller(path: &str, args: &[&str]) -> Result<(), Failure> {
     config.lease_callers.push(LeaseCallerConfig {
         unix_user: flags.text("--lease-user")?,
         caller_id: flags.text("--caller-id")?,
+        turn: flags.turn()?,
         unit_instance: flags.text("--lease-unit-instance")?,
         reservation_micro_usd: flags.number("--lease-reservation-micro-usd")?,
     });

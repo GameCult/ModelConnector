@@ -1,4 +1,4 @@
-//! A credential lease: a Self run's reservation in the caller's spend window.
+//! A credential lease: a Self run's or a Persona turn's reservation in the caller's spend window.
 //! The lease is one record of the same ledger a provider call reserves in, not
 //! a second ledger: it is claimed before anything is lent, counts against the
 //! window's ceiling while open, and settles to the true cost of what the run
@@ -11,6 +11,22 @@ use super::*;
 
 /// The request-id namespace of leases in a caller's replay records.
 const LEASE_PREFIX: &str = "lease:";
+
+/// The most leases one Persona invocation may take in its life.
+const MAX_PERSONA_LEASES: u32 = 1024;
+
+/// Room kept in an identity for `:<n>`, `n` at most `MAX_PERSONA_LEASES`.
+const SEQUENCE_SUFFIX_BYTES: usize = 5;
+
+/// Which kind of turn a lease serves. It is a property of the lease caller's
+/// configured row, never of a request. A Self run leases once per unit
+/// invocation; a Persona turn leases once per turn, so one live invocation
+/// leases in sequence, one open lease at a time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LeaseTurn {
+    SelfRun,
+    PersonaTurn,
+}
 
 /// What an admitted lease holds.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,7 +93,8 @@ pub enum LeaseRefusal {
     /// free pass.
     CostBound,
     UnknownCaller,
-    /// The caller holds a lease already, or this run id was leased before.
+    /// A Self run: the caller holds a Self lease already, or this invocation
+    /// leased before. A Persona turn: this invocation holds a lease now.
     Busy,
 }
 
@@ -89,11 +106,17 @@ pub enum LeaseAdmission {
 
 impl TransportService {
     /// Reserves `max_cost_micro_usd` in `caller_runtime_id`'s current window
-    /// for the unit invocation `invocation_id`, which leases once. A ledger
-    /// that cannot be written answers `Err` and reserves nothing. A lease takes no request slot.
+    /// for the unit invocation `invocation_id`. A Self run leases once per
+    /// invocation, as `lease:<invocation>`, and one Self lease is open per
+    /// caller. A Persona turn takes the next free sequence of its invocation
+    /// as `lease:<invocation>:<n>`, one open at a time; a Persona lease never
+    /// blocks or is blocked by the caller's Self lease. A ledger that cannot
+    /// be written answers `Err` and reserves nothing. A lease takes no
+    /// request slot.
     pub fn begin_lease(
         &mut self,
         caller_runtime_id: &str,
+        turn: LeaseTurn,
         invocation_id: &str,
         max_cost_micro_usd: u64,
         expires_at_unix_ms: u64,
@@ -106,30 +129,60 @@ impl TransportService {
         let spend_window_ms = caller.spend_window_ms;
         let connection_key_epoch = caller.connection_key_epoch;
         require_id(invocation_id, "invocation_id")?;
-        if invocation_id.len() + LEASE_PREFIX.len() > MAX_IDENTITY_BYTES {
+        if invocation_id.len() + LEASE_PREFIX.len() + SEQUENCE_SUFFIX_BYTES > MAX_IDENTITY_BYTES {
             return Err(ContractError::Invalid("invocation_id").into());
         }
         if max_cost_micro_usd == 0 {
             return Ok(LeaseAdmission::Refused(LeaseRefusal::CostBound));
         }
-        let identity = RequestIdentity {
-            caller_runtime_id: caller_runtime_id.to_string(),
-            request_id: format!("{LEASE_PREFIX}{invocation_id}"),
+        let identity = match turn {
+            LeaseTurn::SelfRun => {
+                let identity = RequestIdentity {
+                    caller_runtime_id: caller_runtime_id.to_string(),
+                    request_id: format!("{LEASE_PREFIX}{invocation_id}"),
+                };
+                let holding = self.live.iter().any(|(held, request)| {
+                    request.lease == Some(LeaseTurn::SelfRun)
+                        && held.caller_runtime_id == caller_runtime_id
+                });
+                if holding
+                    || self
+                        .replay_store
+                        .get::<ReplayRecord>(&replay_key(&identity))
+                        .map_err(replay_store_error)?
+                        .is_some()
+                {
+                    return Ok(LeaseAdmission::Refused(LeaseRefusal::Busy));
+                }
+                identity
+            }
+            LeaseTurn::PersonaTurn => {
+                let mut free = None;
+                for sequence in 1..=MAX_PERSONA_LEASES {
+                    let identity = RequestIdentity {
+                        caller_runtime_id: caller_runtime_id.to_string(),
+                        request_id: format!("{LEASE_PREFIX}{invocation_id}:{sequence}"),
+                    };
+                    if self.live.contains_key(&identity) {
+                        return Ok(LeaseAdmission::Refused(LeaseRefusal::Busy));
+                    }
+                    if self
+                        .replay_store
+                        .get::<ReplayRecord>(&replay_key(&identity))
+                        .map_err(replay_store_error)?
+                        .is_none()
+                    {
+                        free = Some(identity);
+                        break;
+                    }
+                }
+                let Some(identity) = free else {
+                    return Ok(LeaseAdmission::Refused(LeaseRefusal::Busy));
+                };
+                identity
+            }
         };
         let key = replay_key(&identity);
-        let holding = self
-            .live
-            .iter()
-            .any(|(held, request)| request.lease && held.caller_runtime_id == caller_runtime_id);
-        if holding
-            || self
-                .replay_store
-                .get::<ReplayRecord>(&key)
-                .map_err(replay_store_error)?
-                .is_some()
-        {
-            return Ok(LeaseAdmission::Refused(LeaseRefusal::Busy));
-        }
         let admitted_at_unix_ms = admission_clock(
             &self.window_spend,
             caller_runtime_id,
@@ -185,7 +238,7 @@ impl TransportService {
             LiveRequest {
                 window,
                 reserved_micro_usd: max_cost_micro_usd,
-                lease: true,
+                lease: Some(turn),
             },
         );
         Ok(LeaseAdmission::Granted(LeaseGrant {
@@ -213,7 +266,7 @@ impl TransportService {
         if !self
             .live
             .get(&identity)
-            .is_some_and(|request| request.lease)
+            .is_some_and(|request| request.lease.is_some())
         {
             return Err(ServiceError::NoActiveRequest);
         }

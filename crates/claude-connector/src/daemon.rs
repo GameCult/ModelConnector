@@ -11,7 +11,8 @@ use std::time::Duration;
 
 use cultcache_rs::{CultCache, DatabaseEntry, SingleFileMessagePackBackingStore};
 use model_connector::{
-    CallerAdmission, CallerConfig, MIN_PAYLOAD_BYTES, ModelPrice, ProviderBackend, ServeError,
+    CallerAdmission, CallerConfig, LeaseTurn, MIN_PAYLOAD_BYTES, ModelPrice, ProviderBackend,
+    ServeError,
     ServeLimits, ServiceError, TransportService, load_admissions, serve_service,
 };
 use serde::{Deserialize, Serialize};
@@ -29,14 +30,17 @@ use crate::{
 const CONFIG_KEY: &str = "runtime";
 const MODEL_PREFIX: &str = "claude-";
 
-/// A unix account that may lease the subscription token for a Self run, the
-/// Self unit (`mind-self@<unit_instance>.service`) its process must run in,
-/// the configured caller whose spend window its leases reserve in, and what
-/// each lease reserves there.
+/// A unix account that may lease the subscription token for a Self run or a
+/// Persona turn, the unit its process must run in (`mind-self@<unit_instance>`
+/// or `mind-persona@<unit_instance>`, by `turn`), the configured caller whose
+/// spend window its leases reserve in, and what each lease reserves there.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LeaseCallerConfig {
     pub unix_user: String,
     pub caller_id: String,
+    /// The kind of turn this account leases for: it fixes the unit, `mind-self@`
+    /// or `mind-persona@`, its process must run in.
+    pub turn: LeaseTurn,
     pub unit_instance: String,
     pub reservation_micro_usd: u64,
 }
@@ -504,6 +508,7 @@ fn lease_callers_of(config: &ClaudeConnectorConfig) -> Result<Vec<LeaseCaller>, 
                 .map(|uid| LeaseCaller {
                     uid,
                     caller_id: lease.caller_id.clone(),
+                    turn: lease.turn,
                     unit_instance: lease.unit_instance.clone(),
                     reservation_micro_usd: lease.reservation_micro_usd,
                 })

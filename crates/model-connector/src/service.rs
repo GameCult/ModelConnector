@@ -337,7 +337,7 @@ struct LiveRequest {
     reserved_micro_usd: u64,
     /// A Self run's credential lease, not a provider call: it holds its
     /// reservation in the window like a call does but takes no request slot.
-    lease: bool,
+    lease: Option<LeaseTurn>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -846,7 +846,7 @@ impl TransportService {
             .live
             .iter()
             .filter(|(key, request)| {
-                !request.lease && key.caller_runtime_id == invocation.caller_runtime_id
+                request.lease.is_none() && key.caller_runtime_id == invocation.caller_runtime_id
             })
             .count();
         if active_for_caller >= max_concurrent_requests {
@@ -909,7 +909,7 @@ impl TransportService {
             LiveRequest {
                 window,
                 reserved_micro_usd,
-                lease: false,
+                lease: None,
             },
         );
         Ok(TransportAdmission::Execute(Box::new(ExecutionClaim {
@@ -1272,7 +1272,9 @@ fn replay_store_error(error: impl std::fmt::Display) -> ServiceError {
 }
 
 mod lease;
-pub use lease::{LeaseAdmission, LeaseGrant, LeaseRefusal, LeaseSettlement, LeaseUse, ModelUsage};
+pub use lease::{
+    LeaseAdmission, LeaseGrant, LeaseRefusal, LeaseSettlement, LeaseTurn, LeaseUse, ModelUsage,
+};
 
 fn contract_refusal(error: &ContractError) -> Refusal {
     match error {
