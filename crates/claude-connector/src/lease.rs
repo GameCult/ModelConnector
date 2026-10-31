@@ -386,7 +386,7 @@ struct Lender {
 }
 
 /// Serves leases on `listener` until it fails. Each connection is one lease:
-/// request, then grant or refusal, then (after a grant) settle. A caller is
+/// request, then grant or refusal, then (after a grant) the hold. A caller is
 /// the account whose uid the kernel reports for the connection, and only a
 /// process in that caller's unit may lease, once per unit invocation for a Self
 /// run and once per turn for a Persona; no
@@ -420,7 +420,7 @@ pub fn serve_leases(
             .spawn(move || {
                 let _permit = permit;
                 // A connection that fails is dropped; the lease it may have
-                // held is settled inside `lend`.
+                // held is ended inside `lend`.
                 let _ = lender.lend(stream);
             })?;
     }

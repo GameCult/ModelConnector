@@ -61,7 +61,7 @@ const USAGE: &str = r#"{"claude-haiku-5-5":{"inputTokens":2,"outputTokens":4,"ca
 
 /// What a resumed session's `modelUsage` says: every turn so far. Every result
 /// fixture carries it beside the turn's own `model_usage_since_last_result`,
-/// so reading the wrong field shows in a price.
+/// so reading the wrong field shows in a count.
 const CUMULATIVE: &str = r#"{"claude-haiku-5-5":{"inputTokens":900000,"outputTokens":900000,"cacheReadInputTokens":900000,"cacheCreationInputTokens":900000,"thinkingTokens":900000,"costUSD":99.0}}"#;
 
 fn result_line(stop_reason: &str, since_last: &str) -> String {
@@ -1704,7 +1704,7 @@ fn backend_end_to_end_through_the_service() {
     let (events, receipt) = parts(&opened);
     assert_eq!(receipt.provider, "claude-code");
     assert_eq!(receipt.model, MODEL);
-    // USAGE priced at the table: 2*3 + 7*0.3 + 1043*6 + 4*15 micro-USD, rounded up.
+    // USAGE counted: 2 input, 7 cache read, 1043 cache write, 4 output.
     assert_eq!(events.len(), 2);
     let items = opened.transcript_items();
     assert_eq!(items[0], assistant("hello back"));
@@ -1809,7 +1809,7 @@ fn door_set_is_exactly_401_403_429() {
     // validity: a refusal at the door is charged nothing, for exactly the
     // statuses the provider cannot have billed (401, 403, 429) and only when
     // the result says its usage is explicitly empty. Every other shape is
-    // billed the reservation. The 401 shape is a real claude 2.1.312 capture
+    // the usage is unknown. The 401 shape is a real claude 2.1.312 capture
     // with a bogus token.
     let retry = r#"{"type":"system","subtype":"api_retry","error":"authentication_failed"}"#;
     let synthetic = r#"{"type":"assistant","api_error_status":401,"error":"authentication_failed","message":{"id":"e48001b7-cf4f-49b1-9810-db8fd7f73c73","model":"<synthetic>","stop_reason":"stop_sequence","content":[{"type":"text","text":"Failed to authenticate. API Error: 401 OAuth access token is invalid."}]}}"#;
@@ -2641,7 +2641,7 @@ fn a_result_that_made_no_api_call_bills_nothing() {
         ("", 0, empty, true),
         ("", 0, "", true),
         // An API call was made, or the status names a server fault, or the
-        // CLI reported rows: the reservation stands.
+        // CLI reported rows: the usage stays unknown.
         ("", 2300, empty, false),
         (r#""api_error_status":500,"#, 0, empty, false),
         (
