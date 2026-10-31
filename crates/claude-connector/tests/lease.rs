@@ -94,7 +94,7 @@ impl PeerUnits for FakeUnits {
 struct Harness {
     dir: PathBuf,
     socket: PathBuf,
-    service: Arc<Mutex<TransportService>>,
+    _service: Arc<Mutex<TransportService>>,
     quota: Arc<QuotaCell>,
     tokens: Arc<FakeTokens>,
     /// The fake behind the listener, when it has one.
@@ -162,18 +162,6 @@ fn receive(stream: &UnixStream) -> (Vec<u8>, Vec<OwnedFd>) {
     }
 }
 
-fn connect(harness: &Harness) -> UnixStream {
-    let stream = UnixStream::connect(&harness.socket).unwrap();
-    stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .unwrap();
-    stream
-}
-
-fn send(stream: &mut UnixStream, message: &LeaseMessage) {
-    stream.write_all(&encode_frame(message)).unwrap();
-}
-
 fn request(ttl_ms: u64) -> LeaseMessage {
     LeaseMessage::ClaudeLeaseRequest(LeaseRequest {
         expires_at_unix_ms: now_ms() + ttl_ms,
@@ -182,7 +170,7 @@ fn request(ttl_ms: u64) -> LeaseMessage {
 
 /// What one request to the listener came back with.
 struct Answer {
-    stream: UnixStream,
+    _stream: UnixStream,
     raw: Vec<u8>,
     message: Option<LeaseMessage>,
     fds: Vec<OwnedFd>,
@@ -202,7 +190,7 @@ fn ask_at(socket: &std::path::Path, ttl_ms: u64) -> Answer {
     let (raw, fds) = receive(&stream);
     let message = decode_frame(&raw);
     Answer {
-        stream,
+        _stream: stream,
         raw,
         message,
         fds,
@@ -316,7 +304,7 @@ fn start(setup: Setup) -> Harness {
     let harness = Harness {
         dir,
         socket,
-        service,
+        _service: service,
         quota,
         tokens,
         units: Some(units),

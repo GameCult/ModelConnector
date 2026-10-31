@@ -4,6 +4,11 @@ The connector kit for GameCult minds: one typed, encrypted, replay-safe contract
 between a caller that needs a model turn and a daemon that holds the provider
 credential, so no project wires its own provider calls.
 
+The connector meters nothing in dollars. It holds the subscription token, lends it, and
+publishes the plan's usage windows (`usage_readout`, and `plan_quota` on every lease grant) for the
+minds to read and decide their own burn. The one usage-derived refusal is the provider's own
+(`ProviderRejected`), repeated until its reset.
+
 Status: the `model-connector` crate and the `claude-connector` backend crate are live. No
 connector binary exists yet (the Claude connector binary is first, then an OpenAI-compatible one).
 
@@ -11,7 +16,7 @@ connector binary exists yet (the Claude connector binary is first, then an OpenA
 
 Crate `crates/model-connector`:
 
-- `src/contract.rs` - the v3 wire contract (`gamecult.model.*.v3`): `ProviderRequest`, `TransportInvocation`,
+- `src/contract.rs` - the v4 wire contract (`gamecult.model.*.v4`): `ProviderRequest`, `TransportInvocation`,
   `TransportResult`, `TransportReceipt`, the typed `StopReason`, `FailureKind` and `Refusal`,
   `InputItem::ReasoningState` (a provider's opaque reasoning block, replayed by callers
   verbatim via `TransportResult::transcript_items`; the service refuses another provider's
@@ -23,10 +28,10 @@ Crate `crates/model-connector`:
   `cultnet.operation_request.v0` / `operation_response.v0` for service
   `gamecult.model.connector`, operation `invoke` (or `usage_readout`), its `message_id` the
   request id and its payload the base64 of the sealed envelope. `usage_readout` answers a
-  `UsageReadout` (`gamecult.model.usage_readout.v1`): each caller's spent and reserved
-  micro-USD against its ceiling in its current window, and the backend's plan quota;
+  `UsageReadout` (`gamecult.model.usage_readout.v1`): the backend's plan quota windows, each with
+  utilization, reset, status and age;
   `ConnectorClient::usage_readout` asks.
-- `schemas/` - one JSON Schema per v3 document, generated from the types.
+- `schemas/` - one JSON Schema per v4 document, generated from the types.
 - `src/client.rs` - `ConnectorClient`, the one-request caller side.
 - `src/service.rs` (feature `daemon`) - `TransportService`: caller admission, durable
   replay (a retried request is answered byte-identically and the provider runs once),
@@ -49,7 +54,7 @@ Crate `crates/claude-connector` (library only; the binary that wires it to `serv
   group); `SessionStore` and `StderrSink` are the other ports. `ClaudeCodeConfig` is what the
   binary hands in; the credential is read from a systemd credential and reaches the child on a
   pipe (`CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR`), never in an environment. `QuotaCell` keeps the
-  plan windows the CLI's `rate_limit_event`s report, for the spend readout.
+  plan windows the CLI's `rate_limit_event`s report, for the usage readout and the lease grant.
 
 Frame arithmetic is public in `src/envelope.rs`, measured on the carriage frame: `frame_bytes_for_payload(n)` is the frame a
 caller payload bound of `n` needs, `payload_bytes_for_frame(frame)` is the largest payload bound
@@ -58,7 +63,7 @@ a frame allows, and `MAX_IDENTITY_BYTES` (256) bounds caller ids, request ids an
 needed); the smallest legal frame is `frame_bytes_for_payload(MIN_PAYLOAD_BYTES)`. A request id past
 the bound is refused on the wire as `Refusal::Malformed`, the reply echoing the id (the connection is dropped only if that reply cannot fit the frame); `ConnectorClient` refuses such an id locally with `RequestIdTooLong`.
 
-The default feature set compiles contract, envelope and client only. The kit speaks v3
+The default feature set compiles contract, envelope and client only. The kit speaks v4
 only: a v2 frame gets no answer.
 
 ## Verify
@@ -68,9 +73,9 @@ cargo test --locked --workspace
 cargo test --locked --workspace --features model-connector/daemon
 ```
 
-`crates/model-connector/tests/wire_golden_v3.rs` pins the v3 documents and one sealed carriage
-frame to the fixtures in `crates/model-connector/tests/fixtures/wire_v3` (regenerate with
-`WIRE_V3_REGENERATE=1`; see the fixtures' README), and
+`crates/model-connector/tests/wire_golden_v4.rs` pins the v4 documents and one sealed carriage
+frame to the fixtures in `crates/model-connector/tests/fixtures/wire_v4` (regenerate with
+`WIRE_V4_REGENERATE=1`; see the fixtures' README), and
 `crates/model-connector/tests/published_schemas.rs` fails when `schemas/` differs from the types
 (`MODEL_CONNECTOR_REGENERATE_SCHEMAS=1` rewrites it).
 

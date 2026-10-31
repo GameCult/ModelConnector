@@ -2158,4 +2158,46 @@ mod tests {
             Some(Operation::UsageReadout)
         );
     }
+
+    #[test]
+    fn a_store_that_cannot_be_written_executes_nothing_and_holds_no_slot() {
+        let store = FlakyStore::new(0);
+        let allowance = store.allowance();
+        let mut service =
+            TransportService::with_store(store, "fixture-sse", [caller(CALLER, KEY, 1)], 5_000)
+                .unwrap();
+        let invocation = invocation_for(CALLER, "request-1");
+        assert!(matches!(
+            service.begin_unplanned(&raw_envelope(&invocation), 1_000, FRAME),
+            Err(ServiceError::ReplayStore(_))
+        ));
+        allowance.store(10, Ordering::SeqCst);
+        assert!(matches!(
+            service.begin_unplanned(&raw_envelope(&invocation), 1_000, FRAME),
+            Ok(TransportAdmission::Execute(_))
+        ));
+    }
+
+    #[test]
+    fn a_failed_completion_write_answers_the_store_failure_and_frees_the_slot() {
+        let store = FlakyStore::new(1);
+        let allowance = store.allowance();
+        let mut service =
+            TransportService::with_store(store, "fixture-sse", [caller(CALLER, KEY, 1)], 5_000)
+                .unwrap();
+        let (claim, invocation) = claim_for(&mut service, "request-1");
+        let result = text_result(claim.call(), "done");
+        assert!(matches!(
+            service.complete(*claim, result, FRAME),
+            Err(ServiceError::ReplayStore(_))
+        ));
+        // The slot is free (one concurrent request is admitted), and the retry
+        // of the unfinished id is told it is indeterminate, not in flight.
+        allowance.store(10, Ordering::SeqCst);
+        let again = service
+            .begin_unplanned(&raw_envelope(&invocation), 1_000, FRAME)
+            .unwrap();
+        assert_eq!(refusal_of(again, &invocation), Refusal::Indeterminate);
+        let _ = claim_for(&mut service, "request-2");
+    }
 }

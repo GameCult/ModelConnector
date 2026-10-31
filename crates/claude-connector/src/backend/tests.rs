@@ -1438,7 +1438,8 @@ fn usage_sums_model_usage_across_models() {
         panic!("completed expected");
     };
     assert_eq!(*summed, usage(12, 37, 1083, 24, Some(8)));
-    // The receipt is priced from usage alone: 12*3 + 37*0.3 + 1083*6 + 24*15 micro-USD, rounded up.
+    // The receipt is the usage alone: the CLI's own total never reaches it.
+    assert_eq!(parts(&cheap).1, parts(&dear).1);
 
     // No model reported thinking tokens: none is claimed.
     let plain = r#"{"claude-haiku-5-5":{"inputTokens":1,"outputTokens":1,"cacheReadInputTokens":0,"cacheCreationInputTokens":0}}"#;
