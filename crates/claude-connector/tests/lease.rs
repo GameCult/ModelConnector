@@ -543,3 +543,99 @@ fn connections_past_the_limit_are_dropped_and_finished_ones_free_their_place() {
     drop(first);
     assert!(granted_ok(&ask_until_granted(&harness, 2)));
 }
+
+#[test]
+fn a_lease_survives_many_polls_while_its_holder_and_invocation_stay() {
+    let harness = start(setup());
+    let mut first = ask(&harness, 60_000);
+    assert!(granted_ok(&first));
+    // Three polls later the lease still holds: a second invocation is Busy.
+    std::thread::sleep(Duration::from_millis(1_700));
+    harness.enter(2);
+    let second = ask(&harness, 60_000);
+    assert_eq!(refusal_of(&second), Some(LeaseRefusalKind::Busy));
+    // The holder talking does not end it either.
+    first._stream.write_all(b"x").unwrap();
+    std::thread::sleep(Duration::from_millis(1_200));
+    harness.enter(3);
+    assert_eq!(
+        refusal_of(&ask(&harness, 60_000)),
+        Some(LeaseRefusalKind::Busy)
+    );
+}
+
+#[test]
+fn a_lease_ends_when_the_unit_runs_a_different_invocation() {
+    let harness = start(setup());
+    let first = ask(&harness, 60_000);
+    assert!(granted_ok(&first));
+    // The same unit, a new invocation: the one that leased is over.
+    harness.enter(2);
+    std::thread::sleep(Duration::from_millis(1_200));
+    assert!(granted_ok(&ask(&harness, 60_000)));
+    drop(first);
+}
+
+#[test]
+fn a_lease_asks_the_system_about_its_holders_process_for_its_own_unit() {
+    let harness = start(setup());
+    let first = ask(&harness, 60_000);
+    assert!(granted_ok(&first));
+    std::thread::sleep(Duration::from_millis(1_200));
+    let asked = harness.units.as_ref().unwrap().asked_about.lock().unwrap().clone();
+    assert!(asked.len() >= 3, "the hold polled: {asked:?}");
+    assert!(asked.iter().all(|(_, unit)| unit == UNIT));
+}
+
+#[test]
+fn an_account_resolves_to_its_uid_and_a_missing_one_to_none() {
+    assert_eq!(claude_connector::user_uid("root"), Some(0));
+    assert_eq!(claude_connector::user_uid("no-such-account-4c1f9a"), None);
+    assert_eq!(claude_connector::user_uid("bad\0name"), None);
+}
+
+#[test]
+fn a_token_up_to_one_atomic_pipe_write_is_lent_and_a_longer_one_is_not() {
+    let exact: &'static str = Box::leak("a".repeat(4096).into_boxed_str());
+    let harness = start(Setup {
+        token: Some(exact),
+        ..setup()
+    });
+    let mut answer = ask(&harness, 60_000);
+    assert!(granted_ok(&answer));
+    let mut read = Vec::new();
+    File::from(answer.fds.remove(0))
+        .read_to_end(&mut read)
+        .unwrap();
+    assert_eq!(read.len(), 4096);
+
+    let long: &'static str = Box::leak("a".repeat(4097).into_boxed_str());
+    let harness = start(Setup {
+        token: Some(long),
+        ..setup()
+    });
+    let refused = ask(&harness, 60_000);
+    assert!(refused.message.is_none() && refused.fds.is_empty());
+}
+
+#[test]
+fn a_request_trickled_past_the_socket_timeout_is_dropped_without_a_lease() {
+    let harness = start(setup());
+    let mut stream = UnixStream::connect(&harness.socket).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(8)))
+        .unwrap();
+    stream.write_all(&[0, 0]).unwrap();
+    let started = Instant::now();
+    let mut byte = [0_u8; 1];
+    let outcome = stream.read(&mut byte);
+    // The listener gave up at its own two-second bound and closed the
+    // connection: end of file or a reset, never our own read timing out.
+    assert!(
+        matches!(outcome, Ok(0))
+            || outcome.as_ref().is_err_and(|e| e.kind() == std::io::ErrorKind::ConnectionReset),
+        "{outcome:?}"
+    );
+    assert!(started.elapsed() < Duration::from_secs(6));
+    assert_eq!(harness.tokens.reads.load(Ordering::SeqCst), 0);
+}
