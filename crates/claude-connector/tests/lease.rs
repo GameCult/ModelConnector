@@ -583,7 +583,14 @@ fn a_lease_asks_the_system_about_its_holders_process_for_its_own_unit() {
     let first = ask(&harness, 60_000);
     assert!(granted_ok(&first));
     std::thread::sleep(Duration::from_millis(1_200));
-    let asked = harness.units.as_ref().unwrap().asked_about.lock().unwrap().clone();
+    let asked = harness
+        .units
+        .as_ref()
+        .unwrap()
+        .asked_about
+        .lock()
+        .unwrap()
+        .clone();
     assert!(asked.len() >= 3, "the hold polled: {asked:?}");
     assert!(asked.iter().all(|(_, unit)| unit == UNIT));
 }
@@ -634,7 +641,9 @@ fn a_request_trickled_past_the_socket_timeout_is_dropped_without_a_lease() {
     // connection: end of file or a reset, never our own read timing out.
     assert!(
         matches!(outcome, Ok(0))
-            || outcome.as_ref().is_err_and(|e| e.kind() == std::io::ErrorKind::ConnectionReset),
+            || outcome
+                .as_ref()
+                .is_err_and(|e| e.kind() == std::io::ErrorKind::ConnectionReset),
         "{outcome:?}"
     );
     assert!(started.elapsed() < Duration::from_secs(6));

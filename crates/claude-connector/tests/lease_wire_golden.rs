@@ -44,7 +44,11 @@ fn the_request_frame_is_pinned() {
 #[test]
 fn every_refusal_frame_is_pinned_with_its_kind_as_a_pascal_case_string() {
     let kinds = [
-        ("refusal_unknown_caller.bin", LeaseRefusalKind::UnknownCaller, "UnknownCaller"),
+        (
+            "refusal_unknown_caller.bin",
+            LeaseRefusalKind::UnknownCaller,
+            "UnknownCaller",
+        ),
         ("refusal_expired.bin", LeaseRefusalKind::Expired, "Expired"),
         ("refusal_busy.bin", LeaseRefusalKind::Busy, "Busy"),
         (
