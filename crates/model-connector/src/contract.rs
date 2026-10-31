@@ -9,11 +9,11 @@ use zeroize::Zeroize;
 
 use crate::envelope::{ServiceError, binary_schema};
 
-pub const PROVIDER_REQUEST_SCHEMA_ID: &str = "gamecult.model.provider_request.v3";
-pub const INVOCATION_SCHEMA_ID: &str = "gamecult.model.transport_invocation.v3";
-pub const RESULT_SCHEMA_ID: &str = "gamecult.model.transport_result.v3";
-pub const RECEIPT_SCHEMA_ID: &str = "gamecult.model.transport_receipt.v3";
-pub const ENVELOPE_SCHEMA_ID: &str = "gamecult.model.transport_envelope.v3";
+pub const PROVIDER_REQUEST_SCHEMA_ID: &str = "gamecult.model.provider_request.v4";
+pub const INVOCATION_SCHEMA_ID: &str = "gamecult.model.transport_invocation.v4";
+pub const RESULT_SCHEMA_ID: &str = "gamecult.model.transport_result.v4";
+pub const RECEIPT_SCHEMA_ID: &str = "gamecult.model.transport_receipt.v4";
+pub const ENVELOPE_SCHEMA_ID: &str = "gamecult.model.transport_envelope.v4";
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct TransportKey(pub(crate) [u8; 32]);
@@ -190,10 +190,10 @@ pub enum FailureKind {
     Provider,
 }
 
-/// Token accounting for one request, as the backend reports it; the service
-/// prices it. Cache reads and writes are counted apart from plain input.
+/// Token accounting for one request, as the backend reports it. Cache reads
+/// and writes are counted apart from plain input.
 /// `output_tokens` includes reasoning tokens: `reasoning_tokens` is a detail
-/// (absent when the provider does not report it) and is never priced apart.
+/// (absent when the provider does not report it) and is never counted apart.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Usage {
@@ -252,10 +252,6 @@ pub struct TransportInvocation {
     pub expires_at_unix_ms: u64,
     pub native_request_sha256: [u8; 32],
     pub provider_request_sha256: [u8; 32],
-    /// The most this request may cost, in micro-USD: the caller's own bound
-    /// on it. Required nonzero. It is part of the invocation's identity, so a
-    /// changed budget under a recorded request id is a `ReplayConflict`.
-    pub max_cost_micro_usd: u64,
     pub request: ProviderRequest,
 }
 
@@ -264,7 +260,6 @@ impl TransportInvocation {
         caller_runtime_id: impl Into<String>,
         expires_at_unix_ms: u64,
         native_request_sha256: [u8; 32],
-        max_cost_micro_usd: u64,
         request: ProviderRequest,
     ) -> Result<Self, ContractError> {
         let provider_request_sha256 = provider_request_sha256(&request)?;
@@ -274,7 +269,6 @@ impl TransportInvocation {
             expires_at_unix_ms,
             native_request_sha256,
             provider_request_sha256,
-            max_cost_micro_usd,
             request,
         })
     }
@@ -286,9 +280,6 @@ impl TransportInvocation {
         require_id(&self.caller_runtime_id, "caller_runtime_id")?;
         if self.native_request_sha256 == [0; 32] {
             return Err(ContractError::Invalid("native_request_sha256"));
-        }
-        if self.max_cost_micro_usd == 0 {
-            return Err(ContractError::Invalid("max_cost_micro_usd"));
         }
         self.request.validate()?;
         if self.provider_request_sha256 != provider_request_sha256(&self.request)? {
@@ -485,15 +476,6 @@ pub struct TransportReceipt {
     /// How many foreign `ReasoningState` items the service removed from the
     /// request before the backend saw it.
     pub foreign_reasoning_dropped: u32,
-    /// What the request cost, in micro-USD. The service derives it from the
-    /// outcome's usage and its price table; a backend never writes it.
-    pub cost_micro_usd: u64,
-    /// How far `cost_micro_usd` exceeds what the service reserved for the
-    /// request: zero unless the backend reported usage above the worst case
-    /// the request allowed, which is a breach of the backend's contract. The
-    /// cost is still the true one and the caller's window is charged all of
-    /// it. The service derives this; a backend never writes it.
-    pub overrun_micro_usd: u64,
     pub outcome: TransportOutcome,
 }
 
@@ -558,12 +540,6 @@ pub enum Refusal {
     ModelNotAllowed,
     OutputBound,
     PayloadBound,
-    // The worst case of the request exceeds the invocation's own
-    // `max_cost_micro_usd`. Plain comments: a doc comment would split the
-    // published schema into a union.
-    CostBound,
-    // The caller's spend window cannot hold the request's reservation.
-    SpendCeiling,
     Capacity,
     InFlight,
     Indeterminate,
@@ -573,15 +549,12 @@ pub enum Refusal {
     // exchange, where dropping it would break the provider's own rules. A plain
     // comment: a doc comment would split the published schema into a union.
     ForeignReasoningState,
-    // The caller's newest admission window starts after the clock's reading,
-    // and the request does not fit what that window holds: the host's clock
-    // is behind the window and the caller stays refused until it catches up.
-    // A plain comment: a doc comment would split the published schema into a
-    // union.
-    ClockBehindAdmissionWindow,
+    // The provider itself is refusing right now: a plan window it reported
+    // `rejected` has not reached its own reset. Plain comments, as above.
+    ProviderRejected,
 }
 
-/// The one wire codec of every v3 document: named MessagePack (struct fields
+/// The one wire codec of every v4 document: named MessagePack (struct fields
 /// are keyed by name), with unknown fields refused by the types themselves.
 pub(crate) fn wire_encode<T: Serialize + ?Sized>(document: &T) -> Result<Vec<u8>, ContractError> {
     rmp_serde::to_vec_named(document).map_err(|_| ContractError::Encoding)
@@ -787,28 +760,16 @@ mod tests {
     }
 
     #[test]
-    fn max_cost_zero_is_malformed() {
-        let mut invocation = invocation();
-        invocation.max_cost_micro_usd = 0;
-        assert_eq!(
-            invocation.validate(1_000, 2_000),
-            Err(ContractError::Invalid("max_cost_micro_usd"))
-        );
-        invocation.max_cost_micro_usd = 1;
-        assert_eq!(invocation.validate(1_000, 2_000), Ok(()));
-    }
-
-    #[test]
-    fn max_cost_is_part_of_the_invocations_identity() {
+    fn the_invocations_identity_covers_its_request() {
         let one = invocation();
         let mut other = one.clone();
-        other.max_cost_micro_usd += 1;
+        other.request.max_output_tokens += 1;
         assert_ne!(
             canonical_invocation_bytes(&one).unwrap(),
             canonical_invocation_bytes(&other).unwrap()
         );
         let decoded: TransportInvocation = wire_decode(&wire_encode(&one).unwrap()).unwrap();
-        assert_eq!(decoded.max_cost_micro_usd, one.max_cost_micro_usd);
+        assert_eq!(decoded, one);
     }
 
     #[test]
@@ -869,7 +830,7 @@ mod tests {
     }
 
     #[test]
-    fn v3_documents_carry_their_v3_ids() {
+    fn v4_documents_carry_their_v4_ids() {
         assert_eq!(
             [
                 PROVIDER_REQUEST_SCHEMA_ID,
@@ -879,11 +840,11 @@ mod tests {
                 ENVELOPE_SCHEMA_ID
             ],
             [
-                "gamecult.model.provider_request.v3",
-                "gamecult.model.transport_invocation.v3",
-                "gamecult.model.transport_result.v3",
-                "gamecult.model.transport_receipt.v3",
-                "gamecult.model.transport_envelope.v3"
+                "gamecult.model.provider_request.v4",
+                "gamecult.model.transport_invocation.v4",
+                "gamecult.model.transport_result.v4",
+                "gamecult.model.transport_receipt.v4",
+                "gamecult.model.transport_envelope.v4"
             ]
         );
         let invocation = invocation();
@@ -922,7 +883,7 @@ mod tests {
         let bytes = wire_encode(document).unwrap();
         let mut value = rmpv::decode::read_value(&mut bytes.as_slice()).unwrap();
         let rmpv::Value::Map(entries) = &mut value else {
-            panic!("a v3 document is a named map");
+            panic!("a v4 document is a named map");
         };
         entries.push((rmpv::Value::from("unexpected_field"), rmpv::Value::from(1)));
         let mut out = Vec::new();

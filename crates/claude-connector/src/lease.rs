@@ -1,15 +1,14 @@
 //! The Self-run credential lease. The connector is the only holder of the
-//! subscription token and the one owner of Self-run admission, reservation and
-//! the spend ledger (rulings self-runs-through-connector,
-//! self-run-credential-lease and self-run-lease-billing-and-binding). A Self
-//! run asks over a unix socket for a lease. The connector decides who may ask
-//! (the peer's uid, and the systemd unit invocation its process runs in),
-//! reserves its own configured amount in the caller's spend window, and only
-//! then hands back one pipe fd that holds the token. The run settles with the
-//! per-model usage it reports, and the connector bills that at true cost,
-//! uncapped; a run that vanishes or lets its lease expire is billed the whole
-//! reservation. Nothing the run says about itself decides who it is, what it
-//! reserves, or what the plan allows.
+//! subscription token and the one owner of Self-run admission (rulings
+//! self-runs-through-connector and self-run-credential-lease). A Self run asks
+//! over a unix socket for a lease. The connector decides who may ask (the
+//! peer's uid, and the systemd unit invocation its process runs in), and hands
+//! back one pipe fd that holds the token, with the plan's usage windows. The
+//! lease lasts while the holder keeps the socket open: it ends when the holder
+//! closes it, when its unit invocation ends, or when its expiry passes. Nothing
+//! is reserved and nothing is billed; the only usage-derived refusal is the
+//! provider's own, repeated until its own reset. Nothing the run says about
+//! itself decides who it is or what the plan allows.
 //!
 //! The token exists in this process only as the value the token source returns
 //! and in the pipe. It is not in an environment, an argument, a file, a log or
@@ -28,12 +27,11 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use model_connector::{
-    LeaseAdmission, LeaseGrant, LeaseRefusal, LeaseSettlement, LeaseTurn, LeaseUse, ModelUsage,
-    TransportService,
+    LeaseAdmission, LeaseGrant, LeaseRefusal, LeaseTurn, PlanQuota, TransportService,
 };
 use serde::{Deserialize, Serialize};
 
-use crate::TokenSource;
+use crate::{QuotaCell, TokenSource};
 
 /// The largest frame either side sends or accepts, in bytes. It is wire
 /// contract: a Huginn client sizes against it, so it is pinned as a literal.
@@ -50,12 +48,9 @@ pub enum LeaseMessage {
     /// holds the token, its write end closed.
     ClaudeLeaseGrant(LeaseGranted),
     ClaudeLeaseRefusal(LeaseRefused),
-    ClaudeLeaseSettle(LeaseSettle),
-    ClaudeLeaseSettled(LeaseSettled),
 }
 
-/// A request names only when the lease ends. Who asks, and what is reserved,
-/// are the connector's to know.
+/// A request names only when the lease ends. Who asks is the connector's to know.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LeaseRequest {
     pub expires_at_unix_ms: u64,
@@ -64,36 +59,23 @@ pub struct LeaseRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LeaseGranted {
     pub lease_id: String,
-    pub reserved_micro_usd: u64,
+    /// The plan's usage windows as the connector last saw them, so the run
+    /// can read its own burn.
+    pub plan_quota: Vec<PlanQuota>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LeaseRefusalKind {
-    SpendCeiling,
-    CostBound,
     UnknownCaller,
     Expired,
     Busy,
+    ProviderRejected,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LeaseRefused {
     pub kind: LeaseRefusalKind,
     pub detail: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LeaseSettle {
-    pub lease_id: String,
-    /// What the run used of each model, as the run reports it.
-    pub usage: Vec<ModelUsage>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LeaseSettled {
-    pub billed_micro_usd: u64,
-    /// How far the bill passed the reservation; zero when it did not.
-    pub overrun_micro_usd: u64,
 }
 
 /// A frame: the length, then the named-map MessagePack of `message`.
@@ -180,8 +162,8 @@ fn read_message(stream: &mut impl Bounded, deadline: Instant) -> io::Result<Leas
 const PIPE_BUF: usize = 4096;
 
 /// A unix account allowed to lease, the unit its process must run in (the
-/// Self or the Persona unit of its instance, by `turn`), and the caller whose
-/// spend window its leases reserve in.
+/// Self or the Persona unit of its instance, by `turn`), and the
+/// caller whose name its leases carry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LeaseCaller {
     pub uid: u32,
@@ -191,8 +173,6 @@ pub struct LeaseCaller {
     /// The `<instance>` of `mind-self@<instance>.service` or
     /// `mind-persona@<instance>.service`.
     pub unit_instance: String,
-    /// What each of this caller's leases reserves, whatever the run asks.
-    pub reservation_micro_usd: u64,
 }
 
 impl LeaseCaller {
@@ -400,6 +380,7 @@ struct Lender {
     callers: Vec<LeaseCaller>,
     limits: LeaseLimits,
     service: Arc<Mutex<TransportService>>,
+    quota: Arc<QuotaCell>,
     tokens: Arc<dyn TokenSource>,
     units: Arc<dyn PeerUnits>,
 }
@@ -415,6 +396,7 @@ pub fn serve_leases(
     callers: Vec<LeaseCaller>,
     limits: LeaseLimits,
     service: Arc<Mutex<TransportService>>,
+    quota: Arc<QuotaCell>,
     tokens: Arc<dyn TokenSource>,
     units: Arc<dyn PeerUnits>,
 ) -> io::Result<()> {
@@ -422,6 +404,7 @@ pub fn serve_leases(
         callers,
         limits,
         service,
+        quota,
         tokens,
         units,
     });
@@ -484,9 +467,9 @@ impl Lender {
                 "the expiry is not in the future or is past the lease bound",
             );
         }
-        // The reservation is claimed in the ledger before the token is read,
-        // let alone lent. A ledger that fails closes the connection with no
-        // answer and no lease.
+        // The lease is claimed before the token is read, let alone lent. The
+        // plan the refusal reads is the one this process last observed.
+        let plan = self.quota.snapshot();
         let admission = self
             .service
             .lock()
@@ -495,119 +478,133 @@ impl Lender {
                 &caller.caller_id,
                 caller.turn,
                 &invocation.invocation_id,
-                caller.reservation_micro_usd,
                 request.expires_at_unix_ms,
                 now,
+                &plan,
             )
-            .map_err(|_| io::Error::other("ledger"))?;
+            .map_err(|_| io::Error::other("lease"))?;
         let grant = match admission {
             LeaseAdmission::Granted(grant) => grant,
             LeaseAdmission::Refused(why) => {
                 let (kind, detail) = match why {
-                    LeaseRefusal::SpendCeiling => (
-                        LeaseRefusalKind::SpendCeiling,
-                        "the window cannot hold this reservation",
-                    ),
-                    LeaseRefusal::CostBound => (
-                        LeaseRefusalKind::CostBound,
-                        "the reservation must be above zero",
-                    ),
                     LeaseRefusal::UnknownCaller => (
                         LeaseRefusalKind::UnknownCaller,
                         "this account is bound to no admitted caller",
                     ),
                     LeaseRefusal::Busy => (
                         LeaseRefusalKind::Busy,
-                        "a lease is open for this caller or this unit invocation leased",
+                        "a lease is open for this caller or this unit invocation",
+                    ),
+                    LeaseRefusal::ProviderRejected => (
+                        LeaseRefusalKind::ProviderRejected,
+                        "the provider is refusing until its own reset",
                     ),
                 };
                 return refuse(&mut stream, kind, detail);
             }
         };
-        self.hold(stream, caller, &grant, request.expires_at_unix_ms)
+        self.hold(
+            stream,
+            caller,
+            &grant,
+            &invocation,
+            peer.process,
+            request.expires_at_unix_ms,
+            plan.windows,
+        )
     }
 
-    /// Everything after a reservation exists: lend the token, then settle the
-    /// lease exactly once whatever happens.
+    /// Everything after a lease exists: lend the token, then keep the lease
+    /// while its holder keeps the socket and its unit invocation, and end it
+    /// exactly once whatever happens.
+    // One argument per fact the held lease binds.
+    #[allow(clippy::too_many_arguments)]
     fn hold(
         &self,
         mut stream: UnixStream,
         caller: &LeaseCaller,
         grant: &LeaseGrant,
+        invocation: &PeerUnit,
+        process: Option<OwnedFd>,
         expires_at_unix_ms: u64,
+        plan_quota: Vec<PlanQuota>,
     ) -> io::Result<()> {
-        // A token that cannot be read or piped was never lent: nothing was
-        // used, so nothing is billed.
+        let held = self.keep(
+            &mut stream,
+            caller,
+            grant,
+            invocation,
+            process.as_ref(),
+            expires_at_unix_ms,
+            plan_quota,
+        );
+        self.service
+            .lock()
+            .map_err(|_| io::Error::other("service lock"))?
+            .end_lease(&caller.caller_id, &grant.lease_id);
+        held
+    }
+
+    // One argument per fact the held lease binds.
+    #[allow(clippy::too_many_arguments)]
+    fn keep(
+        &self,
+        stream: &mut UnixStream,
+        caller: &LeaseCaller,
+        grant: &LeaseGrant,
+        invocation: &PeerUnit,
+        process: Option<&OwnedFd>,
+        expires_at_unix_ms: u64,
+        plan_quota: Vec<PlanQuota>,
+    ) -> io::Result<()> {
+        // A token that cannot be read or piped was never lent: the lease ends.
         let Some(read_end) = self
             .tokens
             .read()
             .and_then(|token| token_pipe(token.as_bytes()).ok())
         else {
-            self.settle(caller, grant, LeaseUse::NeverLent)?;
             return Ok(());
         };
         let frame = encode_frame(&LeaseMessage::ClaudeLeaseGrant(LeaseGranted {
             lease_id: grant.lease_id.clone(),
-            reserved_micro_usd: grant.reserved_micro_usd,
+            plan_quota,
         }));
-        let sent = send_with_fd(&stream, &frame, read_end.as_raw_fd());
+        let sent = send_with_fd(stream, &frame, read_end.as_raw_fd());
         drop(read_end);
-        if sent.is_err() {
-            // The descriptor may have been delivered: the reservation is billed.
-            self.settle(caller, grant, LeaseUse::Reservation)?;
-            return Ok(());
-        }
-        let outcome = self.await_settle(&mut stream, grant, expires_at_unix_ms);
-        match outcome {
-            Some(settle) => {
-                let settlement = self.settle(caller, grant, LeaseUse::Reported(&settle.usage))?;
-                let _ = stream.write_all(&encode_frame(&LeaseMessage::ClaudeLeaseSettled(
-                    LeaseSettled {
-                        billed_micro_usd: settlement.billed_micro_usd,
-                        overrun_micro_usd: settlement.overrun_micro_usd,
-                    },
-                )));
+        sent?;
+        // The holder says nothing more. The lease ends when it closes the
+        // socket, when its unit invocation is no longer the one that leased,
+        // or at the expiry.
+        let mut byte = [0_u8; 1];
+        loop {
+            let left = expires_at_unix_ms.saturating_sub(unix_ms());
+            if left == 0 {
+                return Ok(());
             }
-            None => {
-                self.settle(caller, grant, LeaseUse::Reservation)?;
+            stream.set_read_timeout(Some(Duration::from_millis(left.min(HOLD_POLL_MS))))?;
+            match stream.read(&mut byte) {
+                Ok(0) => return Ok(()),
+                Ok(_) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) => {}
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(_) => return Ok(()),
+            }
+            let still = process
+                .and_then(|process| self.units.invocation_in(process.as_fd(), &caller.unit()))
+                .is_some_and(|found| found == *invocation);
+            if !still {
+                return Ok(());
             }
         }
-        Ok(())
-    }
-
-    /// The run's settle, if its whole frame arrives for this lease before the
-    /// lease expires. Anything else (end of file, silence, a frame still
-    /// trickling at the expiry, a malformed frame, the wrong lease) is no
-    /// report.
-    fn await_settle(
-        &self,
-        stream: &mut UnixStream,
-        grant: &LeaseGrant,
-        expires_at_unix_ms: u64,
-    ) -> Option<LeaseSettle> {
-        let remaining = expires_at_unix_ms.saturating_sub(unix_ms());
-        let deadline = Instant::now() + Duration::from_millis(remaining);
-        match read_message(stream, deadline).ok()? {
-            LeaseMessage::ClaudeLeaseSettle(settle) if settle.lease_id == grant.lease_id => {
-                Some(settle)
-            }
-            _ => None,
-        }
-    }
-
-    fn settle(
-        &self,
-        caller: &LeaseCaller,
-        grant: &LeaseGrant,
-        usage: LeaseUse<'_>,
-    ) -> io::Result<LeaseSettlement> {
-        self.service
-            .lock()
-            .map_err(|_| io::Error::other("service lock"))?
-            .settle_lease(&caller.caller_id, &grant.lease_id, usage)
-            .map_err(|_| io::Error::other("ledger"))
     }
 }
+
+/// How often a held lease looks again at its holder's unit invocation.
+const HOLD_POLL_MS: u64 = 500;
 
 fn refuse(stream: &mut UnixStream, kind: LeaseRefusalKind, detail: &str) -> io::Result<()> {
     stream.write_all(&encode_frame(&LeaseMessage::ClaudeLeaseRefusal(
@@ -622,12 +619,12 @@ fn refuse(stream: &mut UnixStream, kind: LeaseRefusalKind, detail: &str) -> io::
 mod tests {
     use super::*;
 
-    /// A settle frame whose body is exactly `body_bytes` long.
-    fn settle_frame_of(body_bytes: usize) -> Vec<u8> {
+    /// A refusal frame whose body is exactly `body_bytes` long.
+    fn frame_of(body_bytes: usize) -> Vec<u8> {
         let frame_with = |pad: usize| {
-            encode_frame(&LeaseMessage::ClaudeLeaseSettle(LeaseSettle {
-                lease_id: "x".repeat(pad),
-                usage: Vec::new(),
+            encode_frame(&LeaseMessage::ClaudeLeaseRefusal(LeaseRefused {
+                kind: LeaseRefusalKind::Busy,
+                detail: "x".repeat(pad),
             }))
         };
         // The string header is the same width between 256 and 65535 bytes.
@@ -646,10 +643,10 @@ mod tests {
 
     #[test]
     fn a_frame_is_one_whole_message_within_the_bound() {
-        let at_bound = settle_frame_of(MAX_LEASE_FRAME_BYTES);
+        let at_bound = frame_of(MAX_LEASE_FRAME_BYTES);
         assert_eq!(at_bound.len(), 4 + MAX_LEASE_FRAME_BYTES);
         assert!(decode_frame(&at_bound).is_some());
-        let past_bound = settle_frame_of(MAX_LEASE_FRAME_BYTES + 1);
+        let past_bound = frame_of(MAX_LEASE_FRAME_BYTES + 1);
         assert!(decode_frame(&past_bound).is_none());
         let mut trailing = at_bound.clone();
         trailing.push(0);
@@ -661,9 +658,9 @@ mod tests {
 
     #[test]
     fn a_stream_frame_over_the_bound_is_refused_before_it_is_read() {
-        let past_bound = settle_frame_of(MAX_LEASE_FRAME_BYTES + 1);
+        let past_bound = frame_of(MAX_LEASE_FRAME_BYTES + 1);
         assert!(within(&past_bound).is_err());
-        let at_bound = settle_frame_of(MAX_LEASE_FRAME_BYTES);
+        let at_bound = frame_of(MAX_LEASE_FRAME_BYTES);
         assert!(within(&at_bound).is_ok());
         assert!(within(&[0_u8, 0, 0, 0]).is_err());
         // Short of the length it announced is end of file, not a message.
@@ -673,10 +670,10 @@ mod tests {
     #[test]
     fn a_frame_that_trickles_past_its_deadline_is_refused_however_small_each_read() {
         let (mut reader, mut writer) = UnixStream::pair().unwrap();
-        let frame = encode_frame(&LeaseMessage::ClaudeLeaseSettle(LeaseSettle {
-            lease_id: "lease:x".to_string(),
-            usage: Vec::new(),
-        }));
+        let frame = encode_frame(&LeaseMessage::ClaudeLeaseRefusal(LeaseRefused {
+                kind: LeaseRefusalKind::Busy,
+                detail: "lease:x".to_string(),
+            }));
         let trickle = thread::spawn(move || {
             for byte in frame {
                 if writer.write_all(&[byte]).is_err() {

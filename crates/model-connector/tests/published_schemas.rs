@@ -1,4 +1,4 @@
-//! `schemas/` at the repository root publishes one JSON Schema per v3 document,
+//! `schemas/` at the repository root publishes one JSON Schema per v4 document,
 //! generated from the types. This test regenerates them and fails on any
 //! difference; run it with `MODEL_CONNECTOR_REGENERATE_SCHEMAS=1` to rewrite the
 //! files from the types.
@@ -28,7 +28,7 @@ fn published_schemas_are_the_types() {
         ("transport_result", render::<TransportResult>()),
         ("transport_receipt", render::<TransportReceipt>()),
         ("transport_envelope", render::<TransportEnvelope>()),
-        ("spend_readout", render::<SpendReadout>()),
+        ("usage_readout", render::<UsageReadout>()),
     ];
     let dir = schemas_dir();
     if std::env::var_os(REGENERATE).is_some() {
@@ -80,7 +80,7 @@ fn the_published_ciphertext_is_what_the_wire_sends() {
     assert_eq!(&published["properties"]["ciphertext"], ciphertext);
 
     let envelope = TransportEnvelope {
-        schema_id: "gamecult.model.transport_envelope.v3".to_string(),
+        schema_id: "gamecult.model.transport_envelope.v4".to_string(),
         caller_runtime_id: "caller".to_string(),
         request_id: "request".to_string(),
         message_kind: EnvelopeKind::Invocation,
@@ -111,9 +111,7 @@ fn the_refusal_schema_is_one_flat_string_enum() {
         .iter()
         .map(|value| value.as_str().unwrap())
         .collect();
-    assert_eq!(variants.len(), 15);
-    assert!(variants.contains(&"ClockBehindAdmissionWindow"));
+    assert_eq!(variants.len(), 13);
     assert!(variants.contains(&"ForeignReasoningState"));
-    assert!(variants.contains(&"CostBound"));
-    assert!(variants.contains(&"SpendCeiling"));
+    assert!(variants.contains(&"ProviderRejected"));
 }

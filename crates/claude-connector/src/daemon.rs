@@ -3,7 +3,7 @@
 //! run with; nothing in the connector's environment, flags or JSON can change
 //! them. Validation errors name a field and never echo a value.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::net::{SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use cultcache_rs::{CultCache, DatabaseEntry, SingleFileMessagePackBackingStore};
 use model_connector::{
-    CallerAdmission, CallerConfig, LeaseTurn, MIN_PAYLOAD_BYTES, ModelPrice, ProviderBackend,
+    CallerAdmission, CallerConfig, LeaseTurn, MIN_PAYLOAD_BYTES, ProviderBackend,
     ServeError, ServeLimits, ServiceError, TransportService, load_admissions, serve_service,
 };
 use serde::{Deserialize, Serialize};
@@ -31,8 +31,8 @@ const MODEL_PREFIX: &str = "claude-";
 
 /// A unix account that may lease the subscription token for a Self run or a
 /// Persona turn, the unit its process must run in (`mind-self@<unit_instance>`
-/// or `mind-persona@<unit_instance>`, by `turn`), the configured caller whose
-/// spend window its leases reserve in, and what each lease reserves there.
+/// or `mind-persona@<unit_instance>`, by `turn`), and the configured caller
+/// whose name its leases carry.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LeaseCallerConfig {
     pub unix_user: String,
@@ -41,11 +41,10 @@ pub struct LeaseCallerConfig {
     /// or `mind-persona@`, its process must run in.
     pub turn: LeaseTurn,
     pub unit_instance: String,
-    pub reservation_micro_usd: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, DatabaseEntry)]
-#[cultcache(type = "gamecult.model_connector.claude_connector_config.v1")]
+#[cultcache(type = "gamecult.model_connector.claude_connector_config.v2")]
 pub struct ClaudeConnectorConfig {
     /// A loopback socket address.
     #[cultcache(key = 0)]
@@ -86,14 +85,10 @@ pub struct ClaudeConnectorConfig {
     #[cultcache(key = 16)]
     pub max_expiry_skew_ms: u64,
     /// Every caller of this connector: its own connection key and epoch, models,
-    /// concurrency, payload and output bounds, and spend ceiling and window.
+    /// concurrency, payload and output bounds.
     /// Ids are unique. Handles are bound to the caller that was given them.
     #[cultcache(key = 17)]
     pub callers: Vec<CallerConfig>,
-    /// What each allowed model costs. The keys are the known list of models:
-    /// ids exactly as the CLI reports them in its init event.
-    #[cultcache(key = 18)]
-    pub prices: BTreeMap<String, ModelPrice>,
     /// Where the Self-run lease socket is bound (a systemd RuntimeDirectory),
     /// or none when this connector lends no token.
     #[cultcache(key = 19)]
@@ -143,7 +138,6 @@ impl From<ServeError> for ConfigError {
             ServeError::ConnectionKey(_) => Self::Unusable("connection_key_file"),
             ServeError::Service(error) => match error {
                 ServiceError::ReplayStore(_) => Self::Unusable("replay_store"),
-                ServiceError::UnpricedModel(_) => Self::Invalid("prices"),
                 ServiceError::InvalidAdmission
                 | ServiceError::DuplicateCaller
                 | ServiceError::SharedCallerKey => Self::Invalid("callers"),
@@ -228,8 +222,6 @@ impl ClaudeConnectorConfig {
             if caller.max_concurrent_requests == 0
                 || caller.max_payload_bytes < MIN_PAYLOAD_BYTES
                 || caller.max_output_tokens == 0
-                || caller.spend_ceiling_micro_usd == 0
-                || caller.spend_window_ms == 0
             {
                 return Err(ConfigError::Invalid("caller bounds"));
             }
@@ -240,18 +232,10 @@ impl ClaudeConnectorConfig {
             for model in &caller.allowed_models {
                 if !has_model_id_form(model)
                     || !seen.insert(model.as_str())
-                    || !self.prices.contains_key(model)
                 {
                     return Err(ConfigError::Invalid("allowed_models"));
                 }
             }
-        }
-        if !self
-            .prices
-            .iter()
-            .all(|(model, price)| has_model_id_form(model) && is_fully_priced(price))
-        {
-            return Err(ConfigError::Invalid("prices"));
         }
         self.validate_leases()?;
         Ok(listen)
@@ -278,11 +262,7 @@ impl ClaudeConnectorConfig {
                     && self
                         .callers
                         .iter()
-                        .find(|caller| caller.caller_runtime_id == lease.caller_id)
-                        .is_some_and(|caller| {
-                            (1..=caller.spend_ceiling_micro_usd)
-                                .contains(&lease.reservation_micro_usd)
-                        })
+                        .any(|caller| caller.caller_runtime_id == lease.caller_id)
                     && is_unit_instance(&lease.unit_instance)
                     && users.insert(lease.unix_user.as_str())
             })
@@ -336,8 +316,7 @@ fn is_trimmed_nonempty(text: &str) -> bool {
 /// The loose shape of a model id, only to catch typos:
 /// `claude-<family>-<major>`, then an optional `-<minor>` and an optional
 /// `-YYYYMMDD`, the family lowercase letters. No shape can tell an alias from
-/// a canonical id, so the known list is the price table's keys (ruling
-/// claude-model-ids-from-price-table); an alias that slips in fails its first
+/// a canonical id, so the known list is `allowed_models` itself; an alias that slips in fails its first
 /// call, when the stream's `init.model` differs from the request.
 fn has_model_id_form(model: &str) -> bool {
     let Some(rest) = model.strip_prefix(MODEL_PREFIX) else {
@@ -365,25 +344,6 @@ fn has_model_id_form(model: &str) -> bool {
         && after_ok
 }
 
-/// A price is a fuse only if every component it bills is nonzero: a zero rate
-/// lets a call cost nothing against the caller's ceiling.
-fn is_fully_priced(price: &ModelPrice) -> bool {
-    let long = price.long_context.map(|long| long.rates);
-    [Some(price.rates), long]
-        .into_iter()
-        .flatten()
-        .all(|rates| {
-            [
-                rates.input,
-                rates.cache_write_short,
-                rates.cache_write_long,
-                rates.cache_read,
-                rates.output,
-            ]
-            .iter()
-            .all(|rate| *rate > 0)
-        })
-}
 
 /// One file name under `$CREDENTIALS_DIRECTORY`, never a path.
 fn is_credential_name(name: &str) -> bool {
@@ -509,7 +469,6 @@ fn lease_callers_of(config: &ClaudeConnectorConfig) -> Result<Vec<LeaseCaller>, 
                     caller_id: lease.caller_id.clone(),
                     turn: lease.turn,
                     unit_instance: lease.unit_instance.clone(),
-                    reservation_micro_usd: lease.reservation_micro_usd,
                 })
                 .ok_or(ConfigError::Unusable("lease_callers"))
         })
@@ -531,6 +490,7 @@ fn start_leases(
     config: &ClaudeConnectorConfig,
     socket: &Path,
     service: Arc<Mutex<TransportService>>,
+    quota: Arc<crate::QuotaCell>,
 ) -> Result<(), ConfigError> {
     use std::os::unix::fs::{FileTypeExt, PermissionsExt};
     use std::os::unix::net::UnixListener;
@@ -559,6 +519,7 @@ fn start_leases(
                 callers,
                 limits,
                 service,
+                quota,
                 tokens,
                 Arc::new(SystemdUnits::system()),
             );
@@ -589,7 +550,6 @@ pub fn serve_config(path: &Path) -> Result<(), ConfigError> {
         TransportService::open(
             &config.replay_store,
             backend.provider(),
-            config.prices.clone(),
             admissions,
             config.max_expiry_skew_ms,
         )
@@ -597,7 +557,7 @@ pub fn serve_config(path: &Path) -> Result<(), ConfigError> {
     ));
     #[cfg(target_os = "linux")]
     if let Some(socket) = &config.lease_socket {
-        start_leases(&config, socket, service.clone())?;
+        start_leases(&config, socket, service.clone(), backend.quota())?;
     }
     serve_service(listener, config.serve_limits(), service, backend)?;
     Ok(())
@@ -642,10 +602,6 @@ mod tests {
             (
                 ServeError::Service(ServiceError::ReplayStore(format!("{CANARY}/replay.cc"))),
                 "replay_store",
-            ),
-            (
-                ServeError::Service(ServiceError::UnpricedModel(CANARY.to_string())),
-                "prices",
             ),
             (
                 ServeError::Service(ServiceError::InvalidAdmission),

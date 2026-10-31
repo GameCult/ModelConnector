@@ -1,7 +1,7 @@
 //! The plan's own usage windows, as the CLI reports them. The subscription
 //! decides how much a plan may burn; the CLI's `rate_limit_event` is the only
 //! place that number appears, so the latest observation of each window is kept
-//! here and read out beside the connector's own spend ledger.
+//! here and published as the usage readout and lent with each lease.
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;

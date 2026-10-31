@@ -14,7 +14,7 @@ use crate::quota::QuotaCell;
 const STRUCTURED_OUTPUT_TOOL: &str = "StructuredOutput";
 
 /// A call that cannot complete, with the stage that failed. `usage` is `None`
-/// (the kit bills its reservation) unless a result event reported it or the
+/// (unknown) unless a result event reported it or the
 /// call never reached the provider (zero).
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Failure {
@@ -25,7 +25,7 @@ pub(crate) struct Failure {
 
 impl Failure {
     /// A failure after the child ran: what the provider billed is unknown, so
-    /// the kit bills its reservation.
+    /// the usage is unknown.
     pub(crate) fn cost_unknown(kind: FailureKind, message: &'static str) -> Self {
         Self {
             kind,
@@ -356,7 +356,7 @@ fn fail(kind: FailureKind, message: &'static str) -> Step {
 /// provider cannot have billed (`empty_is_zero`: a refusal at the door, 401,
 /// 403 or 429, or a call never made); elsewhere the CLI also zeroes usage on
 /// crashes after real work. A call never made (`absent_is_zero`) may also
-/// omit the field. `None` is billed the reservation by the kit.
+/// omit the field. `None` is unknown usage.
 fn read_usage(reported: Option<Value>, empty_is_zero: bool, absent_is_zero: bool) -> Option<Usage> {
     let Some(reported) = reported else {
         return absent_is_zero.then(|| sum_usage(std::iter::empty()));

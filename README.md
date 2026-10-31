@@ -21,11 +21,11 @@ Crate `crates/model-connector`:
 - `src/envelope.rs` - the AES-256-GCM `TransportEnvelope` (binary ciphertext), its
   identity-binding AAD, the length-prefixed framing, and the CultNet carriage: each frame is a
   `cultnet.operation_request.v0` / `operation_response.v0` for service
-  `gamecult.model.connector`, operation `invoke` (or `spend_readout`), its `message_id` the
-  request id and its payload the base64 of the sealed envelope. `spend_readout` answers a
-  `SpendReadout` (`gamecult.model.spend_readout.v1`): each caller's spent and reserved
+  `gamecult.model.connector`, operation `invoke` (or `usage_readout`), its `message_id` the
+  request id and its payload the base64 of the sealed envelope. `usage_readout` answers a
+  `UsageReadout` (`gamecult.model.usage_readout.v1`): each caller's spent and reserved
   micro-USD against its ceiling in its current window, and the backend's plan quota;
-  `ConnectorClient::spend_readout` asks.
+  `ConnectorClient::usage_readout` asks.
 - `schemas/` - one JSON Schema per v3 document, generated from the types.
 - `src/client.rs` - `ConnectorClient`, the one-request caller side.
 - `src/service.rs` (feature `daemon`) - `TransportService`: caller admission, durable

@@ -47,8 +47,8 @@
       "enum": [
         "Invocation",
         "Result",
-        "SpendReadoutRequest",
-        "SpendReadoutResult"
+        "UsageReadoutRequest",
+        "UsageReadoutResult"
       ]
     }
   }

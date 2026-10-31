@@ -1,5 +1,5 @@
-//! Pins the bytes of the v3 wire so a drift is a failing test. The fixtures in
-//! `fixtures/wire_v3` are produced by this file (see its README); they pin the
+//! Pins the bytes of the v4 wire so a drift is a failing test. The fixtures in
+//! `fixtures/wire_v4` are produced by this file (see its README); they pin the
 //! kit against itself and are not a second contract: the types in
 //! `model_connector::contract` own the shape.
 
@@ -17,10 +17,10 @@ use serde::de::DeserializeOwned;
 
 const KEY: &str = "golden-distinct-test-key";
 const CALLER: &str = "golden-caller";
-const REGENERATE: &str = "WIRE_V3_REGENERATE";
+const REGENERATE: &str = "WIRE_V4_REGENERATE";
 
 fn fixtures() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/wire_v3")
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/wire_v4")
 }
 
 fn named<T: Serialize>(value: &T) -> Vec<u8> {
@@ -28,7 +28,7 @@ fn named<T: Serialize>(value: &T) -> Vec<u8> {
 }
 
 /// The value serializes to the committed bytes and the committed bytes decode
-/// back to it. With `WIRE_V3_REGENERATE` set, the committed bytes are rewritten
+/// back to it. With `WIRE_V4_REGENERATE` set, the committed bytes are rewritten
 /// from the value first.
 fn assert_wire<T: Serialize + DeserializeOwned + PartialEq + std::fmt::Debug>(
     name: &str,
@@ -81,7 +81,7 @@ fn request() -> ProviderRequest {
 }
 
 fn invocation() -> TransportInvocation {
-    TransportInvocation::new(CALLER, 1_800_000_000_000, [7; 32], 5_000_000, request()).unwrap()
+    TransportInvocation::new(CALLER, 1_800_000_000_000, [7; 32], request()).unwrap()
 }
 
 fn receipt(outcome: TransportOutcome) -> TransportReceipt {
@@ -95,8 +95,6 @@ fn receipt(outcome: TransportOutcome) -> TransportReceipt {
         model: invocation.request.model.clone(),
         provider: "anthropic-messages".to_string(),
         foreign_reasoning_dropped: 2,
-        cost_micro_usd: 1_234_567,
-        overrun_micro_usd: 89,
         outcome,
     }
 }
@@ -116,7 +114,7 @@ fn completed() -> TransportOutcome {
 }
 
 #[test]
-fn wire_golden_v3() {
+fn wire_golden_v4() {
     let invocation = invocation();
     assert_wire("provider_request.mp", &invocation.request);
     assert_wire("transport_invocation.mp", &invocation);
@@ -233,7 +231,7 @@ fn the_golden_carriage_frame_decrypts_and_validates_under_the_fixed_key() {
     };
     assert_eq!(service_id, "gamecult.model.connector");
     assert_eq!(operation, "invoke");
-    assert_eq!(payload_schema, "gamecult.model.transport_envelope.v3");
+    assert_eq!(payload_schema, "gamecult.model.transport_envelope.v4");
     assert_eq!(message_id, invocation.request_id());
     let envelope: TransportEnvelope =
         rmp_serde::from_slice(&STANDARD.decode(payload).unwrap()).unwrap();

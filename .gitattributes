@@ -1,2 +1,2 @@
 schemas/*.json text eol=lf
-crates/model-connector/tests/fixtures/wire_v3/* -text
+crates/model-connector/tests/fixtures/wire_v4/* -text

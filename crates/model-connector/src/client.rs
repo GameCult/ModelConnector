@@ -9,11 +9,11 @@ use rand_core::{OsRng, RngCore};
 use crate::contract::{TransportInvocation, TransportKey, TransportResult};
 use crate::envelope::{
     MAX_IDENTITY_BYTES, ServiceError, TransportFrameError, decode_result_frame,
-    decode_spend_readout_response_frame, decrypt_result, decrypt_spend_readout,
-    encode_invocation_frame, encode_spend_readout_request_frame, encrypt_invocation,
-    encrypt_spend_readout_request, read_transport_frame, write_transport_frame,
+    decode_usage_readout_response_frame, decrypt_result, decrypt_usage_readout,
+    encode_invocation_frame, encode_usage_readout_request_frame, encrypt_invocation,
+    encrypt_usage_readout_request, read_transport_frame, write_transport_frame,
 };
-use crate::readout::SpendReadout;
+use crate::readout::UsageReadout;
 
 #[derive(Clone)]
 pub struct ConnectorClient {
@@ -62,25 +62,25 @@ impl ConnectorClient {
         decrypt_result(&envelope, &self.security, invocation).map_err(Into::into)
     }
 
-    /// Reads the connector's spend ledger and plan quota as `caller_runtime_id`,
+    /// Reads the plan's usage windows as `caller_runtime_id`,
     /// which must be a caller whose connection key this client holds.
-    pub fn spend_readout(
+    pub fn usage_readout(
         &self,
         caller_runtime_id: &str,
-    ) -> Result<SpendReadout, ConnectorClientError> {
+    ) -> Result<UsageReadout, ConnectorClientError> {
         let mut nonce = [0_u8; 16];
         OsRng.fill_bytes(&mut nonce);
         let request_id = format!(
-            "spend-readout-{}",
+            "usage-readout-{}",
             nonce.iter().map(|b| format!("{b:02x}")).collect::<String>()
         );
-        let sealed = encrypt_spend_readout_request(caller_runtime_id, &request_id, &self.security)?;
-        let response = self.exchange(&encode_spend_readout_request_frame(&sealed)?)?;
-        let envelope = decode_spend_readout_response_frame(&response)?;
+        let sealed = encrypt_usage_readout_request(caller_runtime_id, &request_id, &self.security)?;
+        let response = self.exchange(&encode_usage_readout_request_frame(&sealed)?)?;
+        let envelope = decode_usage_readout_response_frame(&response)?;
         if envelope.caller_runtime_id != caller_runtime_id || envelope.request_id != request_id {
             return Err(ServiceError::OuterIdentity.into());
         }
-        decrypt_spend_readout(&envelope, &self.security).map_err(Into::into)
+        decrypt_usage_readout(&envelope, &self.security).map_err(Into::into)
     }
 
     /// Sends one frame on a fresh connection and reads the one answer.
@@ -274,17 +274,17 @@ mod fixture_tests {
             let server = std::thread::spawn(move || {
                 let (mut stream, _) = listener.accept().unwrap();
                 let request = read_transport_frame(&mut stream, 64 * 1024).unwrap();
-                let RequestFrame::SpendReadout(asked) = decode_request_frame(&request).unwrap()
+                let RequestFrame::UsageReadout(asked) = decode_request_frame(&request).unwrap()
                 else {
                     panic!("the client sent something other than a readout request");
                 };
                 let request_id = answer_request.unwrap_or(&asked.request_id);
-                let readout = SpendReadout::new(1, Vec::new(), PlanQuotaSnapshot::default());
+                let readout = UsageReadout::new(1, PlanQuotaSnapshot::default());
                 let sealed =
-                    encrypt_spend_readout(answer_caller, request_id, &readout, &key).unwrap();
+                    encrypt_usage_readout(answer_caller, request_id, &readout, &key).unwrap();
                 write_transport_frame(
                     &mut stream,
-                    &encode_spend_readout_response_frame(&sealed).unwrap(),
+                    &encode_usage_readout_response_frame(&sealed).unwrap(),
                     64 * 1024,
                 )
                 .unwrap();
@@ -296,7 +296,7 @@ mod fixture_tests {
                 Some(Duration::from_secs(1)),
             )
             .unwrap();
-            let answer = client.spend_readout("caller-1");
+            let answer = client.usage_readout("caller-1");
             if accepted {
                 assert_eq!(answer.unwrap().at_unix_ms, 1);
             } else {

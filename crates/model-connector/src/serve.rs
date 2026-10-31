@@ -13,13 +13,12 @@ use zeroize::Zeroizing;
 use crate::contract::TransportResult;
 use crate::envelope::{
     RequestFrame, ServiceError, TransportFrameError, decode_request_frame, encode_result_frame,
-    encode_spend_readout_response_frame, frame_bytes_for_payload, read_transport_frame,
+    encode_usage_readout_response_frame, frame_bytes_for_payload, read_transport_frame,
     write_transport_frame,
 };
 use crate::readout::PlanQuotaSnapshot;
 use crate::service::{
-    CallerAdmission, PriceTable, ProviderCall, SpendCeiling, SpendWindowMs, TransportAdmission,
-    TransportService, distinct_admissions,
+    CallerAdmission, ProviderCall, TransportAdmission, TransportService, distinct_admissions,
 };
 
 /// The only provider seam of the connector kit. A connector binary implements
@@ -34,8 +33,9 @@ pub trait ProviderBackend: Send + Sync {
     /// `serve` on: it names the provider on every receipt and decides which
     /// reasoning state is foreign.
     fn provider(&self) -> &str;
-    /// What the provider's own plan allows and has used, for the spend
-    /// readout. A provider with no plan to report keeps the default.
+    /// What the provider's own plan allows and has used, for the usage
+    /// readout and the provider's own refusals. A provider with no plan to report
+    /// keeps the default.
     fn plan_quota(&self) -> PlanQuotaSnapshot {
         PlanQuotaSnapshot::default()
     }
@@ -123,12 +123,6 @@ pub struct CallerConfig {
     pub max_concurrent_requests: usize,
     pub max_payload_bytes: usize,
     pub max_output_tokens: u32,
-    /// The most the caller may spend in one window, in micro-USD. Required
-    /// nonzero. A fuse set once, generously above what the dial allows.
-    pub spend_ceiling_micro_usd: u64,
-    /// The length of the caller's spend window, in milliseconds. Windows are
-    /// fixed and aligned to the unix epoch. Required nonzero.
-    pub spend_window_ms: u64,
 }
 
 pub fn load_admissions(callers: &[CallerConfig]) -> Result<Vec<CallerAdmission>, ServeError> {
@@ -149,8 +143,6 @@ pub fn load_admissions(callers: &[CallerConfig]) -> Result<Vec<CallerAdmission>,
                 caller.max_concurrent_requests,
                 caller.max_payload_bytes,
                 caller.max_output_tokens,
-                SpendCeiling(caller.spend_ceiling_micro_usd),
-                SpendWindowMs(caller.spend_window_ms),
             )
             .map_err(ServeError::Service)?,
         );
@@ -159,15 +151,12 @@ pub fn load_admissions(callers: &[CallerConfig]) -> Result<Vec<CallerAdmission>,
 }
 
 /// Serves admitted callers on a loopback listener until the listener fails.
-/// `prices` is the connector binary's config document's table of what every
-/// allowed model costs (B4 owns that document).
 /// The caller binds; a listener that is not bound to loopback is refused, and
 /// peers that are not loopback are dropped.
 pub fn serve(
     listener: TcpListener,
     limits: ServeLimits,
     admissions: Vec<CallerAdmission>,
-    prices: PriceTable,
     replay_store: &Path,
     backend: Arc<dyn ProviderBackend>,
 ) -> Result<(), ServeError> {
@@ -176,7 +165,6 @@ pub fn serve(
     let service = Arc::new(Mutex::new(TransportService::open(
         replay_store,
         backend.provider(),
-        prices,
         admissions,
         limits.max_expiry_skew_ms,
     )?));
@@ -184,8 +172,8 @@ pub fn serve(
 }
 
 /// `serve` over a service the caller opened and keeps a handle to, so another
-/// front of the same ledger (the Self-run credential lease) reserves in the
-/// same windows. The limits must already have been validated against the
+/// front of the same service (the Self-run credential lease) shares its
+/// replay store and plan. The limits must already have been validated against the
 /// service's admissions.
 pub fn serve_service(
     listener: TcpListener,
@@ -197,7 +185,7 @@ pub fn serve_service(
     accept_loop(|| listener.accept(), limits, service, backend)
 }
 
-/// What must be true before a serve loop touches the ledger: the listener is
+/// What must be true before a serve loop touches the store: the listener is
 /// on loopback and the backend can take work.
 fn admit_listener(listener: &TcpListener, backend: &dyn ProviderBackend) -> Result<(), ServeError> {
     if !listener
@@ -272,20 +260,25 @@ fn answer_frame(
 ) -> Result<Vec<u8>, ServeError> {
     let envelope = match decode_request_frame(request).map_err(|_| ServeError::FrameEncoding)? {
         RequestFrame::Invoke(envelope) => envelope,
-        RequestFrame::SpendReadout(envelope) => {
+        RequestFrame::UsageReadout(envelope) => {
             let plan = backend.plan_quota();
             let response = service
                 .lock()
                 .map_err(|_| ServeError::ServicePoisoned)?
-                .spend_readout(&envelope, unix_ms()?, plan, limits.max_frame_bytes)?;
-            return encode_spend_readout_response_frame(&response)
+                .usage_readout(&envelope, unix_ms()?, plan, limits.max_frame_bytes)?;
+            return encode_usage_readout_response_frame(&response)
                 .map_err(|_| ServeError::FrameEncoding);
         }
     };
     let admission = service
         .lock()
         .map_err(|_| ServeError::ServicePoisoned)?
-        .begin(&envelope, unix_ms()?, limits.max_frame_bytes)?;
+        .begin(
+            &envelope,
+            unix_ms()?,
+            &backend.plan_quota(),
+            limits.max_frame_bytes,
+        )?;
     let response = match admission {
         TransportAdmission::Reply(response) => response,
         TransportAdmission::Execute(claim) => {
@@ -390,7 +383,7 @@ mod tests {
         TransportInvocation, TransportOutcome, TransportResult,
     };
     use crate::fixtures::{
-        CEILING, MAX_COST, TestStore, WINDOW_MS, caller, fixture_prices, invocation_for, receipt,
+        TestStore, caller, invocation_for, receipt,
         request,
     };
 
@@ -472,7 +465,6 @@ mod tests {
                 listener,
                 limits,
                 admissions,
-                fixture_prices(),
                 &path,
                 backend,
             ));
@@ -506,7 +498,6 @@ mod tests {
                 listener,
                 limits(),
                 admissions,
-                fixture_prices(),
                 &path,
                 backend,
             )
@@ -528,8 +519,6 @@ mod tests {
                 max_concurrent_requests: *capacity,
                 max_payload_bytes: 1_048_576,
                 max_output_tokens: 16_384,
-                spend_ceiling_micro_usd: CEILING,
-                spend_window_ms: WINDOW_MS,
             })
             .collect()
     }
@@ -559,7 +548,7 @@ mod tests {
     }
 
     #[test]
-    fn serve_reads_out_spend_and_plan_quota_without_executing_anything() {
+    fn serve_reads_out_plan_usage_without_executing_anything() {
         let store = TestStore::new();
         let inner = CountingBackend::new(true);
         let plan = PlanQuotaSnapshot {
@@ -580,16 +569,9 @@ mod tests {
         assert_eq!(inner.executions.load(Ordering::SeqCst), 1);
 
         let before = now_ms();
-        let readout = client.spend_readout(CALLER).unwrap();
+        let readout = client.usage_readout(CALLER).unwrap();
         assert!(readout.at_unix_ms >= before && readout.at_unix_ms <= now_ms());
         assert_eq!(readout.plan_quota, plan.windows);
-        let [row] = readout.callers.as_slice() else {
-            panic!("one admitted caller");
-        };
-        assert_eq!(row.caller_id, CALLER);
-        assert_eq!((row.ceiling_micro_usd, row.window_ms), (CEILING, WINDOW_MS));
-        assert!(row.spent_micro_usd > 0, "the settled call was charged");
-        assert_eq!(row.reserved_micro_usd, 0);
         assert_eq!(
             inner.executions.load(Ordering::SeqCst),
             1,
@@ -604,39 +586,62 @@ mod tests {
             Some(Duration::from_secs(5)),
         )
         .unwrap();
-        assert!(stranger.spend_readout(CALLER).is_err());
+        assert!(stranger.usage_readout(CALLER).is_err());
     }
 
     #[test]
     fn a_backend_with_no_plan_reads_out_none() {
         let store = TestStore::new();
         let (client, _) = start(CountingBackend::new(true), &store);
-        let readout = client.spend_readout(CALLER).unwrap();
+        let readout = client.usage_readout(CALLER).unwrap();
         assert!(readout.plan_quota.is_empty());
     }
 
+    fn window_plan(permille: u32, status: &str, resets_at_unix_ms: u64) -> PlanQuotaSnapshot {
+        PlanQuotaSnapshot {
+            windows: vec![crate::readout::PlanQuota {
+                window: "five_hour".into(),
+                utilization_permille: Some(permille),
+                resets_at_unix_ms,
+                status: status.into(),
+                observed_at_unix_ms: 1,
+            }],
+        }
+    }
+
     #[test]
-    fn serve_refuses_a_request_over_its_max_cost_without_executing_it() {
+    fn serve_repeats_the_providers_rejection_and_executes_nothing_while_it_stands() {
         let store = TestStore::new();
-        let backend = CountingBackend::new(true);
-        let (client, _) = start(backend.clone(), &store);
-        let mut invocation = fresh("request-costly");
-        invocation.max_cost_micro_usd = 1;
-        let refused = client.execute(&invocation).unwrap();
+        let inner = CountingBackend::new(true);
+        let backend = Arc::new(PlanBackend {
+            inner: inner.clone(),
+            plan: window_plan(1_000, "rejected", now_ms() + 3_600_000),
+        });
+        let (client, _) = start_with(backend, &store, vec![caller(CALLER, KEY, 4)]);
+        let refused = client.execute(&fresh("request-rejected")).unwrap();
         assert_eq!(
             refused.disposition,
-            TransportDisposition::Refused(Refusal::CostBound)
+            TransportDisposition::Refused(Refusal::ProviderRejected)
         );
-        assert_eq!(backend.executions.load(Ordering::SeqCst), 0);
+        assert_eq!(inner.executions.load(Ordering::SeqCst), 0);
+    }
 
-        // The refusal was not recorded: the same id with a budget that holds
-        // the worst case is admitted and executed.
-        invocation.max_cost_micro_usd = MAX_COST;
-        let admitted = client.execute(&invocation).unwrap();
+    #[test]
+    fn serve_admits_a_full_window_the_provider_still_allows() {
+        let store = TestStore::new();
+        let inner = CountingBackend::new(true);
+        let backend = Arc::new(PlanBackend {
+            inner: inner.clone(),
+            plan: window_plan(999, "allowed", now_ms() + 3_600_000),
+        });
+        let (client, _) = start_with(backend, &store, vec![caller(CALLER, KEY, 4)]);
+        let admitted = client.execute(&fresh("request-full")).unwrap();
         assert!(matches!(
             admitted.disposition,
             TransportDisposition::Transported { .. }
         ));
+        assert_eq!(inner.executions.load(Ordering::SeqCst), 1);
+    }
         assert_eq!(backend.executions.load(Ordering::SeqCst), 1);
     }
 
@@ -676,7 +681,6 @@ mod tests {
             CALLER,
             invocation.expires_at_unix_ms,
             [7; 32],
-            MAX_COST,
             conflicting_request,
         )
         .unwrap();
@@ -761,7 +765,6 @@ mod tests {
         let mut service = TransportService::open(
             &store.path,
             "fixture-sse",
-            fixture_prices(),
             vec![caller(CALLER, KEY, 4)],
             300_000,
         )
@@ -770,7 +773,9 @@ mod tests {
             crate::envelope::encrypt_invocation(&invocation, &crate::fixtures::security(KEY))
                 .unwrap();
         let TransportAdmission::Execute(claim) =
-            service.begin(&envelope, now_ms(), 1 << 20).unwrap()
+            service
+                .begin(&envelope, now_ms(), &PlanQuotaSnapshot::default(), 1 << 20)
+                .unwrap()
         else {
             panic!("a fresh request must execute");
         };
@@ -793,7 +798,6 @@ mod tests {
                 listener,
                 narrowed,
                 vec![caller(CALLER, KEY, 4)],
-                fixture_prices(),
                 &path,
                 served,
             )
@@ -1001,8 +1005,6 @@ mod tests {
             slots,
             payload,
             32_768,
-            SpendCeiling(CEILING),
-            SpendWindowMs(WINDOW_MS),
         )
         .unwrap()
     }
@@ -1110,7 +1112,7 @@ mod tests {
             ..limits()
         };
         let admissions = vec![admission(CALLER, KEY, 4, bound)];
-        thread::spawn(move || serve(listener, tight, admissions, fixture_prices(), &path, served));
+        thread::spawn(move || serve(listener, tight, admissions, &path, served));
         let client =
             ConnectorClient::new(endpoint, KEY, frame, Some(Duration::from_secs(5))).unwrap();
         let reply = client.execute(&invocation).unwrap();
@@ -1225,7 +1227,6 @@ mod tests {
         let mut service = TransportService::open(
             &store.path,
             "fixture-sse",
-            fixture_prices(),
             vec![caller(CALLER, KEY, 4)],
             300_000,
         )
@@ -1236,7 +1237,9 @@ mod tests {
         )
         .unwrap();
         let TransportAdmission::Execute(claim) =
-            service.begin(&envelope, now_ms(), 1 << 20).unwrap()
+            service
+                .begin(&envelope, now_ms(), &PlanQuotaSnapshot::default(), 1 << 20)
+                .unwrap()
         else {
             panic!("a fresh request must execute");
         };
@@ -1328,7 +1331,6 @@ mod tests {
                 TransportService::open(
                     &store.path,
                     "fixture-sse",
-                    fixture_prices(),
                     vec![caller(CALLER, KEY, 4)],
                     300_000,
                 )
@@ -1391,7 +1393,6 @@ mod tests {
                 listener,
                 limits(),
                 admissions,
-                fixture_prices(),
                 &path,
                 served,
             )

@@ -133,16 +133,9 @@ pub(crate) fn request() -> ProviderRequest {
     request
 }
 
-/// Generous next to the fixture request's worst case (about 64,000), so it
-/// binds only in the tests that are about spend.
-pub(crate) const MAX_COST: u64 = 10_000_000;
-
-/// What the fixture usage (10 input and 3 output tokens) costs under
-/// [`fixture_price`]: 10 x 3,000,000 + 3 x 15,000,000 = 75,000,000 / 1e6.
-pub(crate) const FIXTURE_USAGE_COST: u64 = 75;
 
 pub(crate) fn invocation() -> TransportInvocation {
-    TransportInvocation::new("epiphany-yggdrasil", 2_000, [7; 32], MAX_COST, request()).unwrap()
+    TransportInvocation::new("epiphany-yggdrasil", 2_000, [7; 32], request()).unwrap()
 }
 
 pub(crate) fn receipt(invocation: &TransportInvocation) -> TransportReceipt {
@@ -155,8 +148,6 @@ pub(crate) fn receipt(invocation: &TransportInvocation) -> TransportReceipt {
         model: invocation.request.model.clone(),
         provider: "fixture-sse".to_string(),
         foreign_reasoning_dropped: 0,
-        cost_micro_usd: FIXTURE_USAGE_COST,
-        overrun_micro_usd: 0,
         outcome: TransportOutcome::Completed {
             provider_response_id: Some("response-1".to_string()),
             stop_reason: StopReason::EndTurn,
@@ -170,33 +161,6 @@ pub(crate) fn receipt(invocation: &TransportInvocation) -> TransportReceipt {
         },
     }
 }
-/// A price with a distinct nonzero rate per class, so a swapped rate changes a cost.
-#[cfg(feature = "daemon")]
-pub(crate) fn fixture_price() -> ModelPrice {
-    ModelPrice {
-        rates: Rates {
-            input: 3_000_000,
-            cache_write_short: 3_750_000,
-            cache_write_long: 6_000_000,
-            cache_read: 300_000,
-            output: 15_000_000,
-        },
-        long_context: None,
-        overhead_tokens: 100,
-    }
-}
-
-#[cfg(feature = "daemon")]
-pub(crate) fn fixture_prices() -> PriceTable {
-    PriceTable::from([("gpt-5.4".to_string(), fixture_price())])
-}
-
-/// Far above anything a fixture request reserves: the ceiling binds only in
-/// the tests that are about it.
-#[cfg(feature = "daemon")]
-pub(crate) const CEILING: u64 = 1 << 40;
-#[cfg(feature = "daemon")]
-pub(crate) const WINDOW_MS: u64 = 3_600_000;
 
 #[cfg(feature = "daemon")]
 pub(crate) fn caller(
@@ -212,8 +176,6 @@ pub(crate) fn caller(
         max_concurrent_requests,
         64 * 1024,
         32_768,
-        SpendCeiling(CEILING),
-        SpendWindowMs(WINDOW_MS),
     )
     .unwrap()
 }
@@ -223,7 +185,6 @@ pub(crate) fn open_service(store: &TestStore, max_concurrent_requests: usize) ->
     TransportService::open(
         &store.path,
         "fixture-sse",
-        fixture_prices(),
         [
             caller(
                 "epiphany-yggdrasil",
@@ -249,5 +210,5 @@ pub(crate) fn security(key: &str) -> TransportKey {
 pub(crate) fn invocation_for(caller_runtime_id: &str, request_id: &str) -> TransportInvocation {
     let mut request = request();
     request.request_id = request_id.to_string();
-    TransportInvocation::new(caller_runtime_id, 2_000, [7; 32], MAX_COST, request).unwrap()
+    TransportInvocation::new(caller_runtime_id, 2_000, [7; 32], request).unwrap()
 }

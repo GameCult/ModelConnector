@@ -5,8 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use model_connector::{
-    CallerAdmission, ModelPrice, PriceTable, Rates, ReasoningEffort, SpendCeiling, SpendWindowMs,
-    StopReason, ToolDefinition, TransportAdmission, TransportDisposition, TransportInvocation,
+    CallerAdmission, PlanQuotaSnapshot, ReasoningEffort, StopReason, ToolDefinition, TransportAdmission, TransportDisposition, TransportInvocation,
     TransportKey, TransportReceipt, TransportService, decrypt_result, encrypt_invocation,
 };
 
@@ -460,25 +459,6 @@ struct Door {
     service: TransportService,
 }
 
-fn prices() -> PriceTable {
-    PriceTable::from([MODEL, OTHER_MODEL].map(|model| {
-        (
-            model.to_string(),
-            ModelPrice {
-                rates: Rates {
-                    input: 3_000_000,
-                    cache_write_short: 3_750_000,
-                    cache_write_long: 6_000_000,
-                    cache_read: 300_000,
-                    output: 15_000_000,
-                },
-                long_context: None,
-                overhead_tokens: 100,
-            },
-        )
-    }))
-}
-
 impl Door {
     fn new() -> Self {
         let dir = std::env::temp_dir().join(format!(
@@ -496,13 +476,11 @@ impl Door {
                 4,
                 FRAME / 2,
                 32_768,
-                SpendCeiling(1 << 40),
-                SpendWindowMs(3_600_000),
             )
             .unwrap()
         });
         let service =
-            TransportService::open(&dir.join("replay.cc"), PROVIDER, prices(), callers, 5_000)
+            TransportService::open(&dir.join("replay.cc"), PROVIDER, callers, 5_000)
                 .unwrap();
         Self { dir, service }
     }
@@ -521,9 +499,12 @@ impl Door {
     ) -> (model_connector::ExecutionClaim, TransportInvocation) {
         let key = TransportKey::from_connection_secret(&format!("{caller}-key")).unwrap();
         let invocation =
-            TransportInvocation::new(caller, 2_000, [7; 32], 10_000_000, request).unwrap();
+            TransportInvocation::new(caller, 2_000, [7; 32], request).unwrap();
         let envelope = encrypt_invocation(&invocation, &key).unwrap();
-        match self.service.begin(&envelope, 1_000, FRAME).unwrap() {
+        match self
+            .service
+            .begin(&envelope, 1_000, &PlanQuotaSnapshot::default(), FRAME)
+            .unwrap() {
             TransportAdmission::Execute(claim) => (*claim, invocation),
             TransportAdmission::Reply(_) => panic!("the door answered instead of admitting"),
         }
@@ -1458,11 +1439,6 @@ fn usage_sums_model_usage_across_models() {
     };
     assert_eq!(*summed, usage(12, 37, 1083, 24, Some(8)));
     // The receipt is priced from usage alone: 12*3 + 37*0.3 + 1083*6 + 24*15 micro-USD, rounded up.
-    assert_eq!(parts(&cheap).1.cost_micro_usd, 36 + 12 + 6498 + 360);
-    assert_eq!(
-        parts(&cheap).1.cost_micro_usd,
-        parts(&dear).1.cost_micro_usd
-    );
 
     // No model reported thinking tokens: none is claimed.
     let plain = r#"{"claude-haiku-5-5":{"inputTokens":1,"outputTokens":1,"cacheReadInputTokens":0,"cacheCreationInputTokens":0}}"#;
@@ -1599,7 +1575,6 @@ fn no_result_event_is_a_failure_with_unknown_usage() {
     };
     assert_eq!(zero_billed, Some(usage_zero()));
 
-    let mut costs = Vec::new();
     for (script, expected) in ends {
         let rig = rig(vec![script]);
         let result = rig.run(request(vec![user("hi")]));
@@ -1607,20 +1582,7 @@ fn no_result_event_is_a_failure_with_unknown_usage() {
         assert_eq!(kind, expected);
         assert_eq!(usage, None, "{message}");
         assert!(result.transcript_items().is_empty());
-        costs.push(parts(&result).1.cost_micro_usd);
     }
-    // Unknown usage is charged the reservation, which is far above a typical turn.
-    assert!(costs.iter().all(|cost| *cost >= 15_000), "{costs:?}");
-    assert_eq!(
-        parts(&rig(vec![]).run({
-            let mut bad = request(vec![user("a")]);
-            bad.tools.push(a_tool());
-            bad
-        }))
-        .1
-        .cost_micro_usd,
-        0
-    );
 }
 
 #[test]
@@ -1719,7 +1681,6 @@ fn a_port_that_cannot_spawn_is_a_provider_failure() {
         Some(usage_zero()),
         "a child that never ran bills nothing"
     );
-    assert_eq!(parts(&result).1.cost_micro_usd, 0);
     assert!(
         !message.contains(dir.path().to_str().unwrap()),
         "no path in a message"
@@ -1743,8 +1704,6 @@ fn backend_end_to_end_through_the_service() {
     assert_eq!(receipt.provider, "claude-code");
     assert_eq!(receipt.model, MODEL);
     // USAGE priced at the table: 2*3 + 7*0.3 + 1043*6 + 4*15 micro-USD, rounded up.
-    assert_eq!(receipt.cost_micro_usd, 6 + 3 + 6258 + 60);
-    assert_eq!(receipt.overrun_micro_usd, 0);
     assert_eq!(events.len(), 2);
     let items = opened.transcript_items();
     assert_eq!(items[0], assistant("hello back"));
@@ -1756,13 +1715,6 @@ fn backend_end_to_end_through_the_service() {
 // ---- usage: this turn's own, or unknown ----
 
 const USAGE_TURN_2: &str = r#"{"claude-haiku-5-5":{"inputTokens":3,"outputTokens":5,"cacheReadInputTokens":1100,"cacheCreationInputTokens":9}}"#;
-
-/// What a call whose usage is unknown is billed: the kit's reservation.
-fn reservation() -> u64 {
-    let result = rig(vec![Script::lines(vec![])]).run(request(vec![user("hi")]));
-    assert_eq!(failure_of(&result).2, None);
-    parts(&result).1.cost_micro_usd
-}
 
 #[test]
 fn a_resumed_turn_is_charged_only_its_own_usage() {
@@ -1788,13 +1740,10 @@ fn a_resumed_turn_is_charged_only_its_own_usage() {
     };
     assert_eq!(*billed, usage(3, 1100, 9, 5, None));
     // 3*3 + 1100*0.3 + 9*6 + 5*15 micro-USD.
-    assert_eq!(parts(&second).1.cost_micro_usd, 9 + 330 + 54 + 75);
 }
 
 #[test]
-fn usage_the_result_does_not_report_is_billed_the_reservation() {
-    let reservation = reservation();
-    assert!(reservation >= 15_000, "{reservation}");
+fn usage_the_result_does_not_report_stays_unknown() {
     let success = |fields: &str| {
         format!(
             r#"{{"type":"result","subtype":"success","is_error":false,"stop_reason":"end_turn","modelUsage":{CUMULATIVE}{fields}}}"#
@@ -1838,7 +1787,6 @@ fn usage_the_result_does_not_report_is_billed_the_reservation() {
         let (kind, _, usage) = failure_of(&result);
         assert_eq!(kind, expected, "{line}");
         assert_eq!(usage, None, "{line}");
-        assert_eq!(parts(&result).1.cost_micro_usd, reservation, "{line}");
     }
     for line in cases {
         let result = rig(vec![Script::lines(vec![
@@ -1850,7 +1798,6 @@ fn usage_the_result_does_not_report_is_billed_the_reservation() {
         let (kind, _, usage) = failure_of(&result);
         assert_eq!(kind, FailureKind::Provider, "{line}");
         assert_eq!(usage, None, "{line}");
-        assert_eq!(parts(&result).1.cost_micro_usd, reservation, "{line}");
         assert!(result.transcript_items().is_empty(), "{line}");
     }
 }
@@ -1865,7 +1812,6 @@ fn door_set_is_exactly_401_403_429() {
     // with a bogus token.
     let retry = r#"{"type":"system","subtype":"api_retry","error":"authentication_failed"}"#;
     let synthetic = r#"{"type":"assistant","api_error_status":401,"error":"authentication_failed","message":{"id":"e48001b7-cf4f-49b1-9810-db8fd7f73c73","model":"<synthetic>","stop_reason":"stop_sequence","content":[{"type":"text","text":"Failed to authenticate. API Error: 401 OAuth access token is invalid."}]}}"#;
-    let reservation = reservation();
     let statuses: [Option<u16>; 9] = [
         Some(400),
         Some(401),
@@ -1904,10 +1850,8 @@ fn door_set_is_exactly_401_403_429() {
             let case = format!("{status:?} {shape}");
             if matches!(status, Some(401 | 403 | 429)) && shape == "empty" {
                 assert_eq!(usage, Some(usage_zero()), "{case}");
-                assert_eq!(parts(&result).1.cost_micro_usd, 0, "{case}");
             } else {
                 assert_eq!(usage, None, "{case}");
-                assert_eq!(parts(&result).1.cost_micro_usd, reservation, "{case}");
             }
         }
     }
@@ -1979,7 +1923,6 @@ fn prompt_file_lives_in_prompt_dir_exclusively() {
     let result = rig.run(request(vec![user("hi")]));
     let (kind, _, usage) = failure_of(&result);
     assert_eq!((kind, usage), (FailureKind::Provider, Some(usage_zero())));
-    assert_eq!(parts(&result).1.cost_micro_usd, 0);
     assert_eq!(rig.spawns(), 0);
 }
 
@@ -1996,11 +1939,6 @@ fn pin_is_checked_before_every_spawn() {
     let result = rig.run(request(vec![user("hi")]));
     let (kind, message, usage) = failure_of(&result);
     assert_eq!((kind, usage), (FailureKind::Provider, Some(usage_zero())));
-    assert_eq!(
-        parts(&result).1.cost_micro_usd,
-        0,
-        "billed nothing, not the reservation"
-    );
     assert!(!message.contains(rig.dir.path().to_str().unwrap()));
     assert_eq!(rig.spawns(), 1, "no child for a binary off its pin");
     assert!(!rig.backend.binary_matches_pin());
@@ -2695,7 +2633,6 @@ fn not_logged_in_line(status: &str, api_ms: u64, extra: &str) -> String {
 
 #[test]
 fn a_result_that_made_no_api_call_bills_nothing() {
-    let reservation = reservation();
     let empty = r#","model_usage_since_last_result":{}"#;
     let cases = [
         // (status field, api ms, usage field, billed nothing)
@@ -2723,10 +2660,8 @@ fn a_result_that_made_no_api_call_bills_nothing() {
         let (_, _, usage) = failure_of(&result);
         if free {
             assert_eq!(usage, Some(usage_zero()), "{line}");
-            assert_eq!(parts(&result).1.cost_micro_usd, 0, "{line}");
         } else {
             assert_eq!(usage, None, "{line}");
-            assert_eq!(parts(&result).1.cost_micro_usd, reservation, "{line}");
         }
     }
 }

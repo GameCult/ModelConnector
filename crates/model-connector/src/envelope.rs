@@ -17,14 +17,14 @@ use crate::contract::{
     ContractError, ENVELOPE_SCHEMA_ID, TransportInvocation, TransportKey, TransportResult,
     canonical_invocation_bytes, require_id, wire_decode, wire_encode,
 };
-use crate::readout::SpendReadout;
+use crate::readout::UsageReadout;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub enum EnvelopeKind {
     Invocation,
     Result,
-    SpendReadoutRequest,
-    SpendReadoutResult,
+    UsageReadoutRequest,
+    UsageReadoutResult,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -54,8 +54,8 @@ pub(crate) fn binary_schema(_: &mut schemars::SchemaGenerator) -> schemars::Sche
 pub const CONNECTOR_SERVICE_ID: &str = "gamecult.model.connector";
 /// The operation that runs one sealed invocation.
 pub const INVOKE_OPERATION: &str = "invoke";
-/// The operation that reads the spend ledger and the plan's quota.
-pub const SPEND_READOUT_OPERATION: &str = "spend_readout";
+/// The operation that reads the plan's usage.
+pub const USAGE_READOUT_OPERATION: &str = "usage_readout";
 
 const PAYLOAD_ENCODING: &str = "messagepack-base64";
 const OK_STATUS: &str = "ok";
@@ -78,19 +78,19 @@ fn seal_payload(envelope: &TransportEnvelope) -> Result<String, ServiceError> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Operation {
     Invoke,
-    SpendReadout,
+    UsageReadout,
 }
 
 impl Operation {
     fn name(self) -> &'static str {
         match self {
             Operation::Invoke => INVOKE_OPERATION,
-            Operation::SpendReadout => SPEND_READOUT_OPERATION,
+            Operation::UsageReadout => USAGE_READOUT_OPERATION,
         }
     }
 
-    fn from_name(name: &str) -> Option<Self> {
-        [Operation::Invoke, Operation::SpendReadout]
+    pub(crate) fn from_name(name: &str) -> Option<Self> {
+        [Operation::Invoke, Operation::UsageReadout]
             .into_iter()
             .find(|operation| operation.name() == name)
     }
@@ -141,10 +141,10 @@ pub(crate) fn encode_invocation_frame(
     request_frame(Operation::Invoke, envelope)
 }
 
-pub(crate) fn encode_spend_readout_request_frame(
+pub(crate) fn encode_usage_readout_request_frame(
     envelope: &TransportEnvelope,
 ) -> Result<Vec<u8>, ServiceError> {
-    request_frame(Operation::SpendReadout, envelope)
+    request_frame(Operation::UsageReadout, envelope)
 }
 
 #[cfg(any(feature = "daemon", test))]
@@ -153,10 +153,10 @@ pub(crate) fn encode_result_frame(envelope: &TransportEnvelope) -> Result<Vec<u8
 }
 
 #[cfg(feature = "daemon")]
-pub(crate) fn encode_spend_readout_response_frame(
+pub(crate) fn encode_usage_readout_response_frame(
     envelope: &TransportEnvelope,
 ) -> Result<Vec<u8>, ServiceError> {
-    response_frame(Operation::SpendReadout, envelope)
+    response_frame(Operation::UsageReadout, envelope)
 }
 
 /// Opens the carriage of one frame. Everything the carriage says is checked
@@ -193,7 +193,7 @@ fn read_carriage(bytes: &[u8]) -> Result<CultNetMessage, ServiceError> {
 #[cfg(any(feature = "daemon", test))]
 pub(crate) enum RequestFrame {
     Invoke(TransportEnvelope),
-    SpendReadout(TransportEnvelope),
+    UsageReadout(TransportEnvelope),
 }
 
 #[cfg(any(feature = "daemon", test))]
@@ -215,7 +215,7 @@ pub(crate) fn decode_request_frame(bytes: &[u8]) -> Result<RequestFrame, Service
                 &payload,
             )? {
                 (Operation::Invoke, envelope) => Ok(RequestFrame::Invoke(envelope)),
-                (Operation::SpendReadout, envelope) => Ok(RequestFrame::SpendReadout(envelope)),
+                (Operation::UsageReadout, envelope) => Ok(RequestFrame::UsageReadout(envelope)),
             }
         }
         _ => Err(ServiceError::Carriage),
@@ -226,7 +226,7 @@ pub(crate) fn decode_request_frame(bytes: &[u8]) -> Result<RequestFrame, Service
 pub(crate) fn decode_invocation_frame(bytes: &[u8]) -> Result<TransportEnvelope, ServiceError> {
     match decode_request_frame(bytes)? {
         RequestFrame::Invoke(envelope) => Ok(envelope),
-        RequestFrame::SpendReadout(_) => Err(ServiceError::Carriage),
+        RequestFrame::UsageReadout(_) => Err(ServiceError::Carriage),
     }
 }
 
@@ -263,10 +263,10 @@ pub(crate) fn decode_result_frame(bytes: &[u8]) -> Result<TransportEnvelope, Ser
     decode_response_frame(bytes, Operation::Invoke)
 }
 
-pub(crate) fn decode_spend_readout_response_frame(
+pub(crate) fn decode_usage_readout_response_frame(
     bytes: &[u8],
 ) -> Result<TransportEnvelope, ServiceError> {
-    decode_response_frame(bytes, Operation::SpendReadout)
+    decode_response_frame(bytes, Operation::UsageReadout)
 }
 
 /// The most bytes one frame holding a sealed envelope of `ciphertext_len`
@@ -416,9 +416,9 @@ pub fn decrypt_result(
     Ok(result)
 }
 
-/// A spend readout request carries no content: the sealed envelope's
+/// A usage readout request carries no content: the sealed envelope's
 /// authenticated identity and kind are the whole request.
-pub(crate) fn encrypt_spend_readout_request(
+pub(crate) fn encrypt_usage_readout_request(
     caller_runtime_id: &str,
     request_id: &str,
     security: &TransportKey,
@@ -426,45 +426,45 @@ pub(crate) fn encrypt_spend_readout_request(
     encrypt_message(
         caller_runtime_id,
         request_id,
-        EnvelopeKind::SpendReadoutRequest,
+        EnvelopeKind::UsageReadoutRequest,
         &[],
         security,
     )
 }
 
 #[cfg(any(feature = "daemon", test))]
-pub(crate) fn decrypt_spend_readout_request(
+pub(crate) fn decrypt_usage_readout_request(
     envelope: &TransportEnvelope,
     security: &TransportKey,
 ) -> Result<(), ServiceError> {
-    validate_envelope(envelope, EnvelopeKind::SpendReadoutRequest)?;
+    validate_envelope(envelope, EnvelopeKind::UsageReadoutRequest)?;
     decrypt_message(envelope, security).map(drop)
 }
 
 #[cfg(feature = "daemon")]
-pub(crate) fn encrypt_spend_readout(
+pub(crate) fn encrypt_usage_readout(
     caller_runtime_id: &str,
     request_id: &str,
-    readout: &SpendReadout,
+    readout: &UsageReadout,
     security: &TransportKey,
 ) -> Result<TransportEnvelope, ServiceError> {
     let plaintext = wire_encode(readout).map_err(|_| ServiceError::Encoding)?;
     encrypt_message(
         caller_runtime_id,
         request_id,
-        EnvelopeKind::SpendReadoutResult,
+        EnvelopeKind::UsageReadoutResult,
         &plaintext,
         security,
     )
 }
 
-pub(crate) fn decrypt_spend_readout(
+pub(crate) fn decrypt_usage_readout(
     envelope: &TransportEnvelope,
     security: &TransportKey,
-) -> Result<SpendReadout, ServiceError> {
-    validate_envelope(envelope, EnvelopeKind::SpendReadoutResult)?;
+) -> Result<UsageReadout, ServiceError> {
+    validate_envelope(envelope, EnvelopeKind::UsageReadoutResult)?;
     let plaintext = decrypt_message(envelope, security)?;
-    let readout: SpendReadout = wire_decode(&plaintext).map_err(|_| ServiceError::Encoding)?;
+    let readout: UsageReadout = wire_decode(&plaintext).map_err(|_| ServiceError::Encoding)?;
     readout.validate()?;
     Ok(readout)
 }
@@ -607,8 +607,6 @@ pub enum ServiceError {
     SharedCallerKey,
     #[error("connector replay store failed: {0}")]
     ReplayStore(String),
-    #[error("an allowed model has no price: {0}")]
-    UnpricedModel(String),
     #[error("connector replay record is malformed")]
     InvalidReplayRecord,
     #[error("caller key changed while durable replay records still exist")]
@@ -1072,7 +1070,7 @@ mod tests {
     fn golden_frame() -> Vec<u8> {
         std::fs::read(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("tests/fixtures/wire_v3/carriage_invocation.frame"),
+                .join("tests/fixtures/wire_v4/carriage_invocation.frame"),
         )
         .expect("carriage_invocation.frame is committed")
     }
@@ -1109,7 +1107,7 @@ mod tests {
         assert_eq!(text(&request, "operation"), "invoke");
         assert_eq!(
             text(&request, "payloadSchema"),
-            "gamecult.model.transport_envelope.v3"
+            "gamecult.model.transport_envelope.v4"
         );
         assert_eq!(text(&request, "payloadEncoding"), "messagepack-base64");
         assert_eq!(text(&request, "messageId"), envelope.request_id);
@@ -1123,7 +1121,7 @@ mod tests {
         assert_eq!(text(&response, "status"), "ok");
         assert_eq!(
             text(&response, "payloadSchema"),
-            "gamecult.model.transport_envelope.v3"
+            "gamecult.model.transport_envelope.v4"
         );
         assert_eq!(text(&response, "payloadEncoding"), "messagepack-base64");
         assert_eq!(text(&response, "messageId"), envelope.request_id);
@@ -1287,23 +1285,23 @@ mod tests {
     #[test]
     fn a_readout_request_is_not_an_invocation_and_names_its_own_operation() {
         let key = TransportKey::from_connection_secret("readout-test-key").unwrap();
-        let sealed = encrypt_spend_readout_request("caller-1", "readout-1", &key).unwrap();
-        let frame = encode_spend_readout_request_frame(&sealed).unwrap();
+        let sealed = encrypt_usage_readout_request("caller-1", "readout-1", &key).unwrap();
+        let frame = encode_usage_readout_request_frame(&sealed).unwrap();
         assert!(matches!(
             decode_request_frame(&frame),
-            Ok(RequestFrame::SpendReadout(found)) if found == sealed
+            Ok(RequestFrame::UsageReadout(found)) if found == sealed
         ));
         assert_eq!(decode_invocation_frame(&frame), Err(ServiceError::Carriage));
         // Sealed as one kind, the authenticated data refuses it as another.
-        assert!(decrypt_spend_readout_request(&sealed, &key).is_ok());
+        assert!(decrypt_usage_readout_request(&sealed, &key).is_ok());
         assert_eq!(
-            decrypt_spend_readout(&sealed, &key).unwrap_err(),
+            decrypt_usage_readout(&sealed, &key).unwrap_err(),
             ServiceError::Envelope
         );
         let mut relabelled = sealed.clone();
-        relabelled.message_kind = EnvelopeKind::SpendReadoutResult;
+        relabelled.message_kind = EnvelopeKind::UsageReadoutResult;
         assert_eq!(
-            decrypt_spend_readout(&relabelled, &key).unwrap_err(),
+            decrypt_usage_readout(&relabelled, &key).unwrap_err(),
             ServiceError::Encryption
         );
     }
@@ -1313,12 +1311,12 @@ mod tests {
     fn a_response_is_read_as_its_own_operation_only() {
         use crate::readout::PlanQuotaSnapshot;
         let key = TransportKey::from_connection_secret("readout-test-key").unwrap();
-        let readout = SpendReadout::new(1, Vec::new(), PlanQuotaSnapshot::default());
-        let sealed = encrypt_spend_readout("caller-1", "readout-1", &readout, &key).unwrap();
-        let readout_frame = encode_spend_readout_response_frame(&sealed).unwrap();
+        let readout = UsageReadout::new(1, PlanQuotaSnapshot::default());
+        let sealed = encrypt_usage_readout("caller-1", "readout-1", &readout, &key).unwrap();
+        let readout_frame = encode_usage_readout_response_frame(&sealed).unwrap();
         let invoke_frame = encode_result_frame(&sealed).unwrap();
         assert_eq!(
-            decode_spend_readout_response_frame(&readout_frame).unwrap(),
+            decode_usage_readout_response_frame(&readout_frame).unwrap(),
             sealed
         );
         assert_eq!(decode_result_frame(&invoke_frame).unwrap(), sealed);
@@ -1327,9 +1325,9 @@ mod tests {
             Err(ServiceError::Carriage)
         );
         assert_eq!(
-            decode_spend_readout_response_frame(&invoke_frame),
+            decode_usage_readout_response_frame(&invoke_frame),
             Err(ServiceError::Carriage)
         );
-        assert_eq!(decrypt_spend_readout(&sealed, &key).unwrap(), readout);
+        assert_eq!(decrypt_usage_readout(&sealed, &key).unwrap(), readout);
     }
 }

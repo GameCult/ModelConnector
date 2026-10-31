@@ -18,7 +18,7 @@ use claude_connector::{
     ClaudeConnectorConfig, ConfigError, LeaseCallerConfig, MIN_SECRET_BYTES, check_ready,
     load_config, write_config,
 };
-use model_connector::{CallerConfig, LeaseTurn, ModelPrice, Rates, frame_bytes_for_payload};
+use model_connector::{CallerConfig, LeaseTurn, frame_bytes_for_payload};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -72,7 +72,6 @@ fn check(path: &str) -> Result<(), Failure> {
     println!("claude connector configuration is valid and ready to serve");
     println!("callers: {}", config.callers.len());
     println!("lease_callers: {}", config.lease_callers.len());
-    println!("prices: {}", config.prices.len());
     Ok(())
 }
 
@@ -85,17 +84,15 @@ struct Flags {
 
 /// The flags that describe one caller, shared by `config init` (which writes
 /// the first caller) and `config add-caller`.
-const CALLER: [&str; 7] = [
+const CALLER: [&str; 5] = [
     "--caller-id",
     "--connection-key-file",
     "--connection-key-epoch",
-    "--spend-ceiling-micro-usd",
-    "--spend-window-ms",
     "--max-concurrent-requests",
     "--max-output-tokens",
 ];
 
-const INIT: [&str; 22] = [
+const INIT: [&str; 21] = [
     "--listen",
     "--replay-store",
     "--claude-binary",
@@ -117,15 +114,9 @@ const INIT: [&str; 22] = [
     "--lease-max-ms",
     "--turn",
     "--lease-unit-instance",
-    "--lease-reservation-micro-usd",
 ];
 
-const LEASE_CALLER: [&str; 4] = [
-    "--caller-id",
-    "--turn",
-    "--lease-unit-instance",
-    "--lease-reservation-micro-usd",
-];
+const LEASE_CALLER: [&str; 3] = ["--caller-id", "--turn", "--lease-unit-instance"];
 
 impl Flags {
     fn parse(
@@ -213,8 +204,6 @@ impl Flags {
             max_concurrent_requests: self.number_or("--max-concurrent-requests", 4)?,
             max_payload_bytes: self.number_or("--max-payload-bytes", 1 << 20)?,
             max_output_tokens: self.number_or("--max-output-tokens", 32_768)?,
-            spend_ceiling_micro_usd: self.number("--spend-ceiling-micro-usd")?,
-            spend_window_ms: self.number("--spend-window-ms")?,
         })
     }
 }
@@ -228,33 +217,6 @@ fn sha256(hex: &str) -> Option<[u8; 32]> {
         *byte = u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok()?;
     }
     Some(digest)
-}
-
-/// MODEL:INPUT:OUTPUT:CACHE_WRITE:CACHE_READ:OVERHEAD, rates in micro-USD per
-/// million tokens. The one cache-write rate prices both retentions.
-fn price(text: &str) -> Option<(String, ModelPrice)> {
-    let mut parts = text.split(':');
-    let model = parts.next()?.to_string();
-    let mut next = || parts.next()?.parse::<u64>().ok();
-    let (input, output, cache_write, cache_read, overhead_tokens) =
-        (next()?, next()?, next()?, next()?, next()?);
-    if parts.next().is_some() {
-        return None;
-    }
-    Some((
-        model,
-        ModelPrice {
-            rates: Rates {
-                input,
-                cache_write_short: cache_write,
-                cache_write_long: cache_write,
-                cache_read,
-                output,
-            },
-            long_context: None,
-            overhead_tokens,
-        },
-    ))
 }
 
 /// Writes 32 random bytes as 64 hex characters, mode 0600, unless the file is
@@ -322,16 +284,9 @@ fn init(path: &str, args: &[&str]) -> Result<(), Failure> {
     let flags = Flags::parse(
         args,
         &[&INIT, &CALLER],
-        &["--allowed-model", "--price", "--lease-user"],
+        &["--allowed-model", "--lease-user"],
     )?;
     let first = flags.caller()?;
-    let mut prices = BTreeMap::new();
-    for text in flags.list("--price") {
-        let (model, price) = price(text).ok_or(Failure::Malformed("--price"))?;
-        if prices.insert(model, price).is_some() {
-            return Err(Failure::Malformed("--price"));
-        }
-    }
     let lease_callers = flags
         .list("--lease-user")
         .iter()
@@ -341,7 +296,6 @@ fn init(path: &str, args: &[&str]) -> Result<(), Failure> {
                 caller_id: first.caller_runtime_id.clone(),
                 turn: flags.turn()?,
                 unit_instance: flags.text("--lease-unit-instance")?,
-                reservation_micro_usd: flags.number("--lease-reservation-micro-usd")?,
             })
         })
         .collect::<Result<Vec<_>, Failure>>()?;
@@ -366,7 +320,6 @@ fn init(path: &str, args: &[&str]) -> Result<(), Failure> {
         socket_timeout_ms: flags.number_or("--socket-timeout-ms", 10_000)?,
         max_expiry_skew_ms: 300_000,
         callers: vec![first],
-        prices,
         lease_socket: flags.single.get("--lease-socket").map(PathBuf::from),
         lease_callers,
         lease_max_ms: flags.number_or("--lease-max-ms", 3_600_000)?,
@@ -412,7 +365,6 @@ fn add_lease_caller(path: &str, args: &[&str]) -> Result<(), Failure> {
         caller_id: flags.text("--caller-id")?,
         turn: flags.turn()?,
         unit_instance: flags.text("--lease-unit-instance")?,
-        reservation_micro_usd: flags.number("--lease-reservation-micro-usd")?,
     });
     write_config(path.as_ref(), &config)?;
     Ok(())
