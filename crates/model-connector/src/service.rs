@@ -2171,7 +2171,7 @@ mod tests {
             service.begin_unplanned(&raw_envelope(&invocation), 1_000, FRAME),
             Err(ServiceError::ReplayStore(_))
         ));
-        allowance.store(10, Ordering::SeqCst);
+        allowance.store(10, std::sync::atomic::Ordering::SeqCst);
         assert!(matches!(
             service.begin_unplanned(&raw_envelope(&invocation), 1_000, FRAME),
             Ok(TransportAdmission::Execute(_))
@@ -2193,7 +2193,7 @@ mod tests {
         ));
         // The slot is free (one concurrent request is admitted), and the retry
         // of the unfinished id is told it is indeterminate, not in flight.
-        allowance.store(10, Ordering::SeqCst);
+        allowance.store(10, std::sync::atomic::Ordering::SeqCst);
         let again = service
             .begin_unplanned(&raw_envelope(&invocation), 1_000, FRAME)
             .unwrap();
