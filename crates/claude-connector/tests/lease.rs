@@ -554,10 +554,11 @@ fn a_lease_survives_many_polls_while_its_holder_and_invocation_stay() {
     harness.enter(2);
     let second = ask(&harness, 60_000);
     assert_eq!(refusal_of(&second), Some(LeaseRefusalKind::Busy));
+    // The system still places the holder in invocation 1.
+    harness.enter(1);
     // The holder talking does not end it either.
     first._stream.write_all(b"x").unwrap();
     std::thread::sleep(Duration::from_millis(1_200));
-    harness.enter(3);
     assert_eq!(
         refusal_of(&ask(&harness, 60_000)),
         Some(LeaseRefusalKind::Busy)
