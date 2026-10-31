@@ -263,10 +263,10 @@ impl TransportService {
             caller_runtime_id: caller_runtime_id.to_string(),
             request_id: lease_id.to_string(),
         };
-        if !self
+        if self
             .live
             .get(&identity)
-            .is_some_and(|request| request.lease.is_some())
+            .is_none_or(|request| request.lease.is_none())
         {
             return Err(ServiceError::NoActiveRequest);
         }
@@ -378,7 +378,7 @@ mod tests {
 
     fn lease(service: &mut TransportService, run: &str, cost: u64) -> LeaseAdmission {
         service
-            .begin_lease(CALLER, run, cost, NOW + 60_000, NOW)
+            .begin_lease(CALLER, LeaseTurn::SelfRun, run, cost, NOW + 60_000, NOW)
             .unwrap()
     }
 
@@ -473,7 +473,7 @@ mod tests {
         let mut service = open(&store, 1_000);
         assert_eq!(
             service
-                .begin_lease("stranger", "run-1", 100, NOW + 1, NOW)
+                .begin_lease("stranger", LeaseTurn::SelfRun, "run-1", 100, NOW + 1, NOW)
                 .unwrap(),
             LeaseAdmission::Refused(LeaseRefusal::UnknownCaller)
         );
@@ -648,7 +648,7 @@ mod tests {
         allowance.store(0, Ordering::SeqCst);
         assert!(
             service
-                .begin_lease(CALLER, "run-1", 100, NOW + 1, NOW)
+                .begin_lease(CALLER, LeaseTurn::SelfRun, "run-1", 100, NOW + 1, NOW)
                 .is_err()
         );
         assert_eq!(held(&service), 0);
@@ -724,7 +724,7 @@ mod tests {
             .unwrap();
         assert!(
             service
-                .begin_lease(CALLER, &format!("{longest}r"), 100, NOW + 1, NOW)
+                .begin_lease(CALLER, LeaseTurn::SelfRun, &format!("{longest}r"), 100, NOW + 1, NOW)
                 .is_err()
         );
     }
