@@ -12,8 +12,7 @@ use std::time::Duration;
 use cultcache_rs::{CultCache, DatabaseEntry, SingleFileMessagePackBackingStore};
 use model_connector::{
     CallerAdmission, CallerConfig, LeaseTurn, MIN_PAYLOAD_BYTES, ModelPrice, ProviderBackend,
-    ServeError,
-    ServeLimits, ServiceError, TransportService, load_admissions, serve_service,
+    ServeError, ServeLimits, ServiceError, TransportService, load_admissions, serve_service,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;

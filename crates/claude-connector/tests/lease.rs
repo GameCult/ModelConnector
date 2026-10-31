@@ -22,9 +22,8 @@ use claude_connector::{
     decode_frame, encode_frame, serve_leases,
 };
 use model_connector::{
-    CallerAdmission, LeaseAdmission, LeaseRefusal, LeaseTurn, LeaseUse, ModelPrice, ModelUsage, Rates,
-    SpendCeiling,
-    SpendWindowMs, TransportService, Usage,
+    CallerAdmission, LeaseAdmission, LeaseRefusal, LeaseTurn, LeaseUse, ModelPrice, ModelUsage,
+    Rates, SpendCeiling, SpendWindowMs, TransportService, Usage,
 };
 use zeroize::Zeroizing;
 
@@ -1191,11 +1190,7 @@ fn start_persona(setup: Setup) -> Harness {
     harness
 }
 
-fn lease_on(
-    harness: &Harness,
-    turn: LeaseTurn,
-    invocation: &str,
-) -> LeaseAdmission {
+fn lease_on(harness: &Harness, turn: LeaseTurn, invocation: &str) -> LeaseAdmission {
     harness
         .service
         .lock()
