@@ -1,7 +1,9 @@
-//! The plan's own usage windows, as the CLI reports them. The subscription
-//! decides how much a plan may burn; the CLI's `rate_limit_event` is the only
-//! place that number appears, so the latest observation of each window is kept
-//! here and published as the usage readout and lent with each lease.
+//! The plan's own usage windows, as the subscription reports them. The
+//! subscription decides how much a plan may burn, and two sensors observe it:
+//! the CLI's `rate_limit_event` on the connector's own calls, and the usage
+//! poll of `usage_poll` while that stream is quiet. The latest observation of
+//! each window, from either, is kept here and published as the usage readout
+//! and lent with each lease.
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
