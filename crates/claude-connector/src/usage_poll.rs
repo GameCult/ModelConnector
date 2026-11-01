@@ -726,4 +726,33 @@ mod tests {
             Some(70)
         );
     }
+
+    #[test]
+    fn run_polls_until_the_endpoint_refuses_then_returns() {
+        let (url, seen) = serve(vec![http("403 Forbidden", "", "{}")]);
+        let cell = Arc::new(QuotaCell::new());
+        let (poller, lines) = make_poller(&cell, &url, Some(CANARY));
+        poller.run();
+        assert_eq!(requests(&seen), 1);
+        let lines = lines.lock().unwrap();
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("user:profile"), "{lines:?}");
+    }
+
+    #[test]
+    fn every_state_has_its_own_line() {
+        let states = [
+            State::Polled,
+            State::NoToken,
+            State::RateLimited,
+            State::Refused,
+            State::NotFound,
+            State::Unreadable,
+            State::Unexpected,
+            State::Unreachable,
+        ];
+        let lines: std::collections::BTreeSet<_> = states.iter().map(|s| s.line()).collect();
+        assert_eq!(lines.len(), states.len());
+        assert!(lines.iter().all(|line| line.starts_with("usage poll: ")));
+    }
 }
