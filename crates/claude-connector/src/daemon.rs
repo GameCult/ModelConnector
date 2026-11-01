@@ -556,6 +556,13 @@ pub fn serve_config(path: &Path) -> Result<(), ConfigError> {
     if let Some(socket) = &config.lease_socket {
         start_leases(&config, socket, service.clone(), backend.quota())?;
     }
+    crate::usage_poll::start(
+        backend.quota(),
+        Box::new(CredentialTokenSource::from_environment(
+            config.token_credential.clone(),
+        )),
+    )
+    .map_err(|_| ConfigError::Serving("usage poll"))?;
     serve_service(listener, config.serve_limits(), service, backend)?;
     Ok(())
 }
