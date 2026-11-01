@@ -160,10 +160,7 @@ impl UsageClient {
 
     fn with_timeout(url: impl Into<String>, timeout: Duration) -> Self {
         Self {
-            agent: ureq::AgentBuilder::new()
-                .timeout(timeout)
-                .redirects(0)
-                .build(),
+            agent: ureq::AgentBuilder::new().redirects(0).build(),
             url: url.into(),
             timeout,
         }
@@ -177,6 +174,7 @@ impl UsageClient {
         let sent = self
             .agent
             .get(&self.url)
+            .timeout(self.timeout)
             .set("Authorization", bearer.as_str())
             .set("anthropic-beta", "oauth-2025-04-20")
             .call();
@@ -911,6 +909,7 @@ mod tests {
             "Wednesday, 21-Oct-26-1 07:28:00 GMT",
             "Wednesday, 21-Oct-2026 07:28:00 GMT",
             "Wednesday, 21-Foo-26 07:28:00 GMT",
+            "Wednesday 21-Oct-26 07:28:00 GMT",
             "Wednesday, 21-Oct-26 07:28 GMT",
             "Wed Oct 21 07:28:00:01 2026",
             "Wed Oct 32 07:28:00 2026",

@@ -678,7 +678,7 @@ Connection: close
         let served = std::thread::spawn(move || serve_config_with(&path, UsageClient::new(url)));
 
         let request = request
-            .recv_timeout(Duration::from_secs(60))
+            .recv_timeout(Duration::from_secs(30))
             .expect("the usage poll never asked the fake endpoint");
         assert!(request.starts_with("GET /api/oauth/usage "), "{request}");
         assert!(request.contains(&format!("Bearer {TOKEN}")), "{request}");

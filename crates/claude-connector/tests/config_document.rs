@@ -286,3 +286,12 @@ fn the_dollar_flags_are_not_flags() {
         );
     }
 }
+
+#[test]
+fn serve_refuses_a_document_that_is_not_there() {
+    let scratch = Scratch::new();
+    let missing = scratch.path("missing.cc");
+    let served = run(&["serve", "--config", missing.to_str().unwrap()]);
+    assert!(!served.status.success(), "{served:?}");
+    assert!(!String::from_utf8_lossy(&served.stderr).is_empty());
+}
