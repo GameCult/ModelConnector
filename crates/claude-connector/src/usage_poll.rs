@@ -197,16 +197,67 @@ impl UsageClient {
 }
 
 /// A `Retry-After` value as a wait from `now_ms`: delay-seconds, or an
-/// HTTP-date (RFC 9110 10.2.3) measured from now, a date already past being a
-/// zero wait. `None` when it is neither.
+/// HTTP-date (RFC 9110 10.2.3, all three forms) measured from now, a date
+/// already past being a zero wait. `None` when it is neither.
 fn retry_after(value: &str, now_ms: u64) -> Option<Duration> {
     let value = value.trim();
     if let Ok(seconds) = value.parse::<u64>() {
         return Some(Duration::from_secs(seconds));
     }
-    let date = chrono::DateTime::parse_from_rfc2822(value).ok()?;
-    let until = u64::try_from(date.timestamp_millis()).ok()?;
+    let until = http_date_ms(value, now_ms)?;
     Some(Duration::from_millis(until.saturating_sub(now_ms)))
+}
+
+/// An HTTP-date as Unix milliseconds: IMF-fixdate (RFC 2822 reads it), the
+/// obsolete RFC 850 form `Sunday, 06-Nov-94 08:49:37 GMT`, or asctime
+/// `Sun Nov  6 08:49:37 1994`. Weekday names are not checked.
+fn http_date_ms(value: &str, now_ms: u64) -> Option<u64> {
+    use chrono::Datelike;
+    if let Ok(date) = chrono::DateTime::parse_from_rfc2822(value) {
+        return u64::try_from(date.timestamp_millis()).ok();
+    }
+    let fields: Vec<&str> = value.split_whitespace().collect();
+    let (day, month, year, time) = match fields.as_slice() {
+        [weekday, date, time, "GMT"] if weekday.ends_with(',') => {
+            let mut parts = date.split('-');
+            let (day, month, year) = (parts.next()?, parts.next()?, parts.next()?);
+            if parts.next().is_some() || year.len() != 2 {
+                return None;
+            }
+            // A two-digit year more than 50 years ahead is the latest past
+            // year with those digits.
+            let now_year =
+                chrono::DateTime::from_timestamp_millis(i64::try_from(now_ms).ok()?)?.year();
+            let year = now_year - now_year.rem_euclid(100) + year.parse::<i32>().ok()?;
+            let year = if year > now_year + 50 {
+                year - 100
+            } else {
+                year
+            };
+            (day, month, year, *time)
+        }
+        [_, month, day, time, year] => (*day, *month, year.parse::<i32>().ok()?, *time),
+        _ => return None,
+    };
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let month = MONTHS
+        .iter()
+        .position(|name| name.eq_ignore_ascii_case(month))?;
+    let mut clock = time.split(':');
+    let (hour, minute, second) = (clock.next()?, clock.next()?, clock.next()?);
+    if clock.next().is_some() {
+        return None;
+    }
+    let moment =
+        chrono::NaiveDate::from_ymd_opt(year, u32::try_from(month + 1).ok()?, day.parse().ok()?)?
+            .and_hms_opt(
+            hour.parse().ok()?,
+            minute.parse().ok()?,
+            second.parse().ok()?,
+        )?;
+    u64::try_from(moment.and_utc().timestamp_millis()).ok()
 }
 
 /// The schedule and the thing it drives. Time comes in as an argument so the
@@ -796,6 +847,39 @@ mod tests {
         assert_eq!(lines.lock().unwrap()[1], State::Polled.line());
     }
 
+    /// 2026-11-01 07:28:00 UTC, a Sunday.
+    fn sunday_morning_ms() -> u64 {
+        chrono::NaiveDate::from_ymd_opt(2026, 11, 1)
+            .unwrap()
+            .and_hms_opt(7, 28, 0)
+            .unwrap()
+            .and_utc()
+            .timestamp_millis() as u64
+    }
+
+    #[test]
+    fn retry_after_reads_all_three_http_date_forms() {
+        let now = sunday_morning_ms();
+        for form in [
+            "Sun, 01 Nov 2026 08:28:00 GMT",
+            "Sunday, 01-Nov-26 08:28:00 GMT",
+            "Sun Nov  1 08:28:00 2026",
+            "Sun Nov 1 08:28:00 2026",
+        ] {
+            assert_eq!(retry_after(form, now), Some(secs(3600)), "{form}");
+        }
+    }
+
+    #[test]
+    fn a_two_digit_year_more_than_fifty_years_ahead_is_the_past() {
+        let now = sunday_morning_ms();
+        let on = |yy: &str| retry_after(&format!("Friday, 01-Jan-{yy} 00:00:00 GMT"), now);
+        assert!(on("76").unwrap() > Duration::ZERO, "2076 is 50 years ahead");
+        assert_eq!(on("77"), Some(Duration::ZERO), "1977, not 2077");
+        assert!(on("33").unwrap() > Duration::ZERO, "2033");
+        assert_eq!(on("94"), Some(Duration::ZERO), "1994");
+    }
+
     #[test]
     fn retry_after_reads_seconds_and_http_dates() {
         const DATE: &str = "Wed, 21 Oct 2026 07:28:00 GMT";
@@ -808,7 +892,21 @@ mod tests {
         assert_eq!(retry_after(DATE, at + 1), Some(Duration::ZERO), "past");
         assert_eq!(retry_after("3600", at), Some(secs(3600)));
         assert_eq!(retry_after(" 3600 ", at), Some(secs(3600)));
-        for bad in ["", "soon", "-5", "3600.5", "1, 2", "Wed, 21 Oct 2026"] {
+        for bad in [
+            "",
+            "soon",
+            "-5",
+            "3600.5",
+            "1, 2",
+            "Wed, 21 Oct 2026",
+            "Wednesday, 21-Oct-26-1 07:28:00 GMT",
+            "Wednesday, 21-Oct-2026 07:28:00 GMT",
+            "Wednesday, 21-Foo-26 07:28:00 GMT",
+            "Wednesday, 21-Oct-26 07:28 GMT",
+            "Wed Oct 21 07:28:00:01 2026",
+            "Wed Oct 32 07:28:00 2026",
+            "Wed Oct 21 25:28:00 2026",
+        ] {
             assert_eq!(retry_after(bad, at), None, "{bad:?}");
         }
     }
