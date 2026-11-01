@@ -3,7 +3,8 @@
 //! quiet the weekly reading goes stale; this thread asks the subscription's
 //! usage endpoint when the `seven_day` reading is `STALE` or older, and
 //! records the answer in the same [`QuotaCell`] the stream feeds. Neither
-//! sensor owns the reading: the newest observation of a window wins. A failed
+//! sensor owns the reading: the cell decides how a reading combines with the
+//! one it holds, and a poll is stamped with the moment it asked. A failed
 //! poll never touches the cell; only the cell's own reset rule retires a
 //! window.
 //!
@@ -17,10 +18,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use model_connector::PlanQuota;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 use crate::backend::TokenSource;
-use crate::quota::QuotaCell;
+use crate::quota::{POLLED, QuotaCell};
 
 /// The usage endpoint.
 const ENDPOINT: &str = "https://api.anthropic.com/api/oauth/usage";
@@ -31,8 +33,6 @@ const CEILING: Duration = Duration::from_secs(6 * 60 * 60);
 const TIMEOUT: Duration = Duration::from_secs(10);
 /// A usage body is a few hundred bytes; this is a ceiling, not an expectation.
 const MAX_BODY: u64 = 1 << 20;
-/// The status every polled window carries.
-const POLLED: &str = "polled";
 
 /// What the endpoint said, reduced to what the schedule needs. It never holds
 /// the token.
@@ -63,7 +63,7 @@ impl State {
             Self::NoToken => "usage poll: no token to ask with",
             Self::RateLimited => "usage poll: rate limited, waiting",
             Self::Refused => {
-                "usage poll: refused (401/403), the token likely lacks the user:profile scope; polling stopped until restart"
+                "usage poll: refused (401/403), the token likely lacks the user:profile scope; not asking again until the token changes"
             }
             Self::NotFound => "usage poll: endpoint not found, backing off",
             Self::Unreadable => "usage poll: answer not readable, backing off",
@@ -73,40 +73,35 @@ impl State {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
-enum Next {
-    Wait(Duration),
-    Stop,
-}
-
 #[derive(Debug, PartialEq)]
 struct Verdict {
     windows: Vec<PlanQuota>,
-    next: Next,
+    /// How long until the next poll may happen.
+    wait: Duration,
     state: State,
 }
 
 /// What one answer means: the windows to record (only a readable body has
 /// any), how long to wait, and the state to report.
 fn judge(answer: &Answer) -> Verdict {
-    let (windows, next, state) = match answer {
+    let (windows, wait, state) = match answer {
         Answer::Body(body) => match parse_usage(body) {
-            Some(windows) => (windows, Next::Wait(STALE), State::Polled),
-            None => (Vec::new(), Next::Wait(CEILING), State::Unreadable),
+            Some(windows) => (windows, STALE, State::Polled),
+            None => (Vec::new(), CEILING, State::Unreadable),
         },
         Answer::Status(429, retry_after) => (
             Vec::new(),
-            Next::Wait(retry_after.unwrap_or_default().clamp(STALE, CEILING)),
+            retry_after.unwrap_or_default().clamp(STALE, CEILING),
             State::RateLimited,
         ),
-        Answer::Status(401 | 403, _) => (Vec::new(), Next::Stop, State::Refused),
-        Answer::Status(404, _) => (Vec::new(), Next::Wait(CEILING), State::NotFound),
-        Answer::Status(..) => (Vec::new(), Next::Wait(STALE), State::Unexpected),
-        Answer::Unreachable => (Vec::new(), Next::Wait(STALE), State::Unreachable),
+        Answer::Status(401 | 403, _) => (Vec::new(), STALE, State::Refused),
+        Answer::Status(404, _) => (Vec::new(), CEILING, State::NotFound),
+        Answer::Status(..) => (Vec::new(), STALE, State::Unexpected),
+        Answer::Unreachable => (Vec::new(), STALE, State::Unreachable),
     };
     Verdict {
         windows,
-        next,
+        wait,
         state,
     }
 }
@@ -153,15 +148,22 @@ struct UsageClient {
 
 impl UsageClient {
     fn new(url: impl Into<String>) -> Self {
+        Self::with_timeout(url, TIMEOUT)
+    }
+
+    fn with_timeout(url: impl Into<String>, timeout: Duration) -> Self {
         Self {
             agent: ureq::AgentBuilder::new()
-                .timeout(TIMEOUT)
+                .timeout(timeout)
                 .redirects(0)
                 .build(),
             url: url.into(),
         }
     }
 
+    /// Asks the endpoint. Our copy of the header value is zeroized when it
+    /// drops; ureq copies it into its own request buffers, which are freed
+    /// without zeroing.
     fn ask(&self, token: &Zeroizing<String>) -> Answer {
         let bearer = Zeroizing::new(format!("Bearer {}", token.as_str()));
         let sent = self
@@ -184,16 +186,27 @@ impl UsageClient {
             }
             Ok(response) => Answer::Status(response.status(), None),
             Err(ureq::Error::Status(code, response)) => {
-                // Whole seconds only; the HTTP-date form counts as absent.
                 let retry_after = response
                     .header("retry-after")
-                    .and_then(|seconds| seconds.trim().parse::<u64>().ok())
-                    .map(Duration::from_secs);
+                    .and_then(|value| retry_after(value, unix_ms()));
                 Answer::Status(code, retry_after)
             }
             Err(ureq::Error::Transport(_)) => Answer::Unreachable,
         }
     }
+}
+
+/// A `Retry-After` value as a wait from `now_ms`: delay-seconds, or an
+/// HTTP-date (RFC 9110 10.2.3) measured from now, a date already past being a
+/// zero wait. `None` when it is neither.
+fn retry_after(value: &str, now_ms: u64) -> Option<Duration> {
+    let value = value.trim();
+    if let Ok(seconds) = value.parse::<u64>() {
+        return Some(Duration::from_secs(seconds));
+    }
+    let date = chrono::DateTime::parse_from_rfc2822(value).ok()?;
+    let until = u64::try_from(date.timestamp_millis()).ok()?;
+    Some(Duration::from_millis(until.saturating_sub(now_ms)))
 }
 
 /// The schedule and the thing it drives. Time comes in as an argument so the
@@ -206,7 +219,9 @@ struct Poller {
     /// No poll before this instant, unix ms: the last answer's own wait.
     not_before_ms: u64,
     started: bool,
-    stopped: bool,
+    /// The digest of the token the endpoint last refused: while the token
+    /// reads the same, the poller does not ask again.
+    refused_token: Option<[u8; 32]>,
     last_state: Option<State>,
 }
 
@@ -224,51 +239,58 @@ impl Poller {
             log,
             not_before_ms: 0,
             started: false,
-            stopped: false,
+            refused_token: None,
             last_state: None,
         }
     }
 
     /// Polls if a poll is due at `now_ms`; returns how long to wait before
-    /// asking again, or `None` once polling has stopped for good.
+    /// asking again.
     ///
     /// The first call polls. After that a poll is due only when the cell's
     /// `seven_day` observation is `STALE` old or older (or absent), and never
-    /// before the last answer's own wait has passed.
-    fn tick(&mut self, now_ms: u64) -> Option<Duration> {
-        if self.stopped {
-            return None;
-        }
+    /// before the last answer's own wait has passed. A token the endpoint
+    /// refused is not sent again until it reads differently.
+    fn tick(&mut self, now_ms: u64) -> Duration {
         let due_at = self.due_at_ms();
         if now_ms < due_at {
-            return Some(Duration::from_millis(due_at - now_ms));
+            return Duration::from_millis(due_at - now_ms);
         }
         self.started = true;
-        let verdict = match self.tokens.read() {
-            Some(token) => judge(&self.client.ask(&token)),
+        let token = self.tokens.read();
+        if let (Some(refused), Some(token)) = (&self.refused_token, &token)
+            && digest(token) != *refused
+        {
+            self.refused_token = None;
+        }
+        let verdict = match token {
+            _ if self.refused_token.is_some() => Verdict {
+                windows: Vec::new(),
+                wait: STALE,
+                state: State::Refused,
+            },
+            Some(token) => {
+                let verdict = judge(&self.client.ask(&token));
+                if verdict.state == State::Refused {
+                    self.refused_token = Some(digest(&token));
+                }
+                verdict
+            }
             None => Verdict {
                 windows: Vec::new(),
-                next: Next::Wait(STALE),
+                wait: STALE,
                 state: State::NoToken,
             },
         };
-        self.cell.observe(verdict.windows);
+        // The reading is as old as the question: an answer that arrives after
+        // the stream spoke does not outrank it.
+        self.cell.observe_at(now_ms, verdict.windows);
         if self.last_state != Some(verdict.state) {
             (self.log)(verdict.state.line());
             self.last_state = Some(verdict.state);
         }
-        match verdict.next {
-            Next::Stop => {
-                self.stopped = true;
-                None
-            }
-            Next::Wait(wait) => {
-                self.not_before_ms = now_ms.saturating_add(duration_ms(wait));
-                Some(Duration::from_millis(
-                    self.due_at_ms().saturating_sub(now_ms),
-                ))
-            }
-        }
+        self.not_before_ms = now_ms.saturating_add(duration_ms(verdict.wait));
+        Duration::from_millis(self.due_at_ms().saturating_sub(now_ms))
     }
 
     /// The earliest instant the next poll may happen.
@@ -289,10 +311,15 @@ impl Poller {
     }
 
     fn run(mut self) {
-        while let Some(wait) = self.tick(unix_ms()) {
+        loop {
+            let wait = self.tick(unix_ms());
             std::thread::sleep(wait);
         }
     }
+}
+
+fn digest(token: &Zeroizing<String>) -> [u8; 32] {
+    Sha256::digest(token.as_bytes()).into()
 }
 
 fn duration_ms(duration: Duration) -> u64 {
@@ -408,38 +435,32 @@ mod tests {
 
     // ---- judgement ----
 
-    fn wait_of(answer: &Answer) -> Next {
-        judge(answer).next
+    fn wait_of(answer: &Answer) -> Duration {
+        judge(answer).wait
     }
 
     #[test]
     fn rate_limit_waits_the_longer_of_retry_after_and_the_floor_capped() {
         let limited = |after| wait_of(&Answer::Status(429, after));
-        assert_eq!(limited(Some(secs(3600))), Next::Wait(secs(3600)));
-        assert_eq!(limited(Some(secs(20 * 60))), Next::Wait(secs(20 * 60)));
-        assert_eq!(limited(Some(secs(10))), Next::Wait(STALE));
-        assert_eq!(limited(None), Next::Wait(STALE));
-        assert_eq!(limited(Some(secs(100_000))), Next::Wait(CEILING));
-        assert_eq!(limited(Some(secs(6 * 3600))), Next::Wait(CEILING));
+        assert_eq!(limited(Some(secs(3600))), secs(3600));
+        assert_eq!(limited(Some(secs(20 * 60))), secs(20 * 60));
+        assert_eq!(limited(Some(secs(10))), STALE);
+        assert_eq!(limited(None), STALE);
+        assert_eq!(limited(Some(secs(100_000))), CEILING);
+        assert_eq!(limited(Some(secs(6 * 3600))), CEILING);
         assert_eq!(judge(&Answer::Status(429, None)).state, State::RateLimited);
     }
 
     #[test]
-    fn refusal_stops_polling_and_the_rest_back_off() {
-        assert_eq!(wait_of(&Answer::Status(401, None)), Next::Stop);
-        assert_eq!(wait_of(&Answer::Status(403, Some(secs(5)))), Next::Stop);
+    fn refusal_backs_off_like_the_rest() {
+        assert_eq!(wait_of(&Answer::Status(401, None)), STALE);
+        assert_eq!(wait_of(&Answer::Status(403, Some(secs(5)))), STALE);
         assert_eq!(judge(&Answer::Status(403, None)).state, State::Refused);
-        assert_eq!(wait_of(&Answer::Status(404, None)), Next::Wait(CEILING));
-        assert_eq!(
-            wait_of(&Answer::Body("<html>".to_string())),
-            Next::Wait(CEILING)
-        );
-        assert_eq!(wait_of(&Answer::Unreachable), Next::Wait(STALE));
-        assert_eq!(wait_of(&Answer::Status(503, None)), Next::Wait(STALE));
-        assert_eq!(
-            wait_of(&Answer::Body(body(&reading(1.0), "null"))),
-            Next::Wait(STALE)
-        );
+        assert_eq!(wait_of(&Answer::Status(404, None)), CEILING);
+        assert_eq!(wait_of(&Answer::Body("<html>".to_string())), CEILING);
+        assert_eq!(wait_of(&Answer::Unreachable), STALE);
+        assert_eq!(wait_of(&Answer::Status(503, None)), STALE);
+        assert_eq!(wait_of(&Answer::Body(body(&reading(1.0), "null"))), STALE);
     }
 
     // ---- a fake server, a poller, and the cell ----
@@ -530,7 +551,7 @@ mod tests {
         )]);
         let cell = Arc::new(QuotaCell::new());
         let (mut poller, lines) = make_poller(&cell, &url, Some(CANARY));
-        let wait = poller.tick(unix_ms()).unwrap();
+        let wait = poller.tick(unix_ms());
         let windows = cell.snapshot().windows;
         assert_eq!(windows.len(), 2);
         assert_eq!(windows[0].status, "polled");
@@ -555,7 +576,7 @@ mod tests {
         let observed = window(&cell, "seven_day").unwrap().observed_at_unix_ms;
 
         // 5 min old: no request, and the wait is the time left.
-        let wait = poller.tick(observed + 5 * MIN).unwrap();
+        let wait = poller.tick(observed + 5 * MIN);
         assert_eq!(requests(&seen), 1);
         assert_eq!(wait, Duration::from_millis(10 * MIN));
         // One millisecond short of 15 min: still none.
@@ -590,7 +611,7 @@ mod tests {
         // The stream reports seven_day afresh, after the poll.
         cell.observe([stream_reading("seven_day", 400)]);
         let observed = window(&cell, "seven_day").unwrap().observed_at_unix_ms;
-        let wait = poller.tick(observed + 14 * MIN).unwrap();
+        let wait = poller.tick(observed + 14 * MIN);
         assert_eq!(requests(&seen), 1);
         assert_eq!(wait, Duration::from_millis(MIN));
     }
@@ -599,19 +620,23 @@ mod tests {
     fn failures_never_touch_the_cell() {
         let limited = |headers: &str| http("429 Too Many Requests", headers, "{}");
         let cases = [
-            (limited("Retry-After: 3600\r\n"), Some(60)),
-            (limited(""), Some(15)),
+            (limited("Retry-After: 3600\r\n"), 60),
+            (limited(""), 15),
             (
                 limited("Retry-After: Wed, 21 Oct 2026 07:28:00 GMT\r\n"),
-                Some(15),
+                15,
             ),
-            (http("403 Forbidden", "", "{}"), None),
-            (http("401 Unauthorized", "", "{}"), None),
-            (http("404 Not Found", "", "{}"), Some(360)),
-            (http("200 OK", "", "<html>not json</html>"), Some(360)),
+            (
+                limited("Retry-After: Fri, 31 Dec 2100 23:59:59 GMT\r\n"),
+                360,
+            ),
+            (http("403 Forbidden", "", "{}"), 15),
+            (http("401 Unauthorized", "", "{}"), 15),
+            (http("404 Not Found", "", "{}"), 360),
+            (http("200 OK", "", "<html>not json</html>"), 360),
             (
                 http("302 Found", "Location: http://127.0.0.1:9/\r\n", ""),
-                Some(15),
+                15,
             ),
         ];
         for (reply, minutes) in cases {
@@ -625,9 +650,8 @@ mod tests {
             let (mut poller, lines) = make_poller(&cell, &url, Some(CANARY));
             let wait = poller.tick(unix_ms());
             assert_eq!(cell.snapshot(), before, "{reply}");
-            assert_eq!(wait.map(|w| w.as_secs() / 60), minutes, "{reply}");
+            assert_eq!(wait.as_secs() / 60, minutes, "{reply}");
             assert_eq!(lines.lock().unwrap().len(), 1, "{reply}");
-            assert_eq!(poller.tick(unix_ms()).is_none(), minutes.is_none());
         }
     }
 
@@ -642,13 +666,13 @@ mod tests {
         let cell = Arc::new(QuotaCell::new());
         let (mut poller, lines) =
             make_poller(&cell, &format!("http://127.0.0.1:{port}/u"), Some(CANARY));
-        assert_eq!(poller.tick(unix_ms()), Some(STALE));
+        assert_eq!(poller.tick(unix_ms()), STALE);
         assert!(cell.snapshot().windows.is_empty());
         assert_eq!(lines.lock().unwrap().len(), 1);
 
         let (url, seen) = serve(vec![http("200 OK", "", "{}")]);
         let (mut poller, lines) = make_poller(&cell, &url, None);
-        assert_eq!(poller.tick(unix_ms()), Some(STALE));
+        assert_eq!(poller.tick(unix_ms()), STALE);
         assert_eq!(requests(&seen), 0);
         assert_eq!(lines.lock().unwrap()[0], State::NoToken.line());
     }
@@ -690,7 +714,7 @@ mod tests {
         let t = unix_ms();
         poller.tick(t);
         poller.tick(t + 16 * MIN);
-        assert!(poller.tick(t + 32 * MIN).is_none());
+        poller.tick(t + 32 * MIN);
         let lines = lines.lock().unwrap();
         assert_eq!(lines.len(), 3, "one line per change of state");
         let seen = format!("{lines:?} {:?}", cell.snapshot());
@@ -727,16 +751,202 @@ mod tests {
         );
     }
 
+    /// A token the test can rotate.
+    struct Rotating(Arc<Mutex<Option<String>>>);
+    impl TokenSource for Rotating {
+        fn read(&self) -> Option<Zeroizing<String>> {
+            self.0.lock().unwrap().clone().map(Zeroizing::new)
+        }
+    }
+
     #[test]
-    fn run_polls_until_the_endpoint_refuses_then_returns() {
-        let (url, seen) = serve(vec![http("403 Forbidden", "", "{}")]);
+    fn a_refused_token_is_not_sent_again_until_it_changes() {
+        let (url, seen) = serve(vec![
+            http("403 Forbidden", "", "{}"),
+            http("200 OK", "", &body("null", &reading(35.0))),
+        ]);
+        let token = Arc::new(Mutex::new(Some("first".to_string())));
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let sink = lines.clone();
         let cell = Arc::new(QuotaCell::new());
-        let (poller, lines) = make_poller(&cell, &url, Some(CANARY));
-        poller.run();
+        let mut poller = Poller::new(
+            cell.clone(),
+            Box::new(Rotating(token.clone())),
+            UsageClient::new(&url),
+            Box::new(move |line| sink.lock().unwrap().push(line.to_string())),
+        );
+        let t = unix_ms();
+        poller.tick(t);
         assert_eq!(requests(&seen), 1);
-        let lines = lines.lock().unwrap();
-        assert_eq!(lines.len(), 1);
-        assert!(lines[0].contains("user:profile"), "{lines:?}");
+        assert!(lines.lock().unwrap()[0].contains("user:profile"));
+        // The same token, a quarter hour on and again: the endpoint is not asked.
+        assert_eq!(poller.tick(t + 16 * MIN), STALE);
+        poller.tick(t + 32 * MIN);
+        assert_eq!(requests(&seen), 1);
+        assert_eq!(lines.lock().unwrap().len(), 1, "one state, one line");
+        // A credential that vanishes does not count as a new one.
+        *token.lock().unwrap() = None;
+        poller.tick(t + 48 * MIN);
+        assert_eq!(requests(&seen), 1);
+        // A rotated credential is tried at the next due time.
+        *token.lock().unwrap() = Some("second".to_string());
+        poller.tick(t + 64 * MIN);
+        assert_eq!(requests(&seen), 2);
+        assert!(window(&cell, "seven_day").is_some());
+        assert_eq!(lines.lock().unwrap()[1], State::Polled.line());
+    }
+
+    #[test]
+    fn retry_after_reads_seconds_and_http_dates() {
+        const DATE: &str = "Wed, 21 Oct 2026 07:28:00 GMT";
+        let at = chrono::DateTime::parse_from_rfc2822(DATE)
+            .unwrap()
+            .timestamp_millis() as u64;
+        let three_hours = 3 * 3600 * 1000;
+        assert_eq!(retry_after(DATE, at - three_hours), Some(secs(3 * 3600)));
+        assert_eq!(retry_after(DATE, at), Some(Duration::ZERO));
+        assert_eq!(retry_after(DATE, at + 1), Some(Duration::ZERO), "past");
+        assert_eq!(retry_after("3600", at), Some(secs(3600)));
+        assert_eq!(retry_after(" 3600 ", at), Some(secs(3600)));
+        for bad in ["", "soon", "-5", "3600.5", "1, 2", "Wed, 21 Oct 2026"] {
+            assert_eq!(retry_after(bad, at), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn keys_beyond_the_two_plan_windows_are_not_windows() {
+        let populated = reading(77.0);
+        let body = format!(
+            r#"{{"five_hour":{},"seven_day":{},"seven_day_opus":{populated},"seven_day_sonnet":{populated},"extra_usage":{populated}}}"#,
+            reading(6.0),
+            reading(35.0)
+        );
+        let names: Vec<_> = parse_usage(&body)
+            .unwrap()
+            .into_iter()
+            .map(|quota| quota.window)
+            .collect();
+        assert_eq!(names, ["five_hour", "seven_day"]);
+    }
+
+    #[test]
+    fn a_redirect_is_not_followed_with_the_token() {
+        let (target, target_seen) = serve(vec![http("200 OK", "", &body("null", &reading(35.0)))]);
+        let (url, _) = serve(vec![http(
+            "302 Found",
+            &format!("Location: {target}\r\n"),
+            "",
+        )]);
+        let cell = Arc::new(QuotaCell::new());
+        let (mut poller, lines) = make_poller(&cell, &url, Some(CANARY));
+        poller.tick(unix_ms());
+        assert_eq!(requests(&target_seen), 0, "the redirect target was asked");
+        assert!(cell.snapshot().windows.is_empty());
+        assert_eq!(lines.lock().unwrap()[0], State::Unexpected.line());
+    }
+
+    #[test]
+    fn a_silent_endpoint_frees_the_poll_at_its_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/u", listener.local_addr().unwrap());
+        let holder = std::thread::spawn(move || {
+            // Accept, say nothing, keep the connection open.
+            let held = listener.accept();
+            std::thread::sleep(Duration::from_secs(3));
+            drop(held);
+        });
+        let started = std::time::Instant::now();
+        let answer = UsageClient::with_timeout(url, Duration::from_millis(300))
+            .ask(&Zeroizing::new(CANARY.to_string()));
+        assert_eq!(answer, Answer::Unreachable);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        holder.join().unwrap();
+    }
+
+    #[test]
+    fn the_real_timeout_frees_the_thread_within_a_minute() {
+        assert!(TIMEOUT >= secs(1) && TIMEOUT <= secs(60), "{TIMEOUT:?}");
+    }
+
+    /// Answers one connection after `delay`, as a slow endpoint does.
+    fn serve_slowly(delay: Duration, reply: String) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/api/oauth/usage", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut request = vec![0u8; 4096];
+            let _ = stream.read(&mut request);
+            std::thread::sleep(delay);
+            let _ = stream.write_all(reply.as_bytes());
+        });
+        url
+    }
+
+    fn stream_event(window: &str, permille: u32, status: &str) -> PlanQuota {
+        PlanQuota {
+            status: status.to_string(),
+            ..stream_reading(window, permille)
+        }
+    }
+
+    /// The stream speaks while a poll is in flight; the poll then answers
+    /// with a reading older than the stream's. Returns the cell after both.
+    fn stream_speaks_while_the_poll_is_in_flight(status: &str) -> Arc<QuotaCell> {
+        let url = serve_slowly(
+            Duration::from_millis(500),
+            http("200 OK", "", &body(&reading(50.0), &reading(35.0))),
+        );
+        let cell = Arc::new(QuotaCell::new());
+        let (mut poller, _) = make_poller(&cell, &url, Some(CANARY));
+        std::thread::scope(|scope| {
+            let polling = scope.spawn(|| poller.tick(unix_ms()));
+            std::thread::sleep(Duration::from_millis(150));
+            cell.observe([stream_event("five_hour", 1000, status)]);
+            polling.join().unwrap();
+        });
+        cell
+    }
+
+    #[test]
+    fn a_poll_answered_late_does_not_replace_what_the_stream_saw_meanwhile() {
+        let cell = stream_speaks_while_the_poll_is_in_flight("allowed");
+        let five = window(&cell, "five_hour").unwrap();
+        assert_eq!(
+            (five.status.as_str(), five.utilization_permille),
+            ("allowed", Some(1000))
+        );
+        let seven = window(&cell, "seven_day").unwrap();
+        assert_eq!(
+            (seven.status.as_str(), seven.utilization_permille),
+            ("polled", Some(350)),
+            "the window the stream did not name takes the poll's reading"
+        );
+    }
+
+    #[test]
+    fn a_slow_poll_cannot_lift_the_rejection_the_stream_reported_meanwhile() {
+        let cell = stream_speaks_while_the_poll_is_in_flight("rejected");
+        let five = window(&cell, "five_hour").unwrap();
+        assert_eq!(
+            (five.status.as_str(), five.utilization_permille),
+            ("rejected", Some(1000))
+        );
+    }
+
+    #[test]
+    fn a_later_poll_does_not_lift_a_rejection_the_provider_reported_earlier() {
+        let (url, _) = serve(vec![http("200 OK", "", &body(&reading(50.0), "null"))]);
+        let cell = Arc::new(QuotaCell::new());
+        cell.observe([stream_event("five_hour", 1000, "rejected")]);
+        let (mut poller, _) = make_poller(&cell, &url, Some(CANARY));
+        poller.tick(unix_ms() + MIN);
+        let five = window(&cell, "five_hour").unwrap();
+        assert_eq!(
+            (five.status.as_str(), five.utilization_permille),
+            ("rejected", Some(1000))
+        );
     }
 
     #[test]
