@@ -393,14 +393,15 @@ fn unix_ms() -> u64 {
 
 /// Starts the poll thread. It reads the token afresh at each poll, writes
 /// only to `cell`, and logs one line to stderr when its state changes.
-pub fn start(
+pub(crate) fn start(
     cell: Arc<QuotaCell>,
     tokens: Box<dyn TokenSource>,
+    client: UsageClient,
 ) -> std::io::Result<std::thread::JoinHandle<()>> {
     let poller = Poller::new(
         cell,
         tokens,
-        UsageClient::production(),
+        client,
         Box::new(|line| eprintln!("claude-connector: {line}")),
     );
     std::thread::Builder::new()

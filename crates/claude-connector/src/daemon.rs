@@ -22,6 +22,8 @@ use crate::backend::readiness;
 use crate::lease::{LeaseCaller, LeaseLimits, serve_leases, user_uid};
 #[cfg(target_os = "linux")]
 use crate::unit::SystemdUnits;
+#[cfg(unix)]
+use crate::usage_poll::UsageClient;
 use crate::{
     ClaudeCodeBackend, ClaudeCodeConfig, ClaudeCodeLimits, CredentialTokenSource, StderrSink,
 };
@@ -535,6 +537,13 @@ pub fn check_ready(config: &ClaudeConnectorConfig) -> Result<(), ConfigError> {
 /// Loads the document and serves until the listener fails.
 #[cfg(unix)]
 pub fn serve_config(path: &Path) -> Result<(), ConfigError> {
+    serve_config_with(path, UsageClient::production())
+}
+
+/// [`serve_config`] with the usage poll asking `usage`: the endpoint is not a
+/// setting of the document, so a test reaches it only through here.
+#[cfg(unix)]
+fn serve_config_with(path: &Path, usage: UsageClient) -> Result<(), ConfigError> {
     let config = load_config(path)?;
     let admissions = readiness_of(&config)?;
     let listen = config.validate()?;
@@ -561,6 +570,7 @@ pub fn serve_config(path: &Path) -> Result<(), ConfigError> {
         Box::new(CredentialTokenSource::from_environment(
             config.token_credential.clone(),
         )),
+        usage,
     )
     .map_err(|_| ConfigError::Serving("usage poll"))?;
     serve_service(listener, config.serve_limits(), service, backend)?;
@@ -570,6 +580,8 @@ pub fn serve_config(path: &Path) -> Result<(), ConfigError> {
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
+
+    use sha2::Digest;
 
     use super::*;
 
@@ -585,6 +597,96 @@ mod tests {
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
+    }
+
+    /// `serve` starts the usage poll beside the listener, and the poll asks
+    /// where it was told: a fake on loopback receives its request, bearer
+    /// token and all, and nothing reaches the provider.
+    #[cfg(unix)]
+    #[test]
+    fn serve_config_starts_the_usage_poll_and_stays_up() {
+        use std::io::{Read, Write};
+        use std::os::unix::fs::PermissionsExt;
+
+        const TOKEN: &str = "sk-ant-oat01-fake-token-for-the-serve-test";
+        let dir =
+            std::env::temp_dir().join(format!("claude-connector-serve-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let at = |name: &str| dir.join(name);
+        for sub in ["work", "home", "prompts", "credentials"] {
+            std::fs::create_dir_all(at(sub)).unwrap();
+        }
+        std::fs::set_permissions(at("prompts"), std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(at("claude"), b"not a real claude binary").unwrap();
+        std::fs::write(at("caller.key"), "k".repeat(48)).unwrap();
+        std::fs::write(at("credentials/claude-token"), TOKEN).unwrap();
+        std::fs::write(at("credentials/claude-handle-secret"), "s".repeat(48)).unwrap();
+        let config = ClaudeConnectorConfig {
+            listen: "127.0.0.1:0".to_string(),
+            replay_store: at("replay.cc"),
+            claude_binary: at("claude"),
+            claude_binary_sha256: sha2::Sha256::digest(b"not a real claude binary").into(),
+            work_dir: at("work"),
+            config_dir: at("home"),
+            prompt_dir: at("prompts"),
+            instance: "persona-a".to_string(),
+            token_credential: "claude-token".to_string(),
+            handle_secret_credential: "claude-handle-secret".to_string(),
+            deadline_ms: 600_000,
+            max_line_bytes: 4 << 20,
+            max_total_bytes: 64 << 20,
+            stderr_tail_bytes: 8192,
+            max_frame_bytes: 2 << 20,
+            max_connections: 8,
+            socket_timeout_ms: 10_000,
+            max_expiry_skew_ms: 300_000,
+            callers: vec![CallerConfig {
+                caller_runtime_id: "persona-a-caller".to_string(),
+                connection_key_file: at("caller.key"),
+                connection_key_epoch: 1,
+                allowed_models: vec!["claude-haiku-5-5".to_string()],
+                max_concurrent_requests: 4,
+                max_payload_bytes: 1 << 20,
+                max_output_tokens: 32_768,
+            }],
+            lease_socket: None,
+            lease_callers: Vec::new(),
+            lease_max_ms: 3_600_000,
+        };
+        write_config(&at("connector.cc"), &config).unwrap();
+        // SAFETY: set once, to a directory only this test reads, before the
+        // serve thread it starts.
+        unsafe { std::env::set_var("CREDENTIALS_DIRECTORY", at("credentials")) };
+
+        let fake = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/api/oauth/usage", fake.local_addr().unwrap());
+        let (asked, request) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut stream, _) = fake.accept().unwrap();
+            let mut text = vec![0u8; 4096];
+            let n = stream.read(&mut text).unwrap();
+            let _ = asked.send(String::from_utf8_lossy(&text[..n]).into_owned());
+            let _ = stream.write_all(
+                b"HTTP/1.1 429 Too Many Requests
+Content-Length: 0
+Connection: close
+
+",
+            );
+        });
+        let path = at("connector.cc");
+        let served = std::thread::spawn(move || serve_config_with(&path, UsageClient::new(url)));
+
+        let request = request
+            .recv_timeout(Duration::from_secs(60))
+            .expect("the usage poll never asked the fake endpoint");
+        assert!(request.starts_with("GET /api/oauth/usage "), "{request}");
+        assert!(request.contains(&format!("Bearer {TOKEN}")), "{request}");
+        assert!(
+            !served.is_finished(),
+            "serve returned after starting the poll"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
