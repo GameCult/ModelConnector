@@ -484,7 +484,11 @@ mod tests {
 
     type Lines = Arc<Mutex<Vec<String>>>;
 
-    fn poller(cell: &Arc<QuotaCell>, url: &str, token: Option<&'static str>) -> (Poller, Lines) {
+    fn make_poller(
+        cell: &Arc<QuotaCell>,
+        url: &str,
+        token: Option<&'static str>,
+    ) -> (Poller, Lines) {
         let lines = Arc::new(Mutex::new(Vec::new()));
         let sink = lines.clone();
         let poller = Poller::new(
@@ -525,7 +529,7 @@ mod tests {
             &body(&reading(6.0), &reading(35.0)),
         )]);
         let cell = Arc::new(QuotaCell::new());
-        let (mut poller, lines) = poller(&cell, &url, Some(CANARY));
+        let (mut poller, lines) = make_poller(&cell, &url, Some(CANARY));
         let wait = poller.tick(unix_ms()).unwrap();
         let windows = cell.snapshot().windows;
         assert_eq!(windows.len(), 2);
@@ -545,7 +549,7 @@ mod tests {
     fn stale_only_polls() {
         let (url, seen) = serve(vec![http("200 OK", "", &body("null", &reading(35.0))); 3]);
         let cell = Arc::new(QuotaCell::new());
-        let (mut poller, _) = poller(&cell, &url, Some(CANARY));
+        let (mut poller, _) = make_poller(&cell, &url, Some(CANARY));
         poller.tick(unix_ms());
         assert_eq!(requests(&seen), 1, "the startup poll");
         let observed = window(&cell, "seven_day").unwrap().observed_at_unix_ms;
@@ -569,7 +573,7 @@ mod tests {
     fn a_reading_is_stale_at_exactly_fifteen_minutes() {
         let (url, seen) = serve(vec![http("200 OK", "", &body("null", &reading(35.0))); 2]);
         let cell = Arc::new(QuotaCell::new());
-        let (mut poller, _) = poller(&cell, &url, Some(CANARY));
+        let (mut poller, _) = make_poller(&cell, &url, Some(CANARY));
         poller.tick(unix_ms());
         let observed = window(&cell, "seven_day").unwrap().observed_at_unix_ms;
         poller.tick(observed + 15 * MIN);
@@ -580,7 +584,7 @@ mod tests {
     fn a_stream_observation_keeps_the_poll_quiet() {
         let (url, seen) = serve(vec![http("200 OK", "", &body("null", &reading(35.0)))]);
         let cell = Arc::new(QuotaCell::new());
-        let (mut poller, _) = poller(&cell, &url, Some(CANARY));
+        let (mut poller, _) = make_poller(&cell, &url, Some(CANARY));
         poller.tick(unix_ms());
         std::thread::sleep(Duration::from_millis(20));
         // The stream reports seven_day afresh, after the poll.
@@ -618,7 +622,7 @@ mod tests {
                 stream_reading("seven_day", 300),
             ]);
             let before = cell.snapshot();
-            let (mut poller, lines) = poller(&cell, &url, Some(CANARY));
+            let (mut poller, lines) = make_poller(&cell, &url, Some(CANARY));
             let wait = poller.tick(unix_ms());
             assert_eq!(cell.snapshot(), before, "{reply}");
             assert_eq!(wait.map(|w| w.as_secs() / 60), minutes, "{reply}");
@@ -637,13 +641,13 @@ mod tests {
             .port();
         let cell = Arc::new(QuotaCell::new());
         let (mut poller, lines) =
-            poller(&cell, &format!("http://127.0.0.1:{port}/u"), Some(CANARY));
+            make_poller(&cell, &format!("http://127.0.0.1:{port}/u"), Some(CANARY));
         assert_eq!(poller.tick(unix_ms()), Some(STALE));
         assert!(cell.snapshot().windows.is_empty());
         assert_eq!(lines.lock().unwrap().len(), 1);
 
         let (url, seen) = serve(vec![http("200 OK", "", "{}")]);
-        let (mut poller, lines) = poller(&cell, &url, None);
+        let (mut poller, lines) = make_poller(&cell, &url, None);
         assert_eq!(poller.tick(unix_ms()), Some(STALE));
         assert_eq!(requests(&seen), 0);
         assert_eq!(lines.lock().unwrap()[0], State::NoToken.line());
@@ -658,7 +662,7 @@ mod tests {
             http("200 OK", "", &body("null", &reading(35.0))),
         ]);
         let cell = Arc::new(QuotaCell::new());
-        let (mut poller, lines) = poller(&cell, &url, Some(CANARY));
+        let (mut poller, lines) = make_poller(&cell, &url, Some(CANARY));
         let t = unix_ms();
         poller.tick(t);
         poller.tick(t + 16 * MIN);
@@ -682,7 +686,7 @@ mod tests {
             http("403 Forbidden", "", CANARY),
         ]);
         let cell = Arc::new(QuotaCell::new());
-        let (mut poller, lines) = poller(&cell, &url, Some(CANARY));
+        let (mut poller, lines) = make_poller(&cell, &url, Some(CANARY));
         let t = unix_ms();
         poller.tick(t);
         poller.tick(t + 16 * MIN);
@@ -701,7 +705,7 @@ mod tests {
             &body(&reading(6.0), &reading(35.0)),
         )]);
         let cell = Arc::new(QuotaCell::new());
-        let (mut poller, _) = poller(&cell, &url, Some(CANARY));
+        let (mut poller, _) = make_poller(&cell, &url, Some(CANARY));
         poller.tick(unix_ms());
         assert_eq!(window(&cell, "five_hour").unwrap().status, "polled");
         // A later stream reading of one window replaces the poll's; the other
@@ -715,15 +719,11 @@ mod tests {
         assert_eq!(window(&cell, "seven_day").unwrap().status, "polled");
         // And a later poll replaces the stream's.
         let (url, _) = serve(vec![http("200 OK", "", &body(&reading(7.0), "null"))]);
-        let (mut again, _) = poller_at(&cell, &url);
+        let (mut again, _) = make_poller(&cell, &url, Some(CANARY));
         again.tick(unix_ms());
         assert_eq!(
             window(&cell, "five_hour").unwrap().utilization_permille,
             Some(70)
         );
-    }
-
-    fn poller_at(cell: &Arc<QuotaCell>, url: &str) -> (Poller, Lines) {
-        poller(cell, url, Some(CANARY))
     }
 }
