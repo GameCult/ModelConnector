@@ -141,13 +141,20 @@ fn parse_usage(body: &str) -> Option<Vec<PlanQuota>> {
 
 /// The blocking HTTPS client: 10 s end to end, no redirects (the token must
 /// not follow one anywhere).
-struct UsageClient {
+pub(crate) struct UsageClient {
     agent: ureq::Agent,
     url: String,
+    timeout: Duration,
 }
 
 impl UsageClient {
-    fn new(url: impl Into<String>) -> Self {
+    /// The client that asks the provider's usage endpoint.
+    pub(crate) fn production() -> Self {
+        Self::new(ENDPOINT)
+    }
+
+    /// A client for another endpoint: a test's fake server.
+    pub(crate) fn new(url: impl Into<String>) -> Self {
         Self::with_timeout(url, TIMEOUT)
     }
 
@@ -158,6 +165,7 @@ impl UsageClient {
                 .redirects(0)
                 .build(),
             url: url.into(),
+            timeout,
         }
     }
 
@@ -392,7 +400,7 @@ pub fn start(
     let poller = Poller::new(
         cell,
         tokens,
-        UsageClient::new(ENDPOINT),
+        UsageClient::production(),
         Box::new(|line| eprintln!("claude-connector: {line}")),
     );
     std::thread::Builder::new()
@@ -962,8 +970,11 @@ mod tests {
     }
 
     #[test]
-    fn the_real_timeout_frees_the_thread_within_a_minute() {
-        assert!(TIMEOUT >= secs(1) && TIMEOUT <= secs(60), "{TIMEOUT:?}");
+    fn the_production_client_asks_the_provider_and_gives_up_after_ten_seconds() {
+        let client = UsageClient::production();
+        assert_eq!(client.url, "https://api.anthropic.com/api/oauth/usage");
+        assert_eq!(client.timeout, secs(10));
+        assert_eq!(TIMEOUT, secs(10));
     }
 
     /// Answers one connection after `delay`, as a slow endpoint does.
