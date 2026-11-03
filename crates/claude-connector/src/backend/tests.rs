@@ -2160,7 +2160,7 @@ fn rate_limit_event_updates_quota_cell() {
 
 #[test]
 fn a_rejected_turn_still_reports_its_windows_and_a_bad_window_costs_only_itself() {
-    let event = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","unifiedWindows":{"five_hour":{"utilization":0.9996,"resetsAt":4102444800,"status":"rejected"},"seven_day":{"resetsAt":4102531200,"status":"allowed"},"idle":{"utilization":0,"resetsAt":4102444800,"status":"allowed"},"odd":{"utilization":"high","resetsAt":1,"status":"allowed"},"negative":{"utilization":-0.5,"resetsAt":1,"status":"allowed"}}}}"#;
+    let event = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","unifiedWindows":{"five_hour":{"utilization":0.9996,"resetsAt":4102444800,"status":"rejected"},"seven_day":{"utilization":0,"resetsAt":4102531200,"status":"allowed"},"seven_day_overage_included":{"utilization":1,"resetsAt":4102531200,"status":"rejected"},"idle":{"utilization":0,"resetsAt":4102444800,"status":"allowed"}}}}"#;
     let rig = rig(vec![Script::lines(vec![
         init_line(MODEL, SESSION),
         event.to_string(),
@@ -2170,12 +2170,12 @@ fn a_rejected_turn_still_reports_its_windows_and_a_bad_window_costs_only_itself(
     assert_eq!(kind, FailureKind::RateLimited);
     let mut rejected = window("five_hour", 1000, 4_102_444_800_000);
     rejected.status = "rejected".to_string();
-    // Unknown is never zero: a window missing a field or of another type is
-    // skipped, not read as empty.
-    // A window at exactly zero use is a reading, and is kept.
+    // A window at exactly zero use is a reading, and is kept. Only the two
+    // windows pacing reads are taken: a per-model bucket that reads rejected
+    // must not close every lease, and no other name is a window of the plan.
     assert_eq!(
         readings(&rig),
-        vec![rejected, window("idle", 0, 4_102_444_800_000)]
+        vec![rejected, window("seven_day", 0, 4_102_531_200_000)]
     );
 }
 
@@ -2745,4 +2745,48 @@ fn a_turn_after_a_schema_turn_is_seeded_not_resumed() {
     let argv = rig.seen().argv;
     assert!(!argv.iter().any(|a| a == "--resume"), "{argv:?}");
     assert!(!argv.iter().any(|a| a == "--json-schema"));
+}
+
+// ---- the meter's call ----
+
+/// One real call of the pinned CLI (2.1.312), captured on Yggdrasil on
+/// 2026-11-03 with the connector's own argv: haiku, no tools, the trivial
+/// prompt. Its `rate_limit_event` names only the week.
+const METER_CALL: &str = include_str!("../../tests/fixtures/claude-2.1.312-meter-call.jsonl");
+
+#[test]
+fn the_meter_call_reads_the_week_from_a_real_captured_event() {
+    let rig = rig(vec![Script::lines(
+        METER_CALL.lines().map(str::to_string).collect(),
+    )]);
+    let usage = rig
+        .backend
+        .read_meter()
+        .expect("the captured call completes");
+    assert_eq!((usage.input_tokens, usage.output_tokens), (384, 4));
+    // 0.06 of the week used; it resets at 1794261600 (unix s).
+    assert_eq!(
+        readings(&rig),
+        vec![window("seven_day", 60, 1_794_261_600_000)]
+    );
+    let argv = rig.seen().argv;
+    let after = |flag: &str| argv[argv.iter().position(|a| a == flag).unwrap() + 1].clone();
+    assert_eq!(after("--model"), METER_MODEL);
+    assert_eq!(after("--tools"), "", "the call can use no tool");
+    assert!(
+        argv.iter().any(|a| a == "--no-session-persistence"),
+        "the meter's transcript is nobody's to keep: {argv:?}"
+    );
+    assert_eq!(rig.spawns(), 1, "one child, never run again");
+}
+
+#[test]
+fn a_failed_meter_call_names_its_kind_and_leaves_the_cell_alone() {
+    let rig = rig(vec![Script::lines(vec![
+        init_line(MODEL, SESSION),
+        error_result_line(r#","api_error_status":500"#),
+    ])]);
+    let failed = rig.backend.read_meter().expect_err("the call fails");
+    assert!(!failed.is_empty() && !failed.contains(' '), "{failed}");
+    assert!(quota_of(&rig).windows.is_empty());
 }

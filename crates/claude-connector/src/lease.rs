@@ -468,8 +468,14 @@ impl Lender {
             );
         }
         // The lease is claimed before the token is read, let alone lent. The
-        // plan the refusal reads is the one this process last observed.
-        let plan = self.quota.snapshot();
+        // plan the refusal reads is the one this process last observed, but a
+        // cell with no weekly reading (a restart empties it) gets the meter's
+        // first read, bounded, before the lease is lent "unobserved" for its
+        // whole life. The request is the swarm's sign of life, however it
+        // ends: the meter reads while one is held or lately asked for.
+        let _asking = self.quota.asking();
+        let plan = self.quota.snapshot_with_week(FIRST_READ_WAIT);
+        let now = unix_ms();
         let admission = self
             .service
             .lock()
@@ -602,6 +608,10 @@ impl Lender {
         }
     }
 }
+
+/// The longest a lease waits for the meter's first read of the week. A call
+/// takes a few seconds; the holder's own wait for the grant is far longer.
+const FIRST_READ_WAIT: Duration = Duration::from_secs(10);
 
 /// How often a held lease looks again at its holder's unit invocation.
 const HOLD_POLL_MS: u64 = 500;

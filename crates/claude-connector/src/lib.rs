@@ -10,12 +10,12 @@ mod handle;
 mod launch;
 #[cfg(target_os = "linux")]
 mod lease;
+mod meter;
 mod process;
 mod quota;
 mod stream;
 #[cfg(target_os = "linux")]
 mod unit;
-mod usage_poll;
 
 pub use backend::{ClaudeCodeBackend, CredentialTokenSource, StderrSink, TokenSource};
 pub use config::{ClaudeCodeConfig, ClaudeCodeLimits};
