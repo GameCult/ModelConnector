@@ -67,7 +67,7 @@ impl QuotaCell {
         self.asking_at(unix_ms())
     }
 
-    fn asking_at(self: &Arc<Self>, now: u64) -> Asking {
+    pub(crate) fn asking_at(self: &Arc<Self>, now: u64) -> Asking {
         {
             let mut asks = self.asks.lock().unwrap_or_else(|e| e.into_inner());
             asks.live += 1;
