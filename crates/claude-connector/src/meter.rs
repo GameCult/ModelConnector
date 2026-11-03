@@ -464,6 +464,23 @@ mod tests {
         assert_eq!(rig.meter.misses, 1);
     }
 
+    #[test]
+    fn the_log_says_what_the_meter_is_doing_in_words() {
+        assert_eq!(
+            State::Braked.line(),
+            "meter: swarm brake held, making no call"
+        );
+        assert_eq!(State::Read.line(), "meter: weekly reading refreshed");
+    }
+
+    #[test]
+    fn the_clock_is_the_system_clock_in_unix_milliseconds() {
+        let before = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+        let read = unix_ms();
+        let after = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+        assert!((before.as_millis() as u64..=after.as_millis() as u64).contains(&read));
+    }
+
     // ---- the brake store, read as the operator's tool writes it ----
 
     /// The swarm store as it stood on Yggdrasil on 2026-11-03 (released),
