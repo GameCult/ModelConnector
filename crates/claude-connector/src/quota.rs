@@ -33,7 +33,7 @@ impl QuotaCell {
     /// held one is dropped, so a slow call cannot replace what a faster one
     /// saw meanwhile. Windows the readings did not mention stay as they were,
     /// stamp included.
-(&self, at: u64, windows: impl IntoIterator<Item = PlanQuota>) {
+    pub fn observe_at(&self, at: u64, windows: impl IntoIterator<Item = PlanQuota>) {
         let mut held = self.0.lock().unwrap_or_else(|e| e.into_inner());
         for mut quota in windows {
             quota.observed_at_unix_ms = at;
