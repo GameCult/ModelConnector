@@ -20,6 +20,12 @@ use crate::process::{ProcessPort, RunningChild, StdoutRead};
 use crate::quota::QuotaCell;
 use crate::stream::{Failure, Finished, Step, StreamState};
 
+/// The meter's call: the cheapest model, a trivial prompt, and an answer cap
+/// that only bounds a runaway.
+const METER_MODEL: &str = "claude-haiku-5-5";
+const METER_CALLER: &str = "meter";
+const METER_MAX_OUTPUT_TOKENS: u32 = 16;
+
 /// Where the child's credential comes from, read afresh at every use. The
 /// connector's own environment is never a source (ruling
 /// claude-connector-token-credential).
@@ -154,6 +160,27 @@ impl ClaudeCodeBackend {
     /// The plan windows every stream this backend reads feeds.
     pub fn quota(&self) -> Arc<QuotaCell> {
         self.quota.clone()
+    }
+
+    /// The meter's call: the smallest real one, through the same child,
+    /// stream and cell as any other. The stream's `rate_limit_event` is what
+    /// the caller wants; this returns what the call billed, or the failure's
+    /// kind (never its message).
+    pub(crate) fn read_meter(&self) -> Result<Usage, String> {
+        let mut request = ProviderRequest::new(
+            METER_CALLER,
+            METER_CALLER,
+            METER_MODEL,
+            "Reply with the single word ok.",
+            METER_MAX_OUTPUT_TOKENS,
+        );
+        request.input = vec![InputItem::UserText {
+            text: "ok?".to_string(),
+        }];
+        match self.run(&request, METER_CALLER).1 {
+            TransportOutcome::Completed { usage, .. } => Ok(usage),
+            TransportOutcome::Failed { kind, .. } => Err(format!("{kind:?}")),
+        }
     }
 
     /// The one pin check: `ready` and every spawn use it, and nothing caches

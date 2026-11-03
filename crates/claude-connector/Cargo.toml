@@ -13,7 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
-chrono = { version = "0.4", default-features = false }
+chrono = { version = "0.4", default-features = false, features = ["serde"] }
 hmac = "0.12"
 cultcache-rs = { git = "https://github.com/GameCult/CultLib.git", rev = "a4eae9056152335662f1115f97bf35fb00ab6d23", package = "cultcache-rs" }
 model-connector = { path = "../model-connector", features = ["daemon"] }
@@ -22,7 +22,6 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 thiserror = "2"
-ureq = { version = "2", default-features = false, features = ["tls"] }
 zeroize = "1"
 
 [target.'cfg(unix)'.dependencies]

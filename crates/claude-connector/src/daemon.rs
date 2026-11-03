@@ -23,7 +23,7 @@ use crate::lease::{LeaseCaller, LeaseLimits, serve_leases, user_uid};
 #[cfg(target_os = "linux")]
 use crate::unit::SystemdUnits;
 #[cfg(unix)]
-use crate::usage_poll::UsageClient;
+use crate::meter::{SWARM_BRAKE_STORE, SwarmBrakeStore};
 use crate::{
     ClaudeCodeBackend, ClaudeCodeConfig, ClaudeCodeLimits, CredentialTokenSource, StderrSink,
 };
@@ -537,13 +537,14 @@ pub fn check_ready(config: &ClaudeConnectorConfig) -> Result<(), ConfigError> {
 /// Loads the document and serves until the listener fails.
 #[cfg(unix)]
 pub fn serve_config(path: &Path) -> Result<(), ConfigError> {
-    serve_config_with(path, UsageClient::production())
+    serve_config_with(path, Path::new(SWARM_BRAKE_STORE))
 }
 
-/// [`serve_config`] with the usage poll asking `usage`: the endpoint is not a
-/// setting of the document, so a test reaches it only through here.
+/// [`serve_config`] with the meter reading the swarm brake at `brake_store`:
+/// the brake's place is not a setting of the document, so a test reaches it
+/// only through here.
 #[cfg(unix)]
-fn serve_config_with(path: &Path, usage: UsageClient) -> Result<(), ConfigError> {
+fn serve_config_with(path: &Path, brake_store: &Path) -> Result<(), ConfigError> {
     let config = load_config(path)?;
     let admissions = readiness_of(&config)?;
     let listen = config.validate()?;
@@ -565,14 +566,12 @@ fn serve_config_with(path: &Path, usage: UsageClient) -> Result<(), ConfigError>
     if let Some(socket) = &config.lease_socket {
         start_leases(&config, socket, service.clone(), backend.quota())?;
     }
-    crate::usage_poll::start(
+    crate::meter::start(
         backend.quota(),
-        Box::new(CredentialTokenSource::from_environment(
-            config.token_credential.clone(),
-        )),
-        usage,
+        Box::new(backend.clone()),
+        Box::new(SwarmBrakeStore::new(brake_store)),
     )
-    .map_err(|_| ConfigError::Serving("usage poll"))?;
+    .map_err(|_| ConfigError::Serving("meter"))?;
     serve_service(listener, config.serve_limits(), service, backend)?;
     Ok(())
 }
@@ -599,16 +598,16 @@ mod tests {
         }
     }
 
-    /// `serve` starts the usage poll beside the listener, and the poll asks
-    /// where it was told: a fake on loopback receives its request, bearer
-    /// token and all, and nothing reaches the provider.
+    /// `serve` starts the meter beside the listener: with a released brake and
+    /// no reading of the week, the meter runs the claude binary once and serve
+    /// stays up. The binary is a script that replays a real captured call.
     #[cfg(unix)]
     #[test]
-    fn serve_config_starts_the_usage_poll_and_stays_up() {
-        use std::io::{Read, Write};
+    fn serve_config_starts_the_meter_and_stays_up() {
         use std::os::unix::fs::PermissionsExt;
 
-        const TOKEN: &str = "sk-ant-oat01-fake-token-for-the-serve-test";
+        const CALL: &str = include_str!("../tests/fixtures/claude-2.1.312-meter-call.jsonl");
+        const BRAKE: &[u8] = include_bytes!("../tests/fixtures/swarm-brake-live-2026-11-03.cc");
         let dir =
             std::env::temp_dir().join(format!("claude-connector-serve-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -617,15 +616,23 @@ mod tests {
             std::fs::create_dir_all(at(sub)).unwrap();
         }
         std::fs::set_permissions(at("prompts"), std::fs::Permissions::from_mode(0o700)).unwrap();
-        std::fs::write(at("claude"), b"not a real claude binary").unwrap();
+        std::fs::write(at("call.jsonl"), CALL).unwrap();
+        let script = format!(
+            "#!/bin/sh\ncat > /dev/null\necho spawned >> '{}'\ncat '{}'\n",
+            at("spawned").display(),
+            at("call.jsonl").display()
+        );
+        std::fs::write(at("claude"), &script).unwrap();
+        std::fs::set_permissions(at("claude"), std::fs::Permissions::from_mode(0o755)).unwrap();
         std::fs::write(at("caller.key"), "k".repeat(48)).unwrap();
-        std::fs::write(at("credentials/claude-token"), TOKEN).unwrap();
+        std::fs::write(at("swarm.cc"), BRAKE).unwrap();
+        std::fs::write(at("credentials/claude-token"), "sk-ant-oat01-fake-token").unwrap();
         std::fs::write(at("credentials/claude-handle-secret"), "s".repeat(48)).unwrap();
         let config = ClaudeConnectorConfig {
             listen: "127.0.0.1:0".to_string(),
             replay_store: at("replay.cc"),
             claude_binary: at("claude"),
-            claude_binary_sha256: sha2::Sha256::digest(b"not a real claude binary").into(),
+            claude_binary_sha256: sha2::Sha256::digest(script.as_bytes()).into(),
             work_dir: at("work"),
             config_dir: at("home"),
             prompt_dir: at("prompts"),
@@ -658,34 +665,19 @@ mod tests {
         // serve thread it starts.
         unsafe { std::env::set_var("CREDENTIALS_DIRECTORY", at("credentials")) };
 
-        let fake = TcpListener::bind("127.0.0.1:0").unwrap();
-        let url = format!("http://{}/api/oauth/usage", fake.local_addr().unwrap());
-        let (asked, request) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let (mut stream, _) = fake.accept().unwrap();
-            let mut text = vec![0u8; 4096];
-            let n = stream.read(&mut text).unwrap();
-            let _ = asked.send(String::from_utf8_lossy(&text[..n]).into_owned());
-            let _ = stream.write_all(
-                b"HTTP/1.1 429 Too Many Requests
-Content-Length: 0
-Connection: close
-
-",
-            );
-        });
         let path = at("connector.cc");
-        let served = std::thread::spawn(move || serve_config_with(&path, UsageClient::new(url)));
+        let brake = at("swarm.cc");
+        let served = std::thread::spawn(move || serve_config_with(&path, &brake));
 
-        let request = request
-            .recv_timeout(Duration::from_secs(30))
-            .expect("the usage poll never asked the fake endpoint");
-        assert!(request.starts_with("GET /api/oauth/usage "), "{request}");
-        assert!(request.contains(&format!("Bearer {TOKEN}")), "{request}");
-        assert!(
-            !served.is_finished(),
-            "serve returned after starting the poll"
-        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while !at("spawned").exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the meter never ran the claude binary"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(!served.is_finished(), "serve returned after starting the meter");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

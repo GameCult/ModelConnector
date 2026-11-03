@@ -1,9 +1,9 @@
 //! The plan's own usage windows, as the subscription reports them. The
-//! subscription decides how much a plan may burn, and two sensors observe it:
-//! the CLI's `rate_limit_event` on the connector's own calls, and the usage
-//! poll of `usage_poll` while that stream is quiet. The latest observation of
-//! each window, from either, is kept here and published as the usage readout
-//! and lent with each lease.
+//! subscription decides how much a plan may burn, and one sensor observes it:
+//! the CLI's `rate_limit_event` on the connector's own calls, which the
+//! `meter` makes when the week's reading goes stale. The latest observation of
+//! each window is kept here and published as the usage readout and lent with
+//! each lease.
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -29,26 +29,17 @@ impl QuotaCell {
         self.observe_at(unix_ms(), windows);
     }
 
-    /// Records readings taken at `at` (unix ms): the moment the sensor asked,
-    /// not the moment its answer arrived. The cell alone decides how a reading
-    /// combines with the one it holds for that window, and every sensor goes
-    /// through this decision:
-    ///
-    /// - a reading older than the held one is dropped, so a slow answer cannot
-    ///   replace what a faster sensor saw meanwhile;
-    /// - the provider's rejection stands until its window resets, or until a
-    ///   reading that itself carries a verdict from the provider replaces it:
-    ///   a [`POLLED`] reading reports utilization only, and says nothing about
-    ///   whether the provider accepts calls.
-    ///
-    /// Windows the readings did not mention stay as they were, stamp included.
-    pub fn observe_at(&self, at: u64, windows: impl IntoIterator<Item = PlanQuota>) {
+    /// Records readings taken at `at` (unix ms). A reading older than the
+    /// held one is dropped, so a slow call cannot replace what a faster one
+    /// saw meanwhile. Windows the readings did not mention stay as they were,
+    /// stamp included.
+(&self, at: u64, windows: impl IntoIterator<Item = PlanQuota>) {
         let mut held = self.0.lock().unwrap_or_else(|e| e.into_inner());
         for mut quota in windows {
             quota.observed_at_unix_ms = at;
             if held
                 .get(&quota.window)
-                .is_none_or(|current| supersedes(current, &quota))
+                .is_none_or(|current| quota.observed_at_unix_ms >= current.observed_at_unix_ms)
             {
                 held.insert(quota.window.clone(), quota);
             }
@@ -81,24 +72,7 @@ impl QuotaCell {
 }
 
 /// The status of a window whose reset has passed since it was observed.
-const EXPIRED: &str = "expired";
-/// The status of a window the provider refuses calls on.
-pub(crate) const REJECTED: &str = "rejected";
-/// The status of a window read from the usage endpoint: utilization and reset
-/// time, with no verdict on whether calls are accepted.
-pub(crate) const POLLED: &str = "polled";
-
-/// Whether `incoming` (already stamped with its own reading time) replaces
-/// `current` for the same window.
-fn supersedes(current: &PlanQuota, incoming: &PlanQuota) -> bool {
-    if incoming.observed_at_unix_ms < current.observed_at_unix_ms {
-        return false;
-    }
-    let rejection_stands = current.status == REJECTED
-        && incoming.status == POLLED
-        && incoming.observed_at_unix_ms < current.resets_at_unix_ms;
-    !rejection_stands
-}
+pub(crate) const EXPIRED: &str = "expired";
 
 fn unix_ms() -> u64 {
     SystemTime::now()
@@ -194,31 +168,11 @@ mod tests {
     }
 
     #[test]
-    fn a_rejection_stands_against_a_poll_until_the_window_resets() {
+    fn a_newer_reading_lifts_a_rejection() {
         let cell = QuotaCell::new();
-        let polled = with_status(quota("five_hour", 500, 0), POLLED);
-        cell.observe_at(100, [with_status(quota("five_hour", 1000, 0), REJECTED)]);
-        cell.observe_at(200, [polled.clone()]);
-        assert_eq!(held(&cell), (REJECTED.to_string(), Some(1000), 100));
-        // The window the rejection described is over: a poll of the next one lands.
-        cell.observe_at(RESET, [polled]);
-        assert_eq!(cell.snapshot_at(RESET - 1).windows[0].status, POLLED);
-    }
-
-    #[test]
-    fn a_newer_reading_that_carries_its_own_verdict_lifts_a_rejection() {
-        let cell = QuotaCell::new();
-        cell.observe_at(100, [with_status(quota("five_hour", 1000, 0), REJECTED)]);
+        cell.observe_at(100, [with_status(quota("five_hour", 1000, 0), "rejected")]);
         cell.observe_at(200, [quota("five_hour", 300, 0)]);
         assert_eq!(held(&cell), ("allowed".to_string(), Some(300), 200));
-    }
-
-    #[test]
-    fn a_poll_replaces_what_is_not_a_rejection() {
-        let cell = QuotaCell::new();
-        cell.observe_at(100, [quota("five_hour", 300, 0)]);
-        cell.observe_at(200, [with_status(quota("five_hour", 400, 0), POLLED)]);
-        assert_eq!(held(&cell), (POLLED.to_string(), Some(400), 200));
     }
 
     #[test]
