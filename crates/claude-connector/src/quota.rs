@@ -11,6 +11,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use model_connector::{PlanQuota, PlanQuotaSnapshot};
 
+/// The window the weekly pacing reads, and the one the meter keeps fresh.
+pub(crate) const WEEK: &str = "seven_day";
+/// The windows the pacing reads, and so the only ones the cell keeps.
+pub(crate) const PACED: [&str; 2] = ["five_hour", WEEK];
+
 /// The latest observation of each plan window, shared by the backend that
 /// feeds it and whatever reads it out. Each window carries the time of its
 /// own observation: an event that names one window says nothing about the

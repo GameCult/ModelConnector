@@ -7,7 +7,7 @@ use model_connector::{FailureKind, PlanQuota, StopReason, Usage};
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::quota::QuotaCell;
+use crate::quota::{PACED, QuotaCell};
 
 /// The tool the CLI gives the model to deliver an answer that must match a
 /// `--json-schema`. Its call is the structured output, not a tool exchange.
@@ -320,12 +320,16 @@ impl<'a> StreamState<'a> {
 /// `rate_limit_info.unifiedWindows`: utilization as a fraction of the window,
 /// reset as unix seconds. A window missing any of its three fields is skipped;
 /// an unknown reading is never zero.
+/// Only the windows pacing reads are taken ([`PACED`]): the event also names
+/// per-model buckets, and one of those reading `rejected` must not close every
+/// lease.
 fn plan_windows(info: &Value) -> Vec<PlanQuota> {
     let Some(windows) = info.get("unifiedWindows").and_then(Value::as_object) else {
         return Vec::new();
     };
     windows
         .iter()
+        .filter(|(window, _)| PACED.contains(&window.as_str()))
         .filter_map(|(window, reading)| {
             let utilization = reading.get("utilization")?.as_f64()?;
             let resets_at = reading.get("resetsAt")?.as_u64()?;
@@ -391,4 +395,51 @@ fn sum_usage(models: impl Iterator<Item = ModelUsage>) -> Usage {
         }
     }
     usage
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn windows(body: &str) -> Vec<(String, Option<u32>, u64)> {
+        let info: Value = serde_json::from_str(&format!(r#"{{"unifiedWindows":{body}}}"#)).unwrap();
+        plan_windows(&info)
+            .into_iter()
+            .map(|q| (q.window, q.utilization_permille, q.resets_at_unix_ms))
+            .collect()
+    }
+
+    #[test]
+    fn only_the_five_hour_and_seven_day_windows_are_taken() {
+        let taken = windows(
+            r#"{"five_hour":{"utilization":0.5,"resetsAt":2,"status":"allowed"},
+                "seven_day":{"utilization":0.25,"resetsAt":3,"status":"allowed"},
+                "seven_day_opus":{"utilization":0.1,"resetsAt":4,"status":"allowed"},
+                "seven_day_overage_included":{"utilization":1,"resetsAt":5,"status":"rejected"}}"#,
+        );
+        assert_eq!(
+            taken,
+            vec![
+                ("five_hour".to_string(), Some(500), 2000),
+                ("seven_day".to_string(), Some(250), 3000),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_window_missing_a_field_or_of_the_wrong_type_costs_only_itself() {
+        // Unknown is never zero: such a window is skipped, not read as empty.
+        for broken in [
+            r#"{"resetsAt":2,"status":"allowed"}"#,
+            r#"{"utilization":0.5,"status":"allowed"}"#,
+            r#"{"utilization":0.5,"resetsAt":2}"#,
+            r#"{"utilization":"high","resetsAt":2,"status":"allowed"}"#,
+            r#"{"utilization":-0.5,"resetsAt":2,"status":"allowed"}"#,
+        ] {
+            let both = windows(&format!(
+                r#"{{"five_hour":{broken},"seven_day":{{"utilization":0,"resetsAt":3,"status":"allowed"}}}}"#
+            ));
+            assert_eq!(both, vec![("seven_day".to_string(), Some(0), 3000)], "{broken}");
+        }
+    }
 }

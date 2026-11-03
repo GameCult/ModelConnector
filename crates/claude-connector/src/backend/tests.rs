@@ -2160,7 +2160,7 @@ fn rate_limit_event_updates_quota_cell() {
 
 #[test]
 fn a_rejected_turn_still_reports_its_windows_and_a_bad_window_costs_only_itself() {
-    let event = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","unifiedWindows":{"five_hour":{"utilization":0.9996,"resetsAt":4102444800,"status":"rejected"},"seven_day":{"resetsAt":4102531200,"status":"allowed"},"idle":{"utilization":0,"resetsAt":4102444800,"status":"allowed"},"odd":{"utilization":"high","resetsAt":1,"status":"allowed"},"negative":{"utilization":-0.5,"resetsAt":1,"status":"allowed"}}}}"#;
+    let event = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","unifiedWindows":{"five_hour":{"utilization":0.9996,"resetsAt":4102444800,"status":"rejected"},"seven_day":{"utilization":0,"resetsAt":4102531200,"status":"allowed"},"seven_day_overage_included":{"utilization":1,"resetsAt":4102531200,"status":"rejected"},"idle":{"utilization":0,"resetsAt":4102444800,"status":"allowed"}}}}"#;
     let rig = rig(vec![Script::lines(vec![
         init_line(MODEL, SESSION),
         event.to_string(),
@@ -2170,12 +2170,12 @@ fn a_rejected_turn_still_reports_its_windows_and_a_bad_window_costs_only_itself(
     assert_eq!(kind, FailureKind::RateLimited);
     let mut rejected = window("five_hour", 1000, 4_102_444_800_000);
     rejected.status = "rejected".to_string();
-    // Unknown is never zero: a window missing a field or of another type is
-    // skipped, not read as empty.
-    // A window at exactly zero use is a reading, and is kept.
+    // A window at exactly zero use is a reading, and is kept. Only the two
+    // windows pacing reads are taken: a per-model bucket that reads rejected
+    // must not close every lease, and no other name is a window of the plan.
     assert_eq!(
         readings(&rig),
-        vec![rejected, window("idle", 0, 4_102_444_800_000)]
+        vec![rejected, window("seven_day", 0, 4_102_531_200_000)]
     );
 }
 
