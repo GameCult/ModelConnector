@@ -177,7 +177,7 @@ impl ClaudeCodeBackend {
         request.input = vec![InputItem::UserText {
             text: "ok?".to_string(),
         }];
-        match self.run(&request, METER_CALLER).1 {
+        match self.run(&request, METER_CALLER, true).1 {
             TransportOutcome::Completed { usage, .. } => Ok(usage),
             TransportOutcome::Failed { kind, .. } => Err(format!("{kind:?}")),
         }
@@ -189,10 +189,13 @@ impl ClaudeCodeBackend {
         binary_matches_pin(&self.config)
     }
 
+    /// `ephemeral` leaves no transcript behind: the meter keeps no handle and
+    /// resumes nothing, every other call is resumed by its session.
     fn run(
         &self,
         request: &ProviderRequest,
         caller: &str,
+        ephemeral: bool,
     ) -> (Vec<TransportEvent>, TransportOutcome) {
         let Some(secret) = usable_secret(self.handle_secret.as_ref()) else {
             return failed(
@@ -236,7 +239,7 @@ impl ClaudeCodeBackend {
                 "claude-code: the system prompt could not be staged",
             ));
         };
-        let argv = argv(&self.config, request, &plan, prompt.path());
+        let argv = argv(&self.config, request, &plan, prompt.path(), ephemeral);
         let env = child_env(&self.config, request);
         let deadline = Instant::now() + self.config.limits.deadline;
 
@@ -350,7 +353,7 @@ impl ProviderBackend for ClaudeCodeBackend {
     }
 
     fn execute(&self, call: &ProviderCall) -> TransportResult {
-        let (events, outcome) = self.run(call.request(), call.caller_runtime_id());
+        let (events, outcome) = self.run(call.request(), call.caller_runtime_id(), false);
         call.transported(events, outcome)
     }
 

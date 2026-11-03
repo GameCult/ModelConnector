@@ -107,13 +107,15 @@ fn effort(effort: ReasoningEffort) -> &'static str {
 /// rather than an argument because one argument is capped near 128 KiB
 /// (E2BIG) and instructions are not, the child has
 /// no tools, no MCP servers, no settings, no slash commands and nobody to ask
-/// for permission, and a resume always forks. A request's output schema goes
-/// to the CLI as `--json-schema`; without one the flag is absent.
+/// for permission, and a resume always forks. An ephemeral call (the
+/// meter's) keeps no session on disk. A request's output schema goes to the
+/// CLI as `--json-schema`; without one the flag is absent.
 pub(crate) fn argv(
     config: &ClaudeCodeConfig,
     request: &ProviderRequest,
     plan: &Plan,
     system_prompt_file: &Path,
+    ephemeral: bool,
 ) -> Vec<String> {
     let mut argv: Vec<String> = [
         config.claude_binary.to_string_lossy().as_ref(),
@@ -139,6 +141,9 @@ pub(crate) fn argv(
     .into_iter()
     .map(str::to_string)
     .collect();
+    if ephemeral {
+        argv.push("--no-session-persistence".to_string());
+    }
     if let Some(level) = request.reasoning_effort {
         argv.extend(["--effort".to_string(), effort(level).to_string()]);
     }

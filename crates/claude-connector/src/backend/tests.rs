@@ -2773,6 +2773,10 @@ fn the_meter_call_reads_the_week_from_a_real_captured_event() {
     let after = |flag: &str| argv[argv.iter().position(|a| a == flag).unwrap() + 1].clone();
     assert_eq!(after("--model"), METER_MODEL);
     assert_eq!(after("--tools"), "", "the call can use no tool");
+    assert!(
+        argv.iter().any(|a| a == "--no-session-persistence"),
+        "the meter's transcript is nobody's to keep: {argv:?}"
+    );
     assert_eq!(rig.spawns(), 1, "one child, never run again");
 }
 
