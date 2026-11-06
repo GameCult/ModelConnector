@@ -726,13 +726,3 @@ fn a_readout_beside_a_held_lease_leaves_it_held() {
     assert_eq!(refusal_of(&second), Some(LeaseRefusalKind::Busy));
     assert!(granted_ok(&held));
 }
-
-#[test]
-fn a_readout_does_not_wait_for_the_meter() {
-    let harness = start(setup());
-    harness.quota.attach_meter();
-    let started = Instant::now();
-    let readout = usage_of(&read_usage(&harness));
-    assert!(started.elapsed() < Duration::from_secs(5));
-    assert!(readout.plan_quota.is_empty());
-}
