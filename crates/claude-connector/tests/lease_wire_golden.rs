@@ -8,8 +8,8 @@
 use std::path::{Path, PathBuf};
 
 use claude_connector::{
-    LeaseGranted, LeaseMessage, LeaseRefusalKind, LeaseRefused, LeaseRequest, LeaseUsageReadoutRequest,
-    decode_frame, encode_frame,
+    LeaseGranted, LeaseMessage, LeaseRefusalKind, LeaseRefused, LeaseRequest,
+    LeaseUsageReadoutRequest, decode_frame, encode_frame,
 };
 use model_connector::{PlanQuota, PlanQuotaSnapshot, UsageReadout};
 
