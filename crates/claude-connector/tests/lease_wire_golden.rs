@@ -8,10 +8,10 @@
 use std::path::{Path, PathBuf};
 
 use claude_connector::{
-    LeaseGranted, LeaseMessage, LeaseRefusalKind, LeaseRefused, LeaseRequest, decode_frame,
-    encode_frame,
+    LeaseGranted, LeaseMessage, LeaseRefusalKind, LeaseRefused, LeaseRequest, UsageReadoutRequest,
+    decode_frame, encode_frame,
 };
-use model_connector::PlanQuota;
+use model_connector::{PlanQuota, PlanQuotaSnapshot, UsageReadout};
 
 const REGENERATE: &str = "LEASE_V2_REGENERATE";
 
@@ -96,4 +96,39 @@ fn a_grant_with_both_usage_windows_is_pinned() {
             ],
         }),
     );
+}
+
+#[test]
+fn the_usage_readout_frames_are_pinned() {
+    let window = |name: &str, permille, status: &str, resets| PlanQuota {
+        window: name.to_string(),
+        utilization_permille: Some(permille),
+        resets_at_unix_ms: resets,
+        status: status.to_string(),
+        observed_at_unix_ms: 1_793_300_000_000,
+    };
+    let request = LeaseMessage::ClaudeUsageReadoutRequest(UsageReadoutRequest {});
+    let answer = LeaseMessage::ClaudeUsageReadout(UsageReadout::new(
+        1_793_300_100_000,
+        PlanQuotaSnapshot {
+            windows: vec![
+                window("five_hour", 420, "allowed", 1_793_307_000_000),
+                window("seven_day", 999, "allowed_warning", 1_793_800_000_000),
+            ],
+        },
+    ));
+    assert_frame("usage_readout_request.bin", &request);
+    assert_frame("usage_readout.bin", &answer);
+    for (message, spelled) in [
+        (&request, "claude_usage_readout_request"),
+        (&answer, "claude_usage_readout"),
+    ] {
+        let bytes = encode_frame(message);
+        let value: rmpv::Value = rmp_serde::from_slice(&bytes[4..]).unwrap();
+        let rmpv::Value::Map(outer) = value else {
+            panic!("a frame is a map")
+        };
+        assert_eq!(outer[0].0.as_str(), Some("kind"));
+        assert_eq!(outer[0].1.as_str(), Some(spelled));
+    }
 }

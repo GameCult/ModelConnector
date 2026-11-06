@@ -10,6 +10,10 @@
 //! provider's own, repeated until its own reset. Nothing the run says about
 //! itself decides who it is or what the plan allows.
 //!
+//! The same socket also answers a usage readout to any peer that can reach it
+//! (the claude-lease group): no lease, no caller check, no token read and no
+//! wake of the meter. Usage is state every Mind reads.
+//!
 //! The token exists in this process only as the value the token source returns
 //! and in the pipe. It is not in an environment, an argument, a file, a log or
 //! a reply frame. The connector spawns nothing here: the Self run's `claude`
@@ -27,7 +31,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use model_connector::{
-    LeaseAdmission, LeaseGrant, LeaseRefusal, LeaseTurn, PlanQuota, TransportService,
+    LeaseAdmission, LeaseGrant, LeaseRefusal, LeaseTurn, PlanQuota, TransportService, UsageReadout,
 };
 use serde::{Deserialize, Serialize};
 
@@ -48,6 +52,10 @@ pub enum LeaseMessage {
     /// holds the token, its write end closed.
     ClaudeLeaseGrant(LeaseGranted),
     ClaudeLeaseRefusal(LeaseRefused),
+    /// Asks for the plan's usage windows. Opens no lease.
+    ClaudeUsageReadoutRequest(UsageReadoutRequest),
+    /// The answer to a readout request: the cell's windows as of now, no fd.
+    ClaudeUsageReadout(UsageReadout),
 }
 
 /// A request names only when the lease ends. Who asks is the connector's to know.
@@ -55,6 +63,10 @@ pub enum LeaseMessage {
 pub struct LeaseRequest {
     pub expires_at_unix_ms: u64,
 }
+
+/// A readout request names nothing: the answer is the same for every asker.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageReadoutRequest {}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LeaseGranted {
@@ -385,8 +397,11 @@ struct Lender {
     units: Arc<dyn PeerUnits>,
 }
 
-/// Serves leases on `listener` until it fails. Each connection is one lease:
-/// request, then grant or refusal, then (after a grant) the hold. A caller is
+/// Serves leases on `listener` until it fails. Each connection is one lease or
+/// one usage readout. A lease: request, then grant or refusal, then (after a
+/// grant) the hold. A readout: request, then one frame, then close; its reach
+/// is the socket's group, and it reads the plan's windows without waking the
+/// meter. A caller is
 /// the account whose uid the kernel reports for the connection, and only a
 /// process in that caller's unit may lease, once per unit invocation for a Self
 /// run and once per turn for a Persona; no
@@ -421,21 +436,33 @@ pub fn serve_leases(
                 let _permit = permit;
                 // A connection that fails is dropped; the lease it may have
                 // held is ended inside `lend`.
-                let _ = lender.lend(stream);
+                let _ = lender.serve_one(stream);
             })?;
     }
 }
 
 impl Lender {
-    fn lend(&self, mut stream: UnixStream) -> io::Result<()> {
+    fn serve_one(&self, mut stream: UnixStream) -> io::Result<()> {
         stream.set_write_timeout(Some(self.limits.socket_timeout))?;
-        let peer = peer_credentials(&stream)?;
         let request_deadline = Instant::now() + self.limits.socket_timeout;
-        let LeaseMessage::ClaudeLeaseRequest(request) =
-            read_message(&mut stream, request_deadline)?
-        else {
-            return Err(io::Error::from(io::ErrorKind::InvalidData));
-        };
+        match read_message(&mut stream, request_deadline)? {
+            LeaseMessage::ClaudeLeaseRequest(request) => {
+                let peer = peer_credentials(&stream)?;
+                self.lend(stream, peer, request)
+            }
+            LeaseMessage::ClaudeUsageReadoutRequest(_) => {
+                stream.write_all(&encode_frame(&readout(&self.quota, unix_ms())))
+            }
+            _ => Err(io::Error::from(io::ErrorKind::InvalidData)),
+        }
+    }
+
+    fn lend(
+        &self,
+        mut stream: UnixStream,
+        peer: PeerCredentials,
+        request: LeaseRequest,
+    ) -> io::Result<()> {
         let Some(caller) = self.callers.iter().find(|caller| caller.uid == peer.uid) else {
             return refuse(
                 &mut stream,
@@ -609,6 +636,12 @@ impl Lender {
     }
 }
 
+/// The plan's windows as the cell holds them at `now_ms`. It takes the cell by
+/// reference so it cannot note a request, and never waits for a first read.
+fn readout(quota: &QuotaCell, now_ms: u64) -> LeaseMessage {
+    LeaseMessage::ClaudeUsageReadout(UsageReadout::new(now_ms, quota.snapshot()))
+}
+
 /// The longest a lease waits for the meter's first read of the week. A call
 /// takes a few seconds; the holder's own wait for the grant is far longer.
 const FIRST_READ_WAIT: Duration = Duration::from_secs(10);
@@ -628,6 +661,30 @@ fn refuse(stream: &mut UnixStream, kind: LeaseRefusalKind, detail: &str) -> io::
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_readout_of_an_empty_metered_cell_does_not_wait() {
+        let quota = QuotaCell::new();
+        quota.attach_meter();
+        let started = Instant::now();
+        let LeaseMessage::ClaudeUsageReadout(answer) = readout(&quota, 77) else {
+            panic!("a readout answers with a readout");
+        };
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(answer.plan_quota.is_empty());
+        assert_eq!(answer.at_unix_ms, 77);
+    }
+
+    #[test]
+    fn a_readout_is_no_sign_of_life() {
+        let quota = Arc::new(QuotaCell::new());
+        let within = Duration::from_secs(15 * 60);
+        let now = unix_ms();
+        let _ = readout(&quota, now);
+        assert!(!quota.wanted_at(now, within));
+        let _asking = quota.asking();
+        assert!(quota.wanted_at(now, within));
+    }
 
     /// A refusal frame whose body is exactly `body_bytes` long.
     fn frame_of(body_bytes: usize) -> Vec<u8> {

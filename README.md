@@ -5,7 +5,7 @@ between a caller that needs a model turn and a daemon that holds the provider
 credential, so no project wires its own provider calls.
 
 The connector meters nothing in dollars. It holds the subscription token, lends it, and
-publishes the plan's usage windows (`usage_readout`, and `plan_quota` on every lease grant) for the
+publishes the plan's usage windows (`usage_readout`, `claude_usage_readout` on the lease socket, and `plan_quota` on every lease grant) for the
 minds to read and decide their own burn. The one usage-derived refusal is the provider's own
 (`ProviderRejected`), repeated until its reset.
 
