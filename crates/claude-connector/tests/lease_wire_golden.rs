@@ -8,7 +8,7 @@
 use std::path::{Path, PathBuf};
 
 use claude_connector::{
-    LeaseGranted, LeaseMessage, LeaseRefusalKind, LeaseRefused, LeaseRequest, UsageReadoutRequest,
+    LeaseGranted, LeaseMessage, LeaseRefusalKind, LeaseRefused, LeaseRequest, LeaseUsageReadoutRequest,
     decode_frame, encode_frame,
 };
 use model_connector::{PlanQuota, PlanQuotaSnapshot, UsageReadout};
@@ -107,7 +107,7 @@ fn the_usage_readout_frames_are_pinned() {
         status: status.to_string(),
         observed_at_unix_ms: 1_793_300_000_000,
     };
-    let request = LeaseMessage::ClaudeUsageReadoutRequest(UsageReadoutRequest {});
+    let request = LeaseMessage::ClaudeUsageReadoutRequest(LeaseUsageReadoutRequest {});
     let answer = LeaseMessage::ClaudeUsageReadout(UsageReadout::new(
         1_793_300_100_000,
         PlanQuotaSnapshot {

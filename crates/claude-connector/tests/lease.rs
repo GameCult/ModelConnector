@@ -15,7 +15,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use claude_connector::{
     LeaseCaller, LeaseGranted, LeaseLimits, LeaseMessage, LeaseRefusalKind, LeaseRefused,
-    LeaseRequest, PeerUnit, PeerUnits, QuotaCell, TokenSource, UsageReadoutRequest, decode_frame,
+    LeaseRequest, PeerUnit, PeerUnits, QuotaCell, TokenSource, LeaseUsageReadoutRequest, decode_frame,
     encode_frame, serve_leases,
 };
 use model_connector::{CallerAdmission, LeaseTurn, PlanQuota, TransportService, UsageReadout};
@@ -658,7 +658,7 @@ fn read_usage(harness: &Harness) -> Answer {
         .unwrap();
     stream
         .write_all(&encode_frame(&LeaseMessage::ClaudeUsageReadoutRequest(
-            UsageReadoutRequest {},
+            LeaseUsageReadoutRequest {},
         )))
         .unwrap();
     let (raw, fds) = receive(&stream);
