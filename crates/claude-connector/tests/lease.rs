@@ -15,10 +15,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use claude_connector::{
     LeaseCaller, LeaseGranted, LeaseLimits, LeaseMessage, LeaseRefusalKind, LeaseRefused,
-    LeaseRequest, PeerUnit, PeerUnits, QuotaCell, TokenSource, decode_frame, encode_frame,
-    serve_leases,
+    LeaseRequest, LeaseUsageReadoutRequest, PeerUnit, PeerUnits, QuotaCell, TokenSource,
+    decode_frame, encode_frame, serve_leases,
 };
-use model_connector::{CallerAdmission, LeaseTurn, PlanQuota, TransportService};
+use model_connector::{CallerAdmission, LeaseTurn, PlanQuota, TransportService, UsageReadout};
 use zeroize::Zeroizing;
 
 const CALLER: &str = "eureka";
@@ -648,4 +648,81 @@ fn a_request_trickled_past_the_socket_timeout_is_dropped_without_a_lease() {
     );
     assert!(started.elapsed() < Duration::from_secs(6));
     assert_eq!(harness.tokens.reads.load(Ordering::SeqCst), 0);
+}
+
+/// What a usage readout request came back with.
+fn read_usage(harness: &Harness) -> Answer {
+    let mut stream = UnixStream::connect(&harness.socket).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    stream
+        .write_all(&encode_frame(&LeaseMessage::ClaudeUsageReadoutRequest(
+            LeaseUsageReadoutRequest {},
+        )))
+        .unwrap();
+    let (raw, fds) = receive(&stream);
+    let message = decode_frame(&raw);
+    Answer {
+        _stream: stream,
+        raw,
+        message,
+        fds,
+    }
+}
+
+fn usage_of(answer: &Answer) -> UsageReadout {
+    match &answer.message {
+        Some(LeaseMessage::ClaudeUsageReadout(readout)) => readout.clone(),
+        other => panic!("expected a usage readout, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_readout_answers_the_cells_windows_and_lends_nothing() {
+    let harness = start(setup());
+    let reset = now_ms() + 3_600_000;
+    harness.quota.observe([
+        window("five_hour", 420, "allowed", reset),
+        window("seven_day", 999, "allowed_warning", reset + 86_400_000),
+    ]);
+    let before = now_ms();
+    let answer = read_usage(&harness);
+    let readout = usage_of(&answer);
+    assert!(answer.fds.is_empty(), "a readout lends no descriptor");
+    assert_eq!(readout.plan_quota, harness.quota.snapshot().windows);
+    assert_eq!(readout.plan_quota.len(), 2);
+    assert!(readout.at_unix_ms >= before && readout.at_unix_ms <= now_ms());
+    assert_eq!(harness.tokens.reads.load(Ordering::SeqCst), 0);
+    // No lease was opened: the next request is granted.
+    assert!(granted_ok(&ask(&harness, 60_000)));
+}
+
+#[test]
+fn a_peer_outside_the_lease_callers_still_reads_usage() {
+    let harness = start(Setup {
+        uid: own_uid().wrapping_add(1),
+        ..setup()
+    });
+    harness
+        .quota
+        .observe([window("five_hour", 420, "allowed", now_ms() + 3_600_000)]);
+    let refused = ask(&harness, 60_000);
+    assert_eq!(refusal_of(&refused), Some(LeaseRefusalKind::UnknownCaller));
+    let readout = usage_of(&read_usage(&harness));
+    assert_eq!(readout.plan_quota.len(), 1);
+    assert_eq!(readout.plan_quota[0].utilization_permille, Some(420));
+    assert_eq!(harness.tokens.reads.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn a_readout_beside_a_held_lease_leaves_it_held() {
+    let harness = start(setup());
+    let held = ask(&harness, 60_000);
+    assert!(granted_ok(&held));
+    assert_eq!(usage_of(&read_usage(&harness)).plan_quota.len(), 0);
+    harness.enter(2);
+    let second = ask(&harness, 60_000);
+    assert_eq!(refusal_of(&second), Some(LeaseRefusalKind::Busy));
+    assert!(granted_ok(&held));
 }

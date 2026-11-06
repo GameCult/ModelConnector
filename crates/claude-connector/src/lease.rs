@@ -10,6 +10,10 @@
 //! provider's own, repeated until its own reset. Nothing the run says about
 //! itself decides who it is or what the plan allows.
 //!
+//! The same socket also answers a usage readout to any peer that can reach it
+//! (the claude-lease group): no lease, no caller check, no token read and no
+//! wake of the meter. Usage is state every Mind reads.
+//!
 //! The token exists in this process only as the value the token source returns
 //! and in the pipe. It is not in an environment, an argument, a file, a log or
 //! a reply frame. The connector spawns nothing here: the Self run's `claude`
@@ -27,7 +31,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use model_connector::{
-    LeaseAdmission, LeaseGrant, LeaseRefusal, LeaseTurn, PlanQuota, TransportService,
+    LeaseAdmission, LeaseGrant, LeaseRefusal, LeaseTurn, PlanQuota, TransportService, UsageReadout,
 };
 use serde::{Deserialize, Serialize};
 
@@ -48,6 +52,10 @@ pub enum LeaseMessage {
     /// holds the token, its write end closed.
     ClaudeLeaseGrant(LeaseGranted),
     ClaudeLeaseRefusal(LeaseRefused),
+    /// Asks for the plan's usage windows. Opens no lease.
+    ClaudeUsageReadoutRequest(LeaseUsageReadoutRequest),
+    /// The answer to a readout request: the cell's windows as of now, no fd.
+    ClaudeUsageReadout(UsageReadout),
 }
 
 /// A request names only when the lease ends. Who asks is the connector's to know.
@@ -55,6 +63,10 @@ pub enum LeaseMessage {
 pub struct LeaseRequest {
     pub expires_at_unix_ms: u64,
 }
+
+/// A readout request names nothing: the answer is the same for every asker.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeaseUsageReadoutRequest {}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LeaseGranted {
@@ -383,10 +395,22 @@ struct Lender {
     quota: Arc<QuotaCell>,
     tokens: Arc<dyn TokenSource>,
     units: Arc<dyn PeerUnits>,
+    /// Connections holding or waiting on a lease, at most `max_connections`.
+    leases: Arc<AtomicUsize>,
+    /// Connections being answered a readout, at most `READOUT_CONNECTIONS`.
+    readouts: Arc<AtomicUsize>,
 }
 
-/// Serves leases on `listener` until it fails. Each connection is one lease:
-/// request, then grant or refusal, then (after a grant) the hold. A caller is
+/// How many usage readouts are served at once, beside the leases. A readout
+/// holds nothing, so a few suffice, and a flood of them cannot take a lease's
+/// slot: the accept loop admits `max_connections` plus this many.
+const READOUT_CONNECTIONS: usize = 4;
+
+/// Serves leases on `listener` until it fails. Each connection is one lease or
+/// one usage readout. A lease: request, then grant or refusal, then (after a
+/// grant) the hold. A readout: request, then one frame, then close; its reach
+/// is the socket's group, and it reads the plan's windows without waking the
+/// meter. A caller is
 /// the account whose uid the kernel reports for the connection, and only a
 /// process in that caller's unit may lease, once per unit invocation for a Self
 /// run and once per turn for a Persona; no
@@ -407,11 +431,14 @@ pub fn serve_leases(
         quota,
         tokens,
         units,
+        leases: Arc::new(AtomicUsize::new(0)),
+        readouts: Arc::new(AtomicUsize::new(0)),
     });
     let active = Arc::new(AtomicUsize::new(0));
     loop {
         let (stream, _) = listener.accept()?;
-        let Some(permit) = Permit::acquire(&active, limits.max_connections) else {
+        let admitted = limits.max_connections.saturating_add(READOUT_CONNECTIONS);
+        let Some(permit) = Permit::acquire(&active, admitted) else {
             continue;
         };
         let lender = lender.clone();
@@ -421,21 +448,45 @@ pub fn serve_leases(
                 let _permit = permit;
                 // A connection that fails is dropped; the lease it may have
                 // held is ended inside `lend`.
-                let _ = lender.lend(stream);
+                let _ = lender.serve_one(stream);
             })?;
     }
 }
 
 impl Lender {
-    fn lend(&self, mut stream: UnixStream) -> io::Result<()> {
+    fn serve_one(&self, mut stream: UnixStream) -> io::Result<()> {
         stream.set_write_timeout(Some(self.limits.socket_timeout))?;
-        let peer = peer_credentials(&stream)?;
         let request_deadline = Instant::now() + self.limits.socket_timeout;
-        let LeaseMessage::ClaudeLeaseRequest(request) =
-            read_message(&mut stream, request_deadline)?
-        else {
-            return Err(io::Error::from(io::ErrorKind::InvalidData));
-        };
+        match read_message(&mut stream, request_deadline)? {
+            LeaseMessage::ClaudeLeaseRequest(request) => {
+                // A lease over the limit is dropped unanswered; readouts
+                // never count against it.
+                let Some(_slot) = Permit::acquire(&self.leases, self.limits.max_connections) else {
+                    return Ok(());
+                };
+                let peer = peer_credentials(&stream)?;
+                self.lend(stream, peer, request)
+            }
+            LeaseMessage::ClaudeUsageReadoutRequest(_) => {
+                let Some(_slot) = Permit::acquire(&self.readouts, READOUT_CONNECTIONS) else {
+                    return refuse(
+                        &mut stream,
+                        LeaseRefusalKind::Busy,
+                        "too many usage readouts at once",
+                    );
+                };
+                stream.write_all(&encode_frame(&readout(&self.quota, unix_ms())))
+            }
+            _ => Err(io::Error::from(io::ErrorKind::InvalidData)),
+        }
+    }
+
+    fn lend(
+        &self,
+        mut stream: UnixStream,
+        peer: PeerCredentials,
+        request: LeaseRequest,
+    ) -> io::Result<()> {
         let Some(caller) = self.callers.iter().find(|caller| caller.uid == peer.uid) else {
             return refuse(
                 &mut stream,
@@ -609,6 +660,12 @@ impl Lender {
     }
 }
 
+/// The plan's windows as the cell holds them at `now_ms`. It takes the cell by
+/// reference so it cannot note a request, and never waits for a first read.
+fn readout(quota: &QuotaCell, now_ms: u64) -> LeaseMessage {
+    LeaseMessage::ClaudeUsageReadout(UsageReadout::new(now_ms, quota.snapshot()))
+}
+
 /// The longest a lease waits for the meter's first read of the week. A call
 /// takes a few seconds; the holder's own wait for the grant is far longer.
 const FIRST_READ_WAIT: Duration = Duration::from_secs(10);
@@ -628,6 +685,210 @@ fn refuse(stream: &mut UnixStream, kind: LeaseRefusalKind, detail: &str) -> io::
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct NoTokens;
+    impl TokenSource for NoTokens {
+        fn read(&self) -> Option<zeroize::Zeroizing<String>> {
+            panic!("a readout read the token")
+        }
+    }
+    struct NoUnits;
+    impl PeerUnits for NoUnits {
+        fn invocation_in(&self, _: BorrowedFd<'_>, _: &str) -> Option<PeerUnit> {
+            panic!("a readout looked up the peer's unit")
+        }
+    }
+
+    fn lender(
+        quota: &Arc<QuotaCell>,
+        dir: &std::path::Path,
+        max_connections: usize,
+    ) -> (Arc<Mutex<TransportService>>, Lender) {
+        let service = Arc::new(Mutex::new(
+            TransportService::open(
+                &dir.join("replay.cc"),
+                "claude-code",
+                [model_connector::CallerAdmission::new(
+                    "lease-test-caller",
+                    "lease-test-connection-key",
+                    1,
+                    ["model".to_string()],
+                    1,
+                    65_536,
+                    32_768,
+                )
+                .unwrap()],
+                300_000,
+            )
+            .unwrap(),
+        ));
+        let lender = Lender {
+            callers: Vec::new(),
+            limits: LeaseLimits {
+                socket_timeout: Duration::from_secs(2),
+                max_lease_ms: 3_600_000,
+                max_connections,
+            },
+            service: service.clone(),
+            quota: quota.clone(),
+            tokens: Arc::new(NoTokens),
+            units: Arc::new(NoUnits),
+            leases: Arc::new(AtomicUsize::new(0)),
+            readouts: Arc::new(AtomicUsize::new(0)),
+        };
+        (service, lender)
+    }
+
+    /// Serves `lender`'s parts on a socket in `dir`; the path comes back.
+    fn serve(lender: Lender, dir: &std::path::Path) -> std::path::PathBuf {
+        let socket = dir.join("lease.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let (service, quota) = (lender.service.clone(), lender.quota.clone());
+        thread::spawn(move || {
+            let _ = serve_leases(
+                &listener,
+                lender.callers,
+                lender.limits,
+                service,
+                quota,
+                lender.tokens,
+                lender.units,
+            );
+        });
+        socket
+    }
+
+    fn ask(socket: &std::path::Path, message: &LeaseMessage) -> Option<LeaseMessage> {
+        let mut stream = UnixStream::connect(socket).ok()?;
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        stream.write_all(&encode_frame(message)).ok()?;
+        let mut raw = Vec::new();
+        let _ = stream.read_to_end(&mut raw);
+        decode_frame(&raw)
+    }
+
+    fn readout_request() -> LeaseMessage {
+        LeaseMessage::ClaudeUsageReadoutRequest(LeaseUsageReadoutRequest {})
+    }
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_socket_readout_never_asks_the_meter_waits_for_a_week_or_takes_the_service_lock() {
+        let dir = scratch("readout-arm");
+        let quota = Arc::new(QuotaCell::new());
+        quota.attach_meter();
+        let (service, lender) = lender(&quota, &dir, 8);
+        let socket = serve(lender, &dir);
+        // Held throughout: a readout that takes it hangs past the read timeout.
+        let guard = service.lock().unwrap();
+        for _ in 0..20 {
+            let started = Instant::now();
+            let Some(LeaseMessage::ClaudeUsageReadout(answer)) = ask(&socket, &readout_request())
+            else {
+                panic!("no readout");
+            };
+            assert!(started.elapsed() < Duration::from_secs(1));
+            assert!(answer.plan_quota.is_empty());
+        }
+        drop(guard);
+        assert_eq!(quota.asks_so_far(), 0);
+        assert!(!quota.wanted_at(unix_ms(), Duration::from_secs(15 * 60)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_flood_of_readouts_at_their_limit_leaves_every_lease_request_answered() {
+        let dir = scratch("readout-flood");
+        let quota = Arc::new(QuotaCell::new());
+        // Fewer lease slots than flooding readers: the readers must not need them.
+        let (_service, lender) = lender(&quota, &dir, 2);
+        let socket = serve(lender, &dir);
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flood: Vec<_> = (0..READOUT_CONNECTIONS)
+            .map(|_| {
+                let (socket, stop) = (socket.clone(), stop.clone());
+                thread::spawn(move || {
+                    while !stop.load(Ordering::Acquire) {
+                        let _ = ask(&socket, &readout_request());
+                    }
+                })
+            })
+            .collect();
+        // No caller is configured, so each lease is answered UnknownCaller:
+        // an answer is all that is asked.
+        let lease = LeaseMessage::ClaudeLeaseRequest(LeaseRequest {
+            expires_at_unix_ms: unix_ms() + 60_000,
+        });
+        let unanswered = (0..40)
+            .filter(|_| {
+                !matches!(
+                    ask(&socket, &lease),
+                    Some(LeaseMessage::ClaudeLeaseRefusal(LeaseRefused {
+                        kind: LeaseRefusalKind::UnknownCaller,
+                        ..
+                    }))
+                )
+            })
+            .count();
+        stop.store(true, Ordering::Release);
+        for client in flood {
+            client.join().unwrap();
+        }
+        assert_eq!(unanswered, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_readout_over_the_readout_limit_is_refused_busy_not_dropped() {
+        let dir = scratch("readout-limit");
+        let quota = Arc::new(QuotaCell::new());
+        let (_service, lender) = lender(&quota, &dir, 8);
+        let held: Vec<_> = (0..READOUT_CONNECTIONS)
+            .map(|_| Permit::acquire(&lender.readouts, READOUT_CONNECTIONS).unwrap())
+            .collect();
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client.write_all(&encode_frame(&readout_request())).unwrap();
+        lender.serve_one(server).unwrap();
+        let mut raw = Vec::new();
+        client.read_to_end(&mut raw).unwrap();
+        let Some(LeaseMessage::ClaudeLeaseRefusal(refusal)) = decode_frame(&raw) else {
+            panic!("no refusal");
+        };
+        assert_eq!(refusal.kind, LeaseRefusalKind::Busy);
+        drop(held);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_readout_of_an_empty_metered_cell_does_not_wait() {
+        let quota = QuotaCell::new();
+        quota.attach_meter();
+        let started = Instant::now();
+        let LeaseMessage::ClaudeUsageReadout(answer) = readout(&quota, 77) else {
+            panic!("a readout answers with a readout");
+        };
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(answer.plan_quota.is_empty());
+        assert_eq!(answer.at_unix_ms, 77);
+    }
+
+    #[test]
+    fn a_readout_is_no_sign_of_life() {
+        let quota = Arc::new(QuotaCell::new());
+        let within = Duration::from_secs(15 * 60);
+        let now = unix_ms();
+        let _ = readout(&quota, now);
+        assert!(!quota.wanted_at(now, within));
+        let _asking = quota.asking();
+        assert!(quota.wanted_at(now, within));
+    }
 
     /// A refusal frame whose body is exactly `body_bytes` long.
     fn frame_of(body_bytes: usize) -> Vec<u8> {
