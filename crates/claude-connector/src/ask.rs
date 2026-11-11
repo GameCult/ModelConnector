@@ -24,6 +24,7 @@ pub const DEFAULT_ENDPOINT: &str = "127.0.0.1:4110";
 /// The payload bound the connector's own `config init` defaults to.
 pub const PAYLOAD_BYTES: usize = 1 << 20;
 const MAX_KEY_BYTES: usize = 1024;
+pub const MAX_SYSTEM_BYTES: usize = 64 * 1024;
 
 pub struct AskArgs {
     pub endpoint: SocketAddr,
@@ -49,6 +50,26 @@ pub enum AskError {
     KeyUnreadable,
     #[error("the connection key file is not text")]
     KeyEncoding,
+    #[error("the connection key file is not a regular file")]
+    KeyNotRegular,
+    #[error("the connection key file is readable by group or world (chmod 600)")]
+    KeyExposed,
+    #[error("the instructions file cannot be read as text from a regular file")]
+    SystemUnreadable,
+    #[error("the instructions file is larger than {MAX_SYSTEM_BYTES} bytes")]
+    SystemTooLarge,
+    #[error("standard input cannot be read")]
+    StdinRead,
+    #[error("standard input is not UTF-8 text")]
+    StdinNotText,
+    #[error("the answer cannot be written to standard output")]
+    StdoutWrite,
+    #[error("nothing is listening at the connector endpoint")]
+    NotListening,
+    #[error(
+        "the connector closed the connection without answering (key, caller or frame not accepted)"
+    )]
+    ClosedWithoutAnswer,
     #[error("the connection key file is empty or longer than {MAX_KEY_BYTES} bytes")]
     KeyLength,
     #[error("the connection key is not usable as a key (surrounding whitespace?)")]
@@ -75,10 +96,57 @@ pub enum AskError {
     EmptyAnswer,
 }
 
+enum ReadFailure {
+    Unreadable,
+    NotRegular,
+    TooLarge,
+    Exposed,
+}
+
+/// Opens `path` without blocking (a FIFO must not hang the open), requires the
+/// opened file to be a regular file (a symlink is followed and its target
+/// judged), optionally refuses one readable by group or world, and reads at
+/// most `cap` bytes, failing if there are more.
+fn read_regular(path: &Path, cap: usize, private: bool) -> Result<Zeroizing<Vec<u8>>, ReadFailure> {
+    use std::io::Read;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options.open(path).map_err(|_| ReadFailure::Unreadable)?;
+    let metadata = file.metadata().map_err(|_| ReadFailure::Unreadable)?;
+    if !metadata.is_file() {
+        return Err(ReadFailure::NotRegular);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if private && metadata.permissions().mode() & 0o077 != 0 {
+            return Err(ReadFailure::Exposed);
+        }
+    }
+    let mut bytes = Zeroizing::new(Vec::new());
+    file.take(cap as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| ReadFailure::Unreadable)?;
+    if bytes.len() > cap {
+        return Err(ReadFailure::TooLarge);
+    }
+    Ok(bytes)
+}
+
 /// Reads the key as the connector reads its own key file (the text without the
 /// trailing line ending). The bytes are zeroized on drop and never shown.
 pub fn read_key(path: &Path) -> Result<Zeroizing<String>, AskError> {
-    let raw = Zeroizing::new(std::fs::read(path).map_err(|_| AskError::KeyUnreadable)?);
+    let raw = read_regular(path, MAX_KEY_BYTES, true).map_err(|failure| match failure {
+        ReadFailure::Unreadable => AskError::KeyUnreadable,
+        ReadFailure::NotRegular => AskError::KeyNotRegular,
+        ReadFailure::TooLarge => AskError::KeyLength,
+        ReadFailure::Exposed => AskError::KeyExposed,
+    })?;
     let text = std::str::from_utf8(raw.as_slice()).map_err(|_| AskError::KeyEncoding)?;
     let key = Zeroizing::new(text.trim_end_matches(['\r', '\n']).to_string());
     if key.is_empty() || key.len() > MAX_KEY_BYTES {
@@ -88,6 +156,15 @@ pub fn read_key(path: &Path) -> Result<Zeroizing<String>, AskError> {
         return Err(AskError::KeyUnusable);
     }
     Ok(key)
+}
+
+/// The instructions file: a regular file of at most [`MAX_SYSTEM_BYTES`] of text.
+pub fn read_system_file(path: &Path) -> Result<String, AskError> {
+    let raw = read_regular(path, MAX_SYSTEM_BYTES, false).map_err(|failure| match failure {
+        ReadFailure::TooLarge => AskError::SystemTooLarge,
+        _ => AskError::SystemUnreadable,
+    })?;
+    String::from_utf8(raw.to_vec()).map_err(|_| AskError::SystemUnreadable)
 }
 
 fn fresh_id(prefix: &str) -> String {
@@ -182,7 +259,13 @@ pub fn ask(args: &AskArgs) -> Result<String, AskError> {
         {
             AskError::Timeout
         }
-        ConnectorClientError::Connection(io) => AskError::Connection(io.kind()),
+        ConnectorClientError::Connection(io) => match io.kind() {
+            std::io::ErrorKind::ConnectionRefused => AskError::NotListening,
+            std::io::ErrorKind::UnexpectedEof
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::BrokenPipe => AskError::ClosedWithoutAnswer,
+            kind => AskError::Connection(kind),
+        },
         ConnectorClientError::Transport(error) => AskError::Transport(error),
         ConnectorClientError::FrameSize => AskError::FrameSize,
         ConnectorClientError::InvalidConfig | ConnectorClientError::RequestIdTooLong => {

@@ -24,6 +24,8 @@ enum Script {
     Empty,
     Failed(&'static str),
     Sleep(Duration),
+    ToolCall,
+    Stop(StopReason),
 }
 
 struct Backend {
@@ -53,9 +55,13 @@ impl ProviderBackend for Backend {
                 payload: TransportEventPayload::TextDelta { text: t.into() },
             }]
         };
+        let stop = match &self.script {
+            Script::Stop(reason) => *reason,
+            _ => StopReason::EndTurn,
+        };
         let completed = TransportOutcome::Completed {
             provider_response_id: None,
-            stop_reason: StopReason::EndTurn,
+            stop_reason: stop,
             usage: usage.clone(),
         };
         match &self.script {
@@ -69,12 +75,30 @@ impl ProviderBackend for Backend {
                     usage: None,
                 },
             ),
+            Script::Stop(_) => call.transported(text("cut off"), completed),
+            Script::ToolCall => call.transported(
+                vec![TransportEvent {
+                    sequence: 0,
+                    payload: TransportEventPayload::ToolCall {
+                        call_id: "c".into(),
+                        name: "n".into(),
+                        arguments: "{}".into(),
+                    },
+                }],
+                completed,
+            ),
             Script::Sleep(d) => {
                 thread::sleep(*d);
                 call.transported(text("late"), completed)
             }
         }
     }
+}
+
+fn write_key(path: &std::path::Path, bytes: &[u8], mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::write(path, bytes).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
 }
 
 struct Rig {
@@ -93,7 +117,7 @@ fn rig(script: Script) -> Rig {
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let key_file = dir.join("caller.key");
-    std::fs::write(&key_file, format!("{KEY}\n")).unwrap();
+    write_key(&key_file, format!("{KEY}\n").as_bytes(), 0o600);
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let endpoint = listener.local_addr().unwrap();
     let admission =
@@ -216,7 +240,7 @@ fn a_wrong_key_or_caller_is_an_error_and_never_reaches_the_provider() {
     let rig = rig(Script::Text("x"));
     let mut wrong_key = rig.args();
     let other = rig.dir.join("other.key");
-    std::fs::write(&other, "some-other-connection-key-0123456789").unwrap();
+    write_key(&other, b"some-other-connection-key-0123456789", 0o600);
     wrong_key.key_file = other;
     let error = ask(&wrong_key).unwrap_err();
     assert!(!message(&error).contains("some-other"), "{error}");
@@ -237,7 +261,7 @@ fn an_unusable_key_file_errors_without_echoing_its_contents() {
     ];
     for (name, bytes) in cases {
         let path = rig.dir.join(format!("{name}.key"));
-        std::fs::write(&path, &bytes).unwrap();
+        write_key(&path, &bytes, 0o600);
         let mut args = rig.args();
         args.key_file = path;
         let text = message(&ask(&args).unwrap_err());
@@ -254,7 +278,7 @@ fn an_unusable_key_file_errors_without_echoing_its_contents() {
     directory.key_file = rig.dir.clone();
     assert!(matches!(
         ask(&directory).unwrap_err(),
-        AskError::KeyUnreadable
+        AskError::KeyNotRegular
     ));
     assert!(rig.seen().is_empty());
 }
@@ -302,10 +326,19 @@ fn a_dead_endpoint_is_a_connection_error() {
     let mut args = rig.args();
     args.endpoint = listener.local_addr().unwrap();
     drop(listener);
-    assert!(matches!(ask(&args).unwrap_err(), AskError::Connection(_)));
+    assert!(matches!(ask(&args).unwrap_err(), AskError::NotListening));
 }
 
 fn run_binary(rig: &Rig, stdin: &str, extra: &[&str]) -> std::process::Output {
+    run_binary_with_key(rig, &rig.key_file, stdin, extra)
+}
+
+fn run_binary_with_key(
+    rig: &Rig,
+    key_file: &std::path::Path,
+    stdin: &str,
+    extra: &[&str],
+) -> std::process::Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_claude-connector"))
         .args(["ask", "--endpoint", &rig.endpoint.to_string()])
         .args([
@@ -316,7 +349,7 @@ fn run_binary(rig: &Rig, stdin: &str, extra: &[&str]) -> std::process::Output {
             "--system",
             "Be brief.",
         ])
-        .args(["--connection-key-file", rig.key_file.to_str().unwrap()])
+        .args(["--connection-key-file", key_file.to_str().unwrap()])
         .args(extra)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -328,6 +361,312 @@ fn run_binary(rig: &Rig, stdin: &str, extra: &[&str]) -> std::process::Output {
         let _ = child.stdin.take().unwrap().write_all(stdin.as_bytes());
     }
     child.wait_with_output().unwrap()
+}
+
+#[test]
+fn a_toolcall_in_the_answer_is_an_error() {
+    let rig = rig(Script::ToolCall);
+    assert!(matches!(ask(&rig.args()).unwrap_err(), AskError::ToolCall));
+}
+
+/// The rule: only a turn that ended (end of turn or a stop sequence) is an
+/// answer; a truncated, refused or context-limited turn is an error even when
+/// it carries text.
+#[test]
+fn a_turn_that_did_not_end_is_an_error() {
+    for reason in [
+        StopReason::MaxOutputTokens,
+        StopReason::Refusal,
+        StopReason::ContextWindow,
+        StopReason::ToolUse,
+    ] {
+        let rig = rig(Script::Stop(reason));
+        assert!(
+            matches!(ask(&rig.args()).unwrap_err(), AskError::NotCompleted(r) if r == reason),
+            "{reason:?}"
+        );
+    }
+    let rig = rig(Script::Stop(StopReason::StopSequence));
+    assert_eq!(ask(&rig.args()).unwrap(), "cut off");
+}
+
+#[test]
+fn a_fifo_key_file_errors_promptly_instead_of_hanging() {
+    let rig = rig(Script::Text("x"));
+    let fifo = rig.dir.join("fifo.key");
+    let path = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+    let mut args = rig.args();
+    args.key_file = fifo;
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::spawn(move || tx.send(ask(&args)).unwrap());
+    let error = rx
+        .recv_timeout(Duration::from_secs(3))
+        .expect("reading a FIFO key file must not hang")
+        .unwrap_err();
+    assert!(matches!(error, AskError::KeyNotRegular), "{error}");
+}
+
+#[test]
+fn a_key_file_readable_by_group_or_world_is_refused_and_a_private_one_accepted() {
+    let rig = rig(Script::Text("fine"));
+    for mode in [0o644, 0o640, 0o604] {
+        let path = rig.dir.join(format!("mode-{mode:o}.key"));
+        write_key(&path, KEY.as_bytes(), mode);
+        let mut args = rig.args();
+        args.key_file = path;
+        let error = ask(&args).unwrap_err();
+        assert!(matches!(error, AskError::KeyExposed), "{mode:o}: {error}");
+        assert!(!message(&error).contains(KEY));
+    }
+    assert!(rig.seen().is_empty());
+    assert_eq!(ask(&rig.args()).unwrap(), "fine");
+}
+
+#[test]
+fn a_symlinked_key_is_judged_by_its_target() {
+    let rig = rig(Script::Text("linked"));
+    let link = rig.dir.join("link.key");
+    std::os::unix::fs::symlink(&rig.key_file, &link).unwrap();
+    let mut args = rig.args();
+    args.key_file = link;
+    assert_eq!(ask(&args).unwrap(), "linked");
+    let dir_link = rig.dir.join("dir.key");
+    std::os::unix::fs::symlink(&rig.dir, &dir_link).unwrap();
+    args.key_file = dir_link;
+    assert!(matches!(ask(&args).unwrap_err(), AskError::KeyNotRegular));
+}
+
+#[test]
+fn the_key_read_is_bounded_at_1024_bytes() {
+    let rig = rig(Script::Text("x"));
+    let path = rig.dir.join("big.key");
+    write_key(&path, &vec![b'k'; 1_025], 0o600);
+    assert!(matches!(
+        claude_connector::ask::read_key(&path).unwrap_err(),
+        AskError::KeyLength
+    ));
+    write_key(&path, &vec![b'k'; 1_024], 0o600);
+    assert!(claude_connector::ask::read_key(&path).is_ok());
+}
+
+#[test]
+fn the_instructions_file_is_capped_and_must_be_a_regular_file() {
+    use claude_connector::ask::{MAX_SYSTEM_BYTES, read_system_file};
+    let rig = rig(Script::Text("x"));
+    let path = rig.dir.join("system.txt");
+    std::fs::write(&path, vec![b's'; MAX_SYSTEM_BYTES]).unwrap();
+    assert_eq!(read_system_file(&path).unwrap().len(), MAX_SYSTEM_BYTES);
+    std::fs::write(&path, vec![b's'; MAX_SYSTEM_BYTES + 1]).unwrap();
+    assert!(matches!(
+        read_system_file(&path).unwrap_err(),
+        AskError::SystemTooLarge
+    ));
+    assert!(matches!(
+        read_system_file(&rig.dir).unwrap_err(),
+        AskError::SystemUnreadable
+    ));
+}
+
+#[test]
+fn the_binary_never_prints_key_bytes_for_a_bad_key_file() {
+    let rig = rig(Script::Text("x"));
+    let cases: [(&str, &[u8], u32); 3] = [
+        ("exposed", b"exposed-key-bytes-0123456789", 0o644),
+        ("padded", b"  padded-key-bytes-0123456789  ", 0o600),
+        ("wrong", b"wrong-but-wellformed-key-0123456789", 0o600),
+    ];
+    for (name, bytes, mode) in cases {
+        let path = rig.dir.join(format!("bin-{name}.key"));
+        write_key(&path, bytes, mode);
+        let out = run_binary_with_key(&rig, &path, "q", &[]);
+        assert!(!out.status.success(), "{name}");
+        let shown = [out.stdout.clone(), out.stderr.clone()].concat();
+        let shown = String::from_utf8_lossy(&shown);
+        assert!(
+            !shown.contains("key-bytes") && !shown.contains("wellformed"),
+            "{name}: {shown}"
+        );
+        assert!(out.stdout.is_empty());
+    }
+    let out = run_binary(&rig, "q", &["--system-file", "/nonexistent"]);
+    assert!(!out.status.success());
+}
+
+#[test]
+fn stdin_and_stdout_failures_have_their_own_wording() {
+    let rig = rig(Script::Text("x"));
+    let mut child = Command::new(env!("CARGO_BIN_EXE_claude-connector"))
+        .args(["ask", "--endpoint", &rig.endpoint.to_string()])
+        .args(["--caller-id", CALLER, "--model", MODEL, "--system", "s"])
+        .args(["--connection-key-file", rig.key_file.to_str().unwrap()])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        use std::io::Write;
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(&[0xff, 0xfe])
+            .unwrap();
+    }
+    let out = child.wait_with_output().unwrap();
+    let err = String::from_utf8(out.stderr).unwrap();
+    assert!(err.contains("not UTF-8"), "{err}");
+    assert!(!err.contains("flag"), "{err}");
+}
+
+/// What the wire returns for a tools-bearing request that gets past the CLI's
+/// own construction (here forced by hand) when the real claude backend sits
+/// behind the real serve loop: the service admits it, the backend's planner
+/// refuses it, the caller receives a transported `Failed(InvalidRequest)`
+/// result, and the claude child is never started.
+#[test]
+fn a_forced_tools_request_reaches_the_planner_is_refused_and_no_child_starts() {
+    use claude_connector::{
+        ChildEnv, ClaudeCodeBackend, ClaudeCodeConfig, ClaudeCodeLimits, ProcessPort, RunningChild,
+        SessionStore, StderrSink, TokenSource,
+    };
+    use sha2::{Digest, Sha256};
+    use zeroize::Zeroizing;
+
+    struct CountingPort(Arc<AtomicUsize>);
+    impl ProcessPort for CountingPort {
+        fn spawn(
+            &self,
+            _: &[String],
+            _: &ChildEnv,
+            _: &std::path::Path,
+            _: Vec<u8>,
+            _: &str,
+        ) -> std::io::Result<Box<dyn RunningChild>> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Err(std::io::Error::other("no child in this test"))
+        }
+    }
+    struct Fixed(&'static str);
+    impl TokenSource for Fixed {
+        fn read(&self) -> Option<Zeroizing<String>> {
+            Some(Zeroizing::new(self.0.to_string()))
+        }
+    }
+    struct NoSessions;
+    impl SessionStore for NoSessions {
+        fn exists(&self, _: &str) -> bool {
+            false
+        }
+    }
+    struct Quiet;
+    impl StderrSink for Quiet {
+        fn stderr_tail(&self, _: &[u8]) {}
+    }
+
+    let dir =
+        std::env::temp_dir().join(format!("claude-connector-ask-tools-{}", std::process::id()));
+    for sub in ["work", "config", "prompt"] {
+        std::fs::create_dir_all(dir.join(sub)).unwrap();
+    }
+    let binary = dir.join("claude");
+    std::fs::write(&binary, b"pretend claude").unwrap();
+    let spawns = Arc::new(AtomicUsize::new(0));
+    let backend = ClaudeCodeBackend::with_ports(
+        ClaudeCodeConfig {
+            claude_binary: binary,
+            claude_binary_sha256: Sha256::digest(b"pretend claude").into(),
+            work_dir: dir.join("work"),
+            config_dir: dir.join("config"),
+            prompt_dir: dir.join("prompt"),
+            token_credential: "t".into(),
+            handle_secret_credential: "h".into(),
+            instance: "i".into(),
+            limits: ClaudeCodeLimits {
+                deadline: Duration::from_secs(5),
+                max_line_bytes: 1 << 16,
+                max_total_bytes: 1 << 20,
+                stderr_tail_bytes: 64,
+            },
+        },
+        Box::new(CountingPort(spawns.clone())),
+        Box::new(NoSessions),
+        Box::new(Quiet),
+        Box::new(Fixed("token")),
+        Box::new(Fixed(
+            "handle-secret-0000000000000000000000000000000000000000",
+        )),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = listener.local_addr().unwrap();
+    let admission =
+        CallerAdmission::new(CALLER, KEY, 1, [MODEL.to_string()], 4, 1 << 20, 4_096).unwrap();
+    let limits = ServeLimits {
+        max_frame_bytes: FRAME,
+        max_connections: 8,
+        socket_timeout_ms: 5_000,
+        max_expiry_skew_ms: 300_000,
+    };
+    let store = dir.join("replay.cc");
+    thread::spawn(move || serve(listener, limits, vec![admission], &store, Arc::new(backend)));
+
+    let mut args = AskArgs {
+        endpoint,
+        caller_id: CALLER.into(),
+        key_file: dir.join("unused"),
+        model: MODEL.into(),
+        instructions: "i".into(),
+        effort: None,
+        max_output_tokens: 64,
+        timeout: Duration::from_secs(5),
+        prompt: "p".into(),
+    };
+    let mut forced = build_invocation(&args).unwrap().request;
+    forced.tools.push(ToolDefinition {
+        name: "lookup".into(),
+        description: "d".into(),
+        parameters_json: "{}".into(),
+    });
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let invocation = TransportInvocation::new(
+        CALLER,
+        now + 60_000,
+        provider_request_sha256(&forced).unwrap(),
+        forced,
+    )
+    .unwrap();
+    let client = ConnectorClient::new(endpoint, KEY, FRAME, Some(Duration::from_secs(5))).unwrap();
+    let result = client.execute(&invocation).unwrap();
+    let TransportDisposition::Transported { receipt, .. } = &result.disposition else {
+        panic!(
+            "expected the planner's failed result, got {:?}",
+            result.disposition
+        );
+    };
+    assert!(matches!(
+        receipt.outcome,
+        TransportOutcome::Failed {
+            kind: FailureKind::InvalidRequest,
+            ..
+        }
+    ));
+    assert_eq!(
+        spawns.load(Ordering::SeqCst),
+        0,
+        "the claude child must never start"
+    );
+    // The same CLI path with no tools would have reached the spawn.
+    args.key_file = dir.join("unused");
+    let clean = client.execute(&build_invocation(&args).unwrap()).unwrap();
+    assert!(matches!(
+        clean.disposition,
+        TransportDisposition::Transported { .. }
+    ));
+    assert_eq!(spawns.load(Ordering::SeqCst), 1);
 }
 
 #[test]

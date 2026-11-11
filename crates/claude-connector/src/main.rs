@@ -125,8 +125,8 @@ fn run_ask(args: &[&str]) -> Result<(), Failure> {
     std::io::stdin()
         .take(ask::PAYLOAD_BYTES as u64 + 1)
         .read_to_end(&mut raw)
-        .map_err(|_| Failure::Malformed("stdin"))?;
-    let prompt = String::from_utf8(raw).map_err(|_| Failure::Malformed("stdin"))?;
+        .map_err(|_| AskError::StdinRead)?;
+    let prompt = String::from_utf8(raw).map_err(|_| AskError::StdinNotText)?;
     let answer = ask::ask(&AskArgs {
         endpoint,
         caller_id: flags.text("--caller-id")?,
@@ -141,7 +141,7 @@ fn run_ask(args: &[&str]) -> Result<(), Failure> {
     let mut out = std::io::stdout();
     out.write_all(answer.as_bytes())
         .and_then(|()| out.flush())
-        .map_err(|_| Failure::Malformed("stdout"))
+        .map_err(|_| AskError::StdoutWrite.into())
 }
 
 /// The flags of one config verb: each single flag at most once, each list
