@@ -18,7 +18,7 @@
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use model_connector::Usage;
+use model_connector::{PlanQuota, Usage};
 
 use crate::backend::ClaudeCodeBackend;
 use crate::quota::{EXPIRED, QuotaCell, WEEK};
@@ -119,17 +119,11 @@ impl Meter {
         // reports its windows and then errors. Only the cell says whether the
         // week was read.
         let called = self.probe.call();
-        let state = if self.refreshed_since(now_ms) {
+        let state = if let Some(week) = self.week_refreshed_since(now_ms) {
             self.misses = 0;
-            let week = self
-                .cell
-                .snapshot()
-                .windows
-                .into_iter()
-                .find(|quota| quota.window == WEEK);
             State::Read {
-                permille: week.as_ref().and_then(|quota| quota.utilization_permille),
-                resets_at_unix_ms: week.map_or(0, |quota| quota.resets_at_unix_ms),
+                permille: week.utilization_permille,
+                resets_at_unix_ms: week.resets_at_unix_ms,
             }
         } else {
             self.misses = self.misses.saturating_add(1);
@@ -162,12 +156,14 @@ impl Meter {
         stale_at.max(self.not_before_ms)
     }
 
-    fn refreshed_since(&self, since_ms: u64) -> bool {
+    /// The week window if it was observed at or after `since_ms`, from one
+    /// snapshot, so the logged value is the one that decided the refresh.
+    fn week_refreshed_since(&self, since_ms: u64) -> Option<PlanQuota> {
         self.cell
             .snapshot()
             .windows
-            .iter()
-            .any(|quota| quota.window == WEEK && quota.observed_at_unix_ms >= since_ms)
+            .into_iter()
+            .find(|quota| quota.window == WEEK && quota.observed_at_unix_ms >= since_ms)
     }
 
     fn report(&mut self, state: State) {
@@ -204,7 +200,8 @@ fn unix_ms() -> u64 {
 }
 
 /// Starts the meter thread. It writes only through the calls it makes, and
-/// logs one line to stderr when its state changes. From here a lease asked of
+/// logs one line to stderr per refresh of the weekly reading and one per
+/// change of any other state. From here a lease asked of
 /// a cell with no weekly reading waits for the meter's first read.
 pub(crate) fn start(
     cell: Arc<QuotaCell>,
@@ -225,7 +222,6 @@ pub(crate) fn start(
 mod tests {
     use super::*;
     use crate::quota::Asking;
-    use model_connector::PlanQuota;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -250,6 +246,10 @@ mod tests {
         reading_at: Option<u64>,
         status: String,
         fails_with: Option<String>,
+        /// The used thousandths the reading reports; 60 when unset.
+        permille: Option<u32>,
+        /// The reset the reading reports; `RESET` when unset.
+        resets_at: Option<u64>,
     }
 
     /// A call that answers as scripted and feeds the cell the way the stream
@@ -265,7 +265,10 @@ mod tests {
             self.made.fetch_add(1, Ordering::SeqCst);
             let script = self.script.lock().unwrap().clone();
             if let Some(at) = script.reading_at {
-                self.cell.observe_at(at, reading(&script.status));
+                let mut week = reading(&script.status);
+                week[0].utilization_permille = Some(script.permille.unwrap_or(60));
+                week[0].resets_at_unix_ms = script.resets_at.unwrap_or(RESET);
+                self.cell.observe_at(at, week);
             }
             if let Some(kind) = script.fails_with {
                 return Err(kind);
@@ -322,6 +325,7 @@ mod tests {
                 reading_at: Some(at),
                 status: "allowed".to_string(),
                 fails_with: None,
+                ..Script::default()
             };
         }
         fn reads_nothing(&self) {
@@ -421,7 +425,11 @@ mod tests {
             rig.reads(at);
             rig.meter.tick(at);
         }
-        assert_eq!(rig.calls(), 17, "one read per period, the lease never lapsing");
+        assert_eq!(
+            rig.calls(),
+            17,
+            "one read per period, the lease never lapsing"
+        );
     }
 
     #[test]
@@ -500,6 +508,7 @@ mod tests {
             reading_at: Some(NOW),
             status: "rejected".to_string(),
             fails_with: Some("RateLimited".to_string()),
+            ..Script::default()
         };
         assert_eq!(rig.meter.tick(NOW), STALE, "the next read is a period away");
         assert_eq!(rig.meter.misses, 0);
@@ -533,6 +542,43 @@ mod tests {
         let line =
             format!("meter: weekly reading refreshed, permille 60 resets_at_unix_ms {RESET}");
         assert_eq!(rig.lines(), vec![line.clone(), line]);
+    }
+
+    #[test]
+    fn the_logged_value_follows_the_reading_and_an_expired_week_is_unknown() {
+        let mut rig = rig();
+        for (at, permille) in [(NOW, 60), (NOW + 15 * MIN, 75)] {
+            *rig.script.lock().unwrap() = Script {
+                reading_at: Some(at),
+                status: "allowed".to_string(),
+                permille: Some(permille),
+                resets_at: Some(RESET + permille as u64),
+                ..Script::default()
+            };
+            rig.meter.tick(at);
+        }
+        let now = unix_ms();
+        *rig.script.lock().unwrap() = Script {
+            reading_at: Some(now),
+            status: "allowed".to_string(),
+            resets_at: Some(1),
+            ..Script::default()
+        };
+        rig.meter.tick(now);
+        assert_eq!(
+            rig.lines(),
+            vec![
+                format!(
+                    "meter: weekly reading refreshed, permille 60 resets_at_unix_ms {}",
+                    RESET + 60
+                ),
+                format!(
+                    "meter: weekly reading refreshed, permille 75 resets_at_unix_ms {}",
+                    RESET + 75
+                ),
+                "meter: weekly reading refreshed, permille unknown resets_at_unix_ms 1".to_string(),
+            ]
+        );
     }
 
     #[test]
@@ -584,6 +630,7 @@ mod tests {
                 reading_at: Some(unix_ms() + 60 * MIN),
                 status: "allowed".to_string(),
                 fails_with: None,
+                ..Script::default()
             })),
         };
         start(cell.clone(), Box::new(probe)).unwrap();
