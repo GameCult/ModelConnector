@@ -42,10 +42,16 @@ impl Probe for Arc<ClaudeCodeBackend> {
     }
 }
 
-/// Why the meter is waiting; logged once per change.
+/// Why the meter is waiting. A refresh is logged every time, with the reading
+/// it saw; the other states are logged once per change.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum State {
-    Read,
+    /// The week window as the refresh left it; a window with no reading is
+    /// `None`.
+    Read {
+        permille: Option<u32>,
+        resets_at_unix_ms: u64,
+    },
     Idle,
     /// The call failed; the kind is the failure's kind, never its message.
     Failed(String),
@@ -55,7 +61,15 @@ enum State {
 impl State {
     fn line(&self) -> String {
         match self {
-            Self::Read => "meter: weekly reading refreshed".to_string(),
+            Self::Read {
+                permille,
+                resets_at_unix_ms,
+            } => {
+                let permille = permille.map_or("unknown".to_string(), |p| p.to_string());
+                format!(
+                    "meter: weekly reading refreshed, permille {permille} resets_at_unix_ms {resets_at_unix_ms}"
+                )
+            }
             Self::Idle => "meter: no lease asked lately, making no call".to_string(),
             Self::Failed(kind) => format!("meter: the call failed ({kind}), backing off"),
             Self::Unread => {
@@ -107,7 +121,16 @@ impl Meter {
         let called = self.probe.call();
         let state = if self.refreshed_since(now_ms) {
             self.misses = 0;
-            State::Read
+            let week = self
+                .cell
+                .snapshot()
+                .windows
+                .into_iter()
+                .find(|quota| quota.window == WEEK);
+            State::Read {
+                permille: week.as_ref().and_then(|quota| quota.utilization_permille),
+                resets_at_unix_ms: week.map_or(0, |quota| quota.resets_at_unix_ms),
+            }
         } else {
             self.misses = self.misses.saturating_add(1);
             match called {
@@ -148,7 +171,7 @@ impl Meter {
     }
 
     fn report(&mut self, state: State) {
-        if self.last_state.as_ref() != Some(&state) {
+        if matches!(state, State::Read { .. }) || self.last_state.as_ref() != Some(&state) {
             (self.log)(&state.line());
             self.last_state = Some(state);
         }
@@ -480,7 +503,12 @@ mod tests {
         };
         assert_eq!(rig.meter.tick(NOW), STALE, "the next read is a period away");
         assert_eq!(rig.meter.misses, 0);
-        assert_eq!(rig.lines(), vec![State::Read.line()]);
+        assert_eq!(
+            rig.lines(),
+            vec![format!(
+                "meter: weekly reading refreshed, permille 60 resets_at_unix_ms {RESET}"
+            )]
+        );
         rig.reads(NOW + 15 * MIN);
         rig.meter.tick(NOW + 15 * MIN);
         assert_eq!(rig.calls(), 2, "a rejected reading is kept fresh");
@@ -496,12 +524,41 @@ mod tests {
     }
 
     #[test]
+    fn a_refresh_logs_the_reading_and_an_unchanged_value_logs_again() {
+        let mut rig = rig();
+        rig.reads(NOW);
+        rig.meter.tick(NOW);
+        rig.reads(NOW + 15 * MIN);
+        rig.meter.tick(NOW + 15 * MIN);
+        let line =
+            format!("meter: weekly reading refreshed, permille 60 resets_at_unix_ms {RESET}");
+        assert_eq!(rig.lines(), vec![line.clone(), line]);
+    }
+
+    #[test]
+    fn idle_logs_once_per_change_however_often_it_repeats() {
+        let mut rig = rig();
+        rig.lease = None;
+        for step in 0..3 {
+            rig.meter.tick(NOW + 60 * MIN * (step + 1));
+        }
+        assert_eq!(rig.lines(), vec![State::Idle.line()]);
+    }
+
+    #[test]
     fn the_log_says_what_the_meter_is_doing_in_words() {
         assert_eq!(
             State::Idle.line(),
             "meter: no lease asked lately, making no call"
         );
-        assert_eq!(State::Read.line(), "meter: weekly reading refreshed");
+        assert_eq!(
+            State::Read {
+                permille: None,
+                resets_at_unix_ms: 7
+            }
+            .line(),
+            "meter: weekly reading refreshed, permille unknown resets_at_unix_ms 7"
+        );
         assert_eq!(
             State::Unread.line(),
             "meter: the call completed without a weekly reading, backing off"
