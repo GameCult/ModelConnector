@@ -557,14 +557,19 @@ mod tests {
             };
             rig.meter.tick(at);
         }
+        let mut expired = self::rig();
         let now = unix_ms();
-        *rig.script.lock().unwrap() = Script {
+        *expired.script.lock().unwrap() = Script {
             reading_at: Some(now),
             status: "allowed".to_string(),
             resets_at: Some(1),
             ..Script::default()
         };
-        rig.meter.tick(now);
+        expired.meter.tick(now);
+        assert_eq!(
+            expired.lines(),
+            vec!["meter: weekly reading refreshed, permille unknown resets_at_unix_ms 1"]
+        );
         assert_eq!(
             rig.lines(),
             vec![
@@ -576,7 +581,6 @@ mod tests {
                     "meter: weekly reading refreshed, permille 75 resets_at_unix_ms {}",
                     RESET + 75
                 ),
-                "meter: weekly reading refreshed, permille unknown resets_at_unix_ms 1".to_string(),
             ]
         );
     }
