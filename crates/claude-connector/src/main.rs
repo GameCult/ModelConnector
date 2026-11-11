@@ -102,9 +102,7 @@ fn run_ask(args: &[&str]) -> Result<(), Failure> {
         flags.single.get("--system-file"),
     ) {
         (Some(text), None) => text.clone(),
-        (None, Some(path)) => {
-            std::fs::read_to_string(path).map_err(|_| Failure::Malformed("--system-file"))?
-        }
+        (None, Some(path)) => ask::read_system_file(std::path::Path::new(path))?,
         _ => return Err(Failure::Missing("--system or --system-file (exactly one)")),
     };
     let effort = match flags.single.get("--effort").map(String::as_str) {

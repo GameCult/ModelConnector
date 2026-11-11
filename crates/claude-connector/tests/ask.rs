@@ -704,3 +704,66 @@ fn the_binary_fails_loudly_with_one_stderr_line_and_empty_stdout() {
     }
     assert!(rig.seen().is_empty());
 }
+
+/// Runs the binary with `--system-file` instead of `--system`, killing it if it
+/// has not exited within five seconds (a hang is a failure, not a stuck suite).
+fn run_with_system_file(rig: &Rig, file: &std::path::Path) -> std::process::Output {
+    use std::io::Write;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_claude-connector"))
+        .args(["ask", "--endpoint", &rig.endpoint.to_string()])
+        .args(["--caller-id", CALLER, "--model", MODEL])
+        .args(["--max-output-tokens", "1024"])
+        .args(["--connection-key-file", rig.key_file.to_str().unwrap()])
+        .args(["--system-file", file.to_str().unwrap()])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let _ = child.stdin.take().unwrap().write_all(b"question");
+    let started = std::time::Instant::now();
+    while child.try_wait().unwrap().is_none() {
+        if started.elapsed() > Duration::from_secs(5) {
+            child.kill().unwrap();
+            let _ = child.wait();
+            panic!("the binary hung on its --system-file");
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    child.wait_with_output().unwrap()
+}
+
+#[test]
+fn the_binary_bounds_and_guards_its_system_file() {
+    use claude_connector::ask::MAX_SYSTEM_BYTES;
+    let rig = rig(Script::Text("accepted"));
+
+    let fifo = rig.dir.join("system.fifo");
+    let path = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+    let out = run_with_system_file(&rig, &fifo);
+    assert!(!out.status.success());
+    assert!(out.stdout.is_empty());
+
+    let zero = run_with_system_file(&rig, std::path::Path::new("/dev/zero"));
+    assert!(!zero.status.success());
+    assert!(zero.stdout.is_empty());
+
+    let file = rig.dir.join("system.txt");
+    std::fs::write(&file, vec![b's'; MAX_SYSTEM_BYTES + 1]).unwrap();
+    let over = run_with_system_file(&rig, &file);
+    assert!(!over.status.success());
+    assert!(over.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&over.stderr).contains("larger than"));
+    assert!(rig.seen().is_empty());
+
+    std::fs::write(&file, vec![b's'; MAX_SYSTEM_BYTES]).unwrap();
+    let exact = run_with_system_file(&rig, &file);
+    assert!(
+        exact.status.success(),
+        "{}",
+        String::from_utf8_lossy(&exact.stderr)
+    );
+    assert_eq!(String::from_utf8(exact.stdout).unwrap(), "accepted");
+    assert_eq!(rig.seen()[0].instructions.len(), MAX_SYSTEM_BYTES);
+}
