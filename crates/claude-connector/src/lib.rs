@@ -3,6 +3,7 @@
 //! stream-json in and out, with every tool, MCP server, settings source and
 //! plugin switched off. A binary wires it to [`model_connector::serve`].
 
+pub mod ask;
 mod backend;
 mod config;
 mod daemon;

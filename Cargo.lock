@@ -144,6 +144,7 @@ dependencies = [
  "hmac",
  "libc",
  "model-connector",
+ "rand_core 0.6.4",
  "rmp-serde",
  "rmpv",
  "serde",
