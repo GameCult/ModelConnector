@@ -5,6 +5,7 @@
 //!   claude-connector config add-caller PATH.cc --caller-id ID --connection-key-file F ...
 //!   claude-connector config add-lease-caller PATH.cc --lease-user U --caller-id ID ...
 //!   claude-connector config check PATH.cc
+//!   claude-connector ask --caller-id ID --connection-key-file F --model M (--system TEXT | --system-file F) < prompt
 //!
 //! `serve` takes its configuration from the typed document alone. The flags of
 //! `config init` exist only to author that document. No message here echoes a
@@ -14,6 +15,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+use claude_connector::ask::{self, AskArgs, AskError};
 use claude_connector::{
     ClaudeConnectorConfig, ConfigError, LeaseCallerConfig, MIN_SECRET_BYTES, check_ready,
     load_config, write_config,
@@ -29,6 +31,7 @@ fn main() -> ExitCode {
         ["config", "add-caller", path, flags @ ..] => add_caller(path, flags),
         ["config", "add-lease-caller", path, flags @ ..] => add_lease_caller(path, flags),
         ["config", "check", path] => check(path),
+        ["ask", flags @ ..] => run_ask(flags),
         _ => Err(Failure::Usage),
     };
     match result {
@@ -43,7 +46,7 @@ fn main() -> ExitCode {
 #[derive(Debug, thiserror::Error)]
 enum Failure {
     #[error(
-        "usage: serve --config PATH | config init PATH --flag value ... | config add-caller PATH --flag value ... | config add-lease-caller PATH --flag value ... | config check PATH (check reads the credentials from the environment it runs in: run it in the unit's environment)"
+        "usage: serve --config PATH | config init PATH --flag value ... | config add-caller PATH --flag value ... | config add-lease-caller PATH --flag value ... | config check PATH | ask --caller-id ID --connection-key-file FILE --model MODEL (--system TEXT | --system-file FILE) [--endpoint HOST:PORT] [--effort low|medium|high|max] [--max-output-tokens N] [--timeout-secs N] (prompt on stdin, answer on stdout) (check reads the credentials from the environment it runs in: run it in the unit's environment)"
     )]
     Usage,
     #[error(transparent)]
@@ -54,6 +57,8 @@ enum Failure {
     Malformed(&'static str),
     #[error("a flag is unknown, repeated or has no value")]
     Flags,
+    #[error("{0}")]
+    Ask(#[from] AskError),
 }
 
 #[cfg(unix)]
@@ -73,6 +78,70 @@ fn check(path: &str) -> Result<(), Failure> {
     println!("callers: {}", config.callers.len());
     println!("lease_callers: {}", config.lease_callers.len());
     Ok(())
+}
+
+const ASK: [&str; 9] = [
+    "--endpoint",
+    "--caller-id",
+    "--connection-key-file",
+    "--model",
+    "--system",
+    "--system-file",
+    "--effort",
+    "--max-output-tokens",
+    "--timeout-secs",
+];
+
+/// One no-tools completion: the prompt is all of stdin, the answer is stdout.
+fn run_ask(args: &[&str]) -> Result<(), Failure> {
+    use std::io::{Read, Write};
+
+    let flags = Flags::parse(args, &[&ASK], &[])?;
+    let instructions = match (
+        flags.single.get("--system"),
+        flags.single.get("--system-file"),
+    ) {
+        (Some(text), None) => text.clone(),
+        (None, Some(path)) => {
+            std::fs::read_to_string(path).map_err(|_| Failure::Malformed("--system-file"))?
+        }
+        _ => return Err(Failure::Missing("--system or --system-file (exactly one)")),
+    };
+    let effort = match flags.single.get("--effort").map(String::as_str) {
+        None => None,
+        Some("low") => Some(model_connector::ReasoningEffort::Low),
+        Some("medium") => Some(model_connector::ReasoningEffort::Medium),
+        Some("high") => Some(model_connector::ReasoningEffort::High),
+        Some("max") => Some(model_connector::ReasoningEffort::Max),
+        Some(_) => return Err(Failure::Malformed("--effort")),
+    };
+    let endpoint = flags
+        .single
+        .get("--endpoint")
+        .map_or(ask::DEFAULT_ENDPOINT, String::as_str)
+        .parse()
+        .map_err(|_| Failure::Malformed("--endpoint"))?;
+    let mut raw = Vec::new();
+    std::io::stdin()
+        .take(ask::PAYLOAD_BYTES as u64 + 1)
+        .read_to_end(&mut raw)
+        .map_err(|_| Failure::Malformed("stdin"))?;
+    let prompt = String::from_utf8(raw).map_err(|_| Failure::Malformed("stdin"))?;
+    let answer = ask::ask(&AskArgs {
+        endpoint,
+        caller_id: flags.text("--caller-id")?,
+        key_file: flags.path("--connection-key-file")?,
+        model: flags.text("--model")?,
+        instructions,
+        effort,
+        max_output_tokens: flags.number_or("--max-output-tokens", 8192)?,
+        timeout: std::time::Duration::from_secs(flags.number_or("--timeout-secs", 300)?),
+        prompt,
+    })?;
+    let mut out = std::io::stdout();
+    out.write_all(answer.as_bytes())
+        .and_then(|()| out.flush())
+        .map_err(|_| Failure::Malformed("stdout"))
 }
 
 /// The flags of one config verb: each single flag at most once, each list

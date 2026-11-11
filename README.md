@@ -9,8 +9,8 @@ publishes the plan's usage windows (`usage_readout`, `claude_usage_readout` on t
 minds to read and decide their own burn. The one usage-derived refusal is the provider's own
 (`ProviderRejected`), repeated until its reset.
 
-Status: the `model-connector` crate and the `claude-connector` backend crate are live. No
-connector binary exists yet (the Claude connector binary is first, then an OpenAI-compatible one).
+Status: the `model-connector` crate and the `claude-connector` backend crate and binary are live
+(`claude-connector serve|config|ask`); an OpenAI-compatible connector is not written.
 
 ## Entry points
 
@@ -40,7 +40,7 @@ Crate `crates/model-connector`:
   `ProviderBackend` trait. A connector binary implements `ProviderBackend` for its
   provider and calls `serve`; the kit names no provider.
 
-Crate `crates/claude-connector` (library only; the binary that wires it to `serve` is not written):
+Crate `crates/claude-connector` (library and the `claude-connector` binary that wires it to `serve`):
 
 - `ClaudeCodeBackend` implements `ProviderBackend` for provider `claude-code` by driving the
   unmodified `claude` binary, one child per call, in print stream-json mode with no tools, no MCP
@@ -55,6 +55,24 @@ Crate `crates/claude-connector` (library only; the binary that wires it to `serv
   binary hands in; the credential is read from a systemd credential and reaches the child on a
   pipe (`CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR`), never in an environment. `QuotaCell` keeps the
   plan windows the CLI's `rate_limit_event`s report, for the usage readout and the lease grant.
+
+## Asking for one no-tools completion
+
+`claude-connector ask` is a caller of a running connector for a Mind's Self run: the prompt is all
+of stdin, the answer text is stdout.
+
+```
+claude-connector ask --caller-id ID --connection-key-file FILE --model MODEL (--system TEXT | --system-file FILE) [--endpoint HOST:PORT] [--effort low|medium|high|max] [--max-output-tokens N] [--timeout-secs N] < prompt > answer
+```
+
+Defaults: endpoint `127.0.0.1:4110`, 8192 output tokens, 300 s. The key is read from the file (the
+same text the connector reads for the caller; never argv or environment). There is no tools flag,
+no working-directory flag and no other endpoint: the request is built by `ProviderRequest::new`
+(no tools) and the model child's cwd and environment stay the connector's. Any failure (refused,
+over a cap, model not allowed, wrong key or caller, timeout, provider failure, empty answer, empty
+stdin) exits nonzero with one `claude-connector: <cause>` line on stderr and nothing on stdout;
+the line never carries the key, the prompt or the provider's message. Each run uses a fresh request
+id. Code: `crates/claude-connector/src/ask.rs`; tests: `crates/claude-connector/tests/ask.rs`.
 
 Frame arithmetic is public in `src/envelope.rs`, measured on the carriage frame: `frame_bytes_for_payload(n)` is the frame a
 caller payload bound of `n` needs, `payload_bytes_for_frame(frame)` is the largest payload bound
